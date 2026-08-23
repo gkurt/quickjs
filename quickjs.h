@@ -451,7 +451,10 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 #define JS_EVAL_TYPE_MASK     (3 << 0)
 
 #define JS_EVAL_FLAG_STRICT   (1 << 3) /* force 'strict' mode */
-#define JS_EVAL_FLAG_UNUSED   (1 << 4) /* unused */
+/* do not resolve the module's dependencies; the module is returned
+   unresolved, for JS_LoadModuleAsync() to load its graph. Implies
+   JS_EVAL_FLAG_COMPILE_ONLY and JS_EVAL_TYPE_MODULE. */
+#define JS_EVAL_FLAG_ASYNC_LOAD (1 << 4)
 /* compile but do not run. The result is an object with a
    JS_TAG_FUNCTION_BYTECODE or JS_TAG_MODULE tag. It can be executed
    with JS_EvalFunction(). */
@@ -1224,6 +1227,44 @@ JS_EXTERN void JS_SetModuleLoaderFunc2(JSRuntime *rt,
 /* Set an attributes-aware module normalizer. Call after JS_SetModuleLoaderFunc2. */
 JS_EXTERN void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
                                           JSModuleNormalizeFunc2 *module_normalize);
+
+/* --- asynchronous module loading (ECMA-262 HostLoadImportedModule) ---------
+   An opaque token for one in-flight module load. The host settles it with
+   JS_FulfillModuleLoad() or JS_RejectModuleLoad(), from this turn or any
+   later one; it is freed by whichever of the two is called first. */
+typedef struct JSModuleLoadHandle JSModuleLoadHandle;
+
+/* Asks the host for the source of 'module_name'. Unlike JSModuleLoaderFunc
+   this returns nothing: the load is settled through 'handle', so the host is
+   free to do it over any number of event loop turns. */
+typedef void JSModuleLoaderAsyncFunc(JSContext *ctx, const char *module_name,
+                                     JSValueConst attributes, void *opaque,
+                                     JSModuleLoadHandle *handle);
+
+/* Installs an async loader. Mutually exclusive with JS_SetModuleLoaderFunc*:
+   whichever is called last wins. Graphs are then loaded by
+   JS_LoadModuleAsync() / JS_EvalModuleAsync(), and by dynamic import(). */
+JS_EXTERN void JS_SetModuleLoaderFuncAsync(JSRuntime *rt,
+                                           JSModuleNormalizeFunc *module_normalize,
+                                           JSModuleLoaderAsyncFunc *module_loader,
+                                           JSModuleCheckSupportedImportAttributes *module_check_attrs,
+                                           void *opaque);
+
+/* Settles a load with the module's source. Returns -1 on error (the graph's
+   promise is rejected in that case), 0 on success. Consumes 'handle'. */
+JS_EXTERN int JS_FulfillModuleLoad(JSContext *ctx, JSModuleLoadHandle *handle,
+                                   const char *source, size_t source_len);
+
+/* Settles a load as failed, rejecting the promise of every graph waiting on
+   it. Consumes 'handle'. */
+JS_EXTERN int JS_RejectModuleLoad(JSContext *ctx, JSModuleLoadHandle *handle,
+                                  JSValueConst error);
+
+/* Loads, links and evaluates a module graph whose root source the caller
+   already holds. Returns a promise for the root's namespace object; every
+   dependency is fetched through the async loader. */
+JS_EXTERN JSValue JS_EvalModuleAsync(JSContext *ctx, const char *input,
+                                     size_t input_len, const char *filename);
 
 /* return the import.meta object of a module */
 JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);

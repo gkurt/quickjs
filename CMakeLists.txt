@@ -451,6 +451,12 @@ endif()
 # Interrupt test
 #
 
+add_executable(async-module-test
+    async-module-test.c
+)
+target_compile_definitions(async-module-test PRIVATE ${qjs_defines})
+target_link_libraries(async-module-test PRIVATE qjs)
+
 add_executable(api-test
     api-test.c
 )

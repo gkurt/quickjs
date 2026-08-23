@@ -389,12 +389,17 @@ struct JSRuntime {
         JSModuleNormalizeFunc2 *module_normalize_func2;
     } normalize_u;
     bool module_loader_has_attr;
+    bool module_loader_is_async;
     union {
         JSModuleLoaderFunc *module_loader_func;
         JSModuleLoaderFunc2 *module_loader_func2;
+        JSModuleLoaderAsyncFunc *module_loader_async_func;
     } u;
     JSModuleCheckSupportedImportAttributes *module_check_attrs;
     void *module_loader_opaque;
+    /* JSModuleLoadHandle.link - one entry per specifier being fetched, so
+       that concurrent requests for the same module share a single load */
+    struct list_head module_inflight_loads;
     /* timestamp for internal use in module evaluation */
     int64_t module_async_evaluation_next_timestamp;
 
@@ -1471,6 +1476,11 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                const char *input, size_t input_len,
                                const char *filename, int line, int flags, int scope_idx);
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
+static void js_free_inflight_module_loads(JSRuntime *rt);
+static void js_load_module_by_name_async(JSContext *ctx, const char *basename,
+                                         const char *filename,
+                                         JSValueConst attributes,
+                                         JSValueConst *resolving_funcs);
 static int js_module_attributes_equal(JSContext *ctx, JSValueConst attr1,
                                       JSValueConst attr2);
 static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
@@ -2344,6 +2354,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     init_list_head(&rt->string_list);
 #endif
     init_list_head(&rt->job_list);
+    init_list_head(&rt->module_inflight_loads);
 
     if (JS_InitAtoms(rt))
         goto fail;
@@ -2657,6 +2668,8 @@ void JS_FreeRuntime(JSRuntime *rt)
         js_free_rt(rt, e);
     }
     init_list_head(&rt->job_list);
+
+    js_free_inflight_module_loads(rt);
 
     JS_RunGC(rt);
 
@@ -30267,6 +30280,39 @@ fail:
 #endif // QJS_DISABLE_PARSER
 
 /* 'name' is freed */
+/* js_free_modules(JS_FREE_MODULE_NOT_RESOLVED) reclaims every module that has
+   not resolved yet, which during an async load is every module of every graph
+   being loaded. Skip it while any load is in flight, or one graph failing
+   would free modules another still references. */
+/* A JSModuleDef is referenced by ctx->loaded_modules and by everything
+   pointing at it - a JS_TAG_MODULE value, a graph being loaded - so a count
+   of 1 means the registry is the only holder. The registry's reference is
+   never released here, so unref cannot reach zero. */
+static void js_module_def_ref(JSModuleDef *m)
+{
+    JS_REF_COUNT(m)++;
+}
+
+static void js_module_def_unref(JSModuleDef *m)
+{
+    assert(JS_REF_COUNT(m) > 1);
+    JS_REF_COUNT(m)--;
+}
+
+/* Reclaims what a failed load left behind. js_free_modules() ignores the
+   refcount and would free modules a concurrent load, or a promise reaction
+   that has not run yet, still points at; this skips those. */
+static void js_free_unresolved_modules(JSContext *ctx)
+{
+    struct list_head *el, *el1;
+
+    list_for_each_safe(el, el1, &ctx->loaded_modules) {
+        JSModuleDef *m = list_entry(el, JSModuleDef, link);
+        if (!m->resolved && JS_REF_COUNT(m) == 1)
+            js_free_module_def(ctx, m);
+    }
+}
+
 static JSModuleDef *js_new_module_def(JSContext *ctx, JSAtom name)
 {
     JSModuleDef *m;
@@ -30530,6 +30576,7 @@ void JS_SetModuleLoaderFunc(JSRuntime *rt,
     rt->module_normalize_has_attr = false;
     rt->normalize_u.module_normalize_func = module_normalize;
     rt->module_loader_has_attr = false;
+    rt->module_loader_is_async = false;
     rt->u.module_loader_func = module_loader;
     rt->module_check_attrs = NULL;
     rt->module_loader_opaque = opaque;
@@ -30544,7 +30591,22 @@ void JS_SetModuleLoaderFunc2(JSRuntime *rt,
     rt->module_normalize_has_attr = false;
     rt->normalize_u.module_normalize_func = module_normalize;
     rt->module_loader_has_attr = true;
+    rt->module_loader_is_async = false;
     rt->u.module_loader_func2 = module_loader;
+    rt->module_check_attrs = module_check_attrs;
+    rt->module_loader_opaque = opaque;
+}
+
+void JS_SetModuleLoaderFuncAsync(JSRuntime *rt,
+                                 JSModuleNormalizeFunc *module_normalize,
+                                 JSModuleLoaderAsyncFunc *module_loader,
+                                 JSModuleCheckSupportedImportAttributes *module_check_attrs,
+                                 void *opaque)
+{
+    rt->normalize_u.module_normalize_func = module_normalize;
+    rt->module_loader_has_attr = false;
+    rt->module_loader_is_async = true;
+    rt->u.module_loader_async_func = module_loader;
     rt->module_check_attrs = module_check_attrs;
     rt->module_loader_opaque = opaque;
 }
@@ -30732,6 +30794,25 @@ static JSModuleDef *js_find_loaded_module_by_name(JSContext *ctx, JSAtom name)
 
 /* return NULL in case of exception (e.g. module could not be loaded) */
 /* `base_cname` and `cname1` may be pure ASCII or UTF-8 encoded */
+/* Runs the host's normalizer, or the default one. Returns a js_free()able
+   string, or NULL with an exception pending. */
+static char *js_host_normalize_module_name(JSContext *ctx,
+                                           const char *base_cname,
+                                           const char *cname1,
+                                           JSValueConst attributes)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (!rt->normalize_u.module_normalize_func && !rt->normalize_u.module_normalize_func2)
+        return js_default_module_normalize_name(ctx, base_cname, cname1);
+    if (rt->module_normalize_has_attr)
+        return rt->normalize_u.module_normalize_func2(ctx, base_cname, cname1,
+                                                      attributes,
+                                                      rt->module_loader_opaque);
+    return rt->normalize_u.module_normalize_func(ctx, base_cname, cname1,
+                                                 rt->module_loader_opaque);
+}
+
 static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
                                                     const char *base_cname,
                                                     const char *cname1,
@@ -30742,16 +30823,7 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
     char *cname;
     JSAtom module_name;
 
-    if (!rt->normalize_u.module_normalize_func && !rt->normalize_u.module_normalize_func2) {
-        cname = js_default_module_normalize_name(ctx, base_cname, cname1);
-    } else if (rt->module_normalize_has_attr) {
-        cname = rt->normalize_u.module_normalize_func2(ctx, base_cname, cname1,
-                                                       attributes,
-                                                       rt->module_loader_opaque);
-    } else {
-        cname = rt->normalize_u.module_normalize_func(ctx, base_cname, cname1,
-                                                      rt->module_loader_opaque);
-    }
+    cname = js_host_normalize_module_name(ctx, base_cname, cname1, attributes);
     if (!cname)
         return NULL;
 
@@ -31822,12 +31894,19 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     JSValue ret, err, func_obj, evaluate_resolving_funcs[2];
     JSValueConst func_data[3];
 
+    /* dynamic import() and JS_LoadModule() both land here */
+    if (ctx->rt->module_loader_is_async) {
+        js_load_module_by_name_async(ctx, basename, filename, attributes,
+                                     resolving_funcs);
+        return;
+    }
+
     m = js_host_resolve_imported_module(ctx, basename, filename, attributes);
     if (!m)
         goto fail;
 
     if (js_resolve_module(ctx, m) < 0) {
-        js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
+        js_free_unresolved_modules(ctx);
         goto fail;
     }
 
@@ -31868,6 +31947,648 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
     if (JS_IsException(promise))
         return JS_EXCEPTION;
     JS_LoadModuleInternal(ctx, basename, filename, vc(resolving_funcs), JS_UNDEFINED);
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    return promise;
+}
+
+/* --- asynchronous module loading -----------------------------------------
+
+   ECMA-262 loads a module graph asynchronously: HostLoadImportedModule is
+   handed a payload and the host calls FinishLoadingImportedModule whenever
+   the source arrives. js_resolve_module() collapses that into one synchronous
+   recursive walk, which a host fetching over a network cannot satisfy without
+   blocking.
+
+   The functions below implement the spec's shape instead - LoadRequestedModules,
+   InnerModuleLoading, ContinueModuleLoading - which is a fan-out with a
+   pending counter, not a suspended C stack. Linking stays synchronous (every
+   source is in hand by the time it runs) and evaluation already returns a
+   promise, so only the loading phase changes. */
+
+typedef struct JSGraphLoadingState {
+    int ref_count;
+    bool is_loading;
+    int pending_modules_count;
+    JSValue resolving_funcs[2]; /* spec field: [[PromiseCapability]] */
+    JSModuleDef **visited;      /* spec field: [[Visited]] */
+    int visited_count;
+    int visited_size;
+} JSGraphLoadingState;
+
+/* One graph waiting on one in-flight load. Several can share a handle: two
+   modules importing the same specifier must yield a single host fetch. */
+/* 'state' is NULL for a root fetch - a dynamic import(), or JS_LoadModule() -
+   where there is no referrer entry to fill in and the module that arrives
+   becomes the root of a graph load of its own. */
+typedef struct JSModuleLoadWaiter {
+    struct list_head link;
+    JSGraphLoadingState *state;
+    JSModuleDef *referrer;
+    int req_index;
+    JSValue resolving_funcs[2]; /* root fetch only */
+} JSModuleLoadWaiter;
+
+struct JSModuleLoadHandle {
+    struct list_head link;    /* JSRuntime.module_inflight_loads */
+    struct list_head waiters; /* JSModuleLoadWaiter.link */
+    JSContext *ctx;
+    char *cname;
+    JSValue attributes;
+    bool dispatched;          /* the loader has been called for this handle */
+};
+
+static void js_inner_module_loading(JSContext *ctx, JSGraphLoadingState *st,
+                                    JSModuleDef *m);
+static void js_load_module_async_internal(JSContext *ctx, JSModuleDef *m,
+                                          JSValueConst *resolving_funcs);
+static void js_module_load_dispatch(JSContext *ctx, JSModuleLoadHandle *h);
+
+static JSGraphLoadingState *js_graph_loading_state_new(JSContext *ctx)
+{
+    JSGraphLoadingState *st;
+
+    st = js_mallocz(ctx, sizeof(*st));
+    if (!st)
+        return NULL;
+    st->ref_count = 1;
+    st->is_loading = true;
+    /* the root's own InnerModuleLoading owes the matching decrement; that is
+       what keeps the count above zero while the graph fans out */
+    st->pending_modules_count = 1;
+    st->resolving_funcs[0] = JS_UNDEFINED;
+    st->resolving_funcs[1] = JS_UNDEFINED;
+    return st;
+}
+
+static void js_graph_loading_state_free(JSContext *ctx, JSGraphLoadingState *st)
+{
+    int i;
+
+    if (--st->ref_count == 0) {
+        JS_FreeValue(ctx, st->resolving_funcs[0]);
+        JS_FreeValue(ctx, st->resolving_funcs[1]);
+        for (i = 0; i < st->visited_count; i++)
+            js_module_def_unref(st->visited[i]);
+        js_free(ctx, st->visited);
+        js_free(ctx, st);
+    }
+}
+
+static bool js_graph_state_has_visited(JSGraphLoadingState *st, JSModuleDef *m)
+{
+    int i;
+    for (i = 0; i < st->visited_count; i++)
+        if (st->visited[i] == m)
+            return true;
+    return false;
+}
+
+static int js_graph_state_visit(JSContext *ctx, JSGraphLoadingState *st,
+                                JSModuleDef *m)
+{
+    if (js_resize_array(ctx, (void **)&st->visited, sizeof(*st->visited),
+                        &st->visited_size, st->visited_count + 1))
+        return -1;
+    /* A reference, so that a failing load elsewhere cannot reclaim a module
+       this graph is still walking. */
+    js_module_def_ref(m);
+    st->visited[st->visited_count++] = m;
+    return 0;
+}
+
+/* Every module reached by this load now has all of its req_module_entries
+   bound, which is what m->resolved records. */
+static void js_graph_loading_finish(JSContext *ctx, JSGraphLoadingState *st)
+{
+    JSValue ret;
+    int i;
+
+    st->is_loading = false;
+    for (i = 0; i < st->visited_count; i++)
+        st->visited[i]->resolved = true;
+    ret = JS_Call(ctx, st->resolving_funcs[0], JS_UNDEFINED, 0, NULL);
+    JS_FreeValue(ctx, ret);
+}
+
+/* First failure wins; later ones land on a state that is no longer loading
+   and are dropped. Modules left unresolved are reclaimed by the caller. */
+static void js_graph_loading_fail(JSContext *ctx, JSGraphLoadingState *st,
+                                  JSValueConst error)
+{
+    JSValue ret;
+
+    if (!st->is_loading)
+        return;
+    st->is_loading = false;
+    ret = JS_Call(ctx, st->resolving_funcs[1], JS_UNDEFINED, 1, &error);
+    JS_FreeValue(ctx, ret);
+}
+
+static void js_graph_loading_fail_with_exception(JSContext *ctx,
+                                                 JSGraphLoadingState *st)
+{
+    JSValue err;
+
+    err = JS_GetException(ctx);
+    js_graph_loading_fail(ctx, st, err);
+    JS_FreeValue(ctx, err);
+}
+
+/* Finds or creates the handle for '*pcname' and appends a fresh waiter to it,
+   returned through 'pw' for the caller to fill in. Takes ownership of the
+   name on success and clears '*pcname'. A handle it just created has not been
+   dispatched yet - js_module_load_dispatch() does that once the waiter is
+   complete, so a host that settles re-entrantly finds consistent state. */
+static JSModuleLoadHandle *js_module_load_enqueue(JSContext *ctx, char **pcname,
+                                                  JSValueConst attributes,
+                                                  JSModuleLoadWaiter **pw)
+{
+    JSRuntime *rt = ctx->rt;
+    JSModuleLoadHandle *h = NULL;
+    JSModuleLoadWaiter *w;
+    struct list_head *el;
+    bool fresh;
+
+    list_for_each(el, &rt->module_inflight_loads) {
+        JSModuleLoadHandle *h1 = list_entry(el, JSModuleLoadHandle, link);
+        int eq;
+        if (strcmp(h1->cname, *pcname) != 0)
+            continue;
+        eq = js_module_attributes_equal(ctx, h1->attributes, attributes);
+        if (eq < 0)
+            return NULL;
+        if (eq) {
+            h = h1;
+            break;
+        }
+    }
+
+    fresh = (h == NULL);
+    if (fresh) {
+        h = js_mallocz(ctx, sizeof(*h));
+        if (!h)
+            return NULL;
+        h->ctx = ctx;
+        h->cname = *pcname; /* owned from here on */
+        h->attributes = js_dup(attributes);
+        h->dispatched = false;
+        init_list_head(&h->waiters);
+        list_add_tail(&h->link, &rt->module_inflight_loads);
+    } else {
+        js_free(ctx, *pcname);
+    }
+    *pcname = NULL;
+
+    w = js_mallocz(ctx, sizeof(*w));
+    if (!w) {
+        /* a fresh handle with no waiters would never be settled */
+        if (fresh) {
+            list_del(&h->link);
+            JS_FreeValue(ctx, h->attributes);
+            js_free(ctx, h->cname);
+            js_free(ctx, h);
+        }
+        return NULL;
+    }
+    w->resolving_funcs[0] = JS_UNDEFINED;
+    w->resolving_funcs[1] = JS_UNDEFINED;
+    list_add_tail(&w->link, &h->waiters);
+    *pw = w;
+    return h;
+}
+
+static void js_module_load_dispatch(JSContext *ctx, JSModuleLoadHandle *h)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (h->dispatched)
+        return;
+    h->dispatched = true;
+    rt->u.module_loader_async_func(ctx, h->cname, h->attributes,
+                                   rt->module_loader_opaque, h);
+}
+
+/* spec: HostLoadImportedModule. Issues at most one host fetch per specifier;
+   a request already in flight gains a waiter instead. */
+static int js_host_load_imported_module(JSContext *ctx, JSGraphLoadingState *st,
+                                        JSModuleDef *referrer, int req_index)
+{
+    JSRuntime *rt = ctx->rt;
+    JSReqModuleEntry *rme = &referrer->req_module_entries[req_index];
+    const char *base_cname, *cname1;
+    char *cname = NULL;
+    JSAtom module_name;
+    JSModuleDef *m;
+    JSModuleLoadHandle *h;
+    JSModuleLoadWaiter *w;
+
+    base_cname = JS_AtomToCString(ctx, referrer->module_name);
+    if (!base_cname)
+        return -1;
+    cname1 = JS_AtomToCString(ctx, rme->module_name);
+    if (!cname1) {
+        JS_FreeCString(ctx, base_cname);
+        return -1;
+    }
+    cname = js_host_normalize_module_name(ctx, base_cname, cname1, rme->attributes);
+    JS_FreeCString(ctx, base_cname);
+    JS_FreeCString(ctx, cname1);
+    if (!cname)
+        return -1;
+
+    /* already in the registry: FinishLoadingImportedModule is immediate */
+    module_name = JS_NewAtom(ctx, cname);
+    if (module_name == JS_ATOM_NULL)
+        goto fail;
+    m = js_find_loaded_module(ctx, module_name, rme->attributes);
+    JS_FreeAtom(ctx, module_name);
+    if (m) {
+        js_free(ctx, cname);
+        rme->module = m;
+        js_inner_module_loading(ctx, st, m);
+        return 0;
+    }
+    if (JS_HasException(ctx))
+        goto fail;
+
+    if (!rt->module_loader_is_async || !rt->u.module_loader_async_func) {
+        JS_ThrowReferenceError(ctx, "could not load module '%s'", cname);
+        goto fail;
+    }
+
+    h = js_module_load_enqueue(ctx, &cname, rme->attributes, &w);
+    if (!h)
+        goto fail;
+    w->state = st;
+    st->ref_count++;
+    w->referrer = referrer;
+    w->req_index = req_index;
+
+    /* The host may settle this before returning; InnerModuleLoading is
+       re-entrant and the pending count does not depend on the order. */
+    js_module_load_dispatch(ctx, h);
+    return 0;
+ fail:
+    js_free(ctx, cname);
+    return -1;
+}
+
+/* spec: InnerModuleLoading */
+static void js_inner_module_loading(JSContext *ctx, JSGraphLoadingState *st,
+                                    JSModuleDef *m)
+{
+    int i;
+
+    if (!m->resolved && !js_graph_state_has_visited(st, m)) {
+        if (js_graph_state_visit(ctx, st, m) < 0) {
+            js_graph_loading_fail_with_exception(ctx, st);
+            return;
+        }
+        st->pending_modules_count += m->req_module_entries_count;
+        for (i = 0; i < m->req_module_entries_count; i++) {
+            JSReqModuleEntry *rme = &m->req_module_entries[i];
+            if (rme->module) {
+                js_inner_module_loading(ctx, st, rme->module);
+            } else if (js_host_load_imported_module(ctx, st, m, i) < 0) {
+                js_graph_loading_fail_with_exception(ctx, st);
+                return;
+            }
+            if (!st->is_loading)
+                return;
+        }
+    }
+    assert(st->pending_modules_count >= 1);
+    if (--st->pending_modules_count == 0)
+        js_graph_loading_finish(ctx, st);
+}
+
+/* Detaches a handle from the in-flight table, moving its waiters to 'waiters'. */
+static void js_module_load_handle_detach(JSModuleLoadHandle *h,
+                                         struct list_head *waiters)
+{
+    list_del(&h->link);
+    if (list_empty(&h->waiters)) {
+        init_list_head(waiters);
+    } else {
+        waiters->next = h->waiters.next;
+        waiters->prev = h->waiters.prev;
+        waiters->next->prev = waiters;
+        waiters->prev->next = waiters;
+    }
+    init_list_head(&h->waiters);
+}
+
+/* spec: FinishLoadingImportedModule + ContinueModuleLoading, for every graph
+   that was waiting on this specifier. */
+static void js_module_load_settle(JSContext *ctx, JSModuleLoadHandle *h,
+                                  JSModuleDef *m, JSValueConst error)
+{
+    struct list_head waiters, *el, *el1;
+
+    js_module_load_handle_detach(h, &waiters);
+    JS_FreeValue(ctx, h->attributes);
+    js_free(ctx, h->cname);
+    js_free(ctx, h);
+
+    list_for_each_safe(el, el1, &waiters) {
+        JSModuleLoadWaiter *w = list_entry(el, JSModuleLoadWaiter, link);
+        JSGraphLoadingState *st = w->state;
+
+        if (st) {
+            if (st->is_loading) {
+                if (m) {
+                    w->referrer->req_module_entries[w->req_index].module = m;
+                    js_inner_module_loading(ctx, st, m);
+                } else {
+                    js_graph_loading_fail(ctx, st, error);
+                }
+            }
+            js_graph_loading_state_free(ctx, st);
+        } else if (m) {
+            /* a root fetch: this module is the root of its own graph load */
+            js_load_module_async_internal(ctx, m, vc(w->resolving_funcs));
+        } else {
+            JSValue ret = JS_Call(ctx, w->resolving_funcs[1], JS_UNDEFINED, 1,
+                                  &error);
+            JS_FreeValue(ctx, ret);
+        }
+        JS_FreeValue(ctx, w->resolving_funcs[0]);
+        JS_FreeValue(ctx, w->resolving_funcs[1]);
+        js_free(ctx, w);
+    }
+}
+
+/* Runtime teardown: the host will never settle these now, so drop the
+   handles, their waiters, and the promise capability each waiting graph
+   holds. Uses the rt-level frees - the contexts may already be gone. */
+static void js_free_inflight_module_loads(JSRuntime *rt)
+{
+    struct list_head *el, *el1;
+
+    list_for_each_safe(el, el1, &rt->module_inflight_loads) {
+        JSModuleLoadHandle *h = list_entry(el, JSModuleLoadHandle, link);
+        struct list_head *wel, *wel1;
+
+        list_for_each_safe(wel, wel1, &h->waiters) {
+            JSModuleLoadWaiter *w = list_entry(wel, JSModuleLoadWaiter, link);
+            JSGraphLoadingState *st = w->state;
+            if (st && --st->ref_count == 0) {
+                int i;
+                JS_FreeValueRT(rt, st->resolving_funcs[0]);
+                JS_FreeValueRT(rt, st->resolving_funcs[1]);
+                for (i = 0; i < st->visited_count; i++)
+                    js_module_def_unref(st->visited[i]);
+                js_free_rt(rt, st->visited);
+                js_free_rt(rt, st);
+            }
+            JS_FreeValueRT(rt, w->resolving_funcs[0]);
+            JS_FreeValueRT(rt, w->resolving_funcs[1]);
+            js_free_rt(rt, w);
+        }
+        JS_FreeValueRT(rt, h->attributes);
+        js_free_rt(rt, h->cname);
+        js_free_rt(rt, h);
+    }
+    init_list_head(&rt->module_inflight_loads);
+}
+
+int JS_FulfillModuleLoad(JSContext *ctx, JSModuleLoadHandle *h,
+                         const char *source, size_t source_len)
+{
+    JSModuleDef *m;
+    JSValue func_val, err;
+
+    /* Compiled but deliberately not resolved: this module's own requests are
+       discovered here and fanned out by js_module_load_settle() below. */
+    func_val = JS_Eval(ctx, source, source_len, h->cname,
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
+                       JS_EVAL_FLAG_ASYNC_LOAD);
+    if (JS_IsException(func_val)) {
+        err = JS_GetException(ctx);
+        js_module_load_settle(ctx, h, NULL, err);
+        JS_FreeValue(ctx, err);
+        return -1;
+    }
+    assert(JS_VALUE_GET_TAG(func_val) == JS_TAG_MODULE);
+    m = JS_VALUE_GET_PTR(func_val);
+    /* ctx->loaded_modules holds the reference from here on */
+    JS_FreeValue(ctx, func_val);
+
+    /* remember what it was requested with, so js_find_loaded_module() can
+       tell a text module from a JS module of the same name */
+    if (JS_IsObject(h->attributes) && JS_IsUndefined(m->attributes))
+        m->attributes = js_dup(h->attributes);
+
+    js_module_load_settle(ctx, h, m, JS_UNDEFINED);
+    return 0;
+}
+
+int JS_RejectModuleLoad(JSContext *ctx, JSModuleLoadHandle *h,
+                        JSValueConst error)
+{
+    js_module_load_settle(ctx, h, NULL, error);
+    return 0;
+}
+
+/* spec: LoadRequestedModules. Returns a promise for the graph rooted at 'm'
+   having been loaded - not linked, and not evaluated. */
+static JSValue js_load_requested_modules(JSContext *ctx, JSModuleDef *m)
+{
+    JSGraphLoadingState *st;
+    JSValue promise, resolving_funcs[2];
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        return JS_EXCEPTION;
+    st = js_graph_loading_state_new(ctx);
+    if (!st) {
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
+        JS_FreeValue(ctx, promise);
+        return JS_EXCEPTION;
+    }
+    st->resolving_funcs[0] = resolving_funcs[0];
+    st->resolving_funcs[1] = resolving_funcs[1];
+
+    js_inner_module_loading(ctx, st, m);
+    js_graph_loading_state_free(ctx, st);
+    return promise;
+}
+
+/* Once the graph is loaded, linking and evaluation are the ordinary path. */
+static JSValue js_module_graph_loaded(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv, int magic,
+                                     JSValueConst *func_data)
+{
+    JSValueConst *resolving_funcs = func_data;
+    JSModuleDef *m = JS_VALUE_GET_PTR(func_data[2]);
+    JSValue evaluate_promise, func_obj, ret, err;
+    JSValue evaluate_resolving_funcs[2];
+    JSValueConst fd[3];
+
+    func_obj = JS_NewModuleValue(ctx, m);
+    evaluate_promise = JS_EvalFunction(ctx, func_obj);
+    if (JS_IsException(evaluate_promise)) {
+        err = JS_GetException(ctx);
+        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, err);
+        return JS_UNDEFINED;
+    }
+
+    func_obj = JS_NewModuleValue(ctx, m);
+    fd[0] = resolving_funcs[0];
+    fd[1] = resolving_funcs[1];
+    fd[2] = func_obj;
+    evaluate_resolving_funcs[0] = JS_NewCFunctionData(ctx, js_load_module_fulfilled, 0, 0, 3, fd);
+    evaluate_resolving_funcs[1] = JS_NewCFunctionData(ctx, js_load_module_rejected, 0, 0, 3, fd);
+    JS_FreeValue(ctx, func_obj);
+    ret = js_promise_then(ctx, evaluate_promise, 2, vc(evaluate_resolving_funcs));
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, evaluate_resolving_funcs[0]);
+    JS_FreeValue(ctx, evaluate_resolving_funcs[1]);
+    JS_FreeValue(ctx, evaluate_promise);
+    return JS_UNDEFINED;
+}
+
+/* The graph failed to load. func_data deliberately carries only the caller's
+   promise and no module value: the sibling reaction is released when the
+   promise settles, so by the time this runs nothing points at the modules the
+   load created and js_free_unresolved_modules() can reclaim them. */
+static JSValue js_module_graph_failed(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv, int magic,
+                                      JSValueConst *func_data)
+{
+    JSValueConst error = argc >= 1 ? argv[0] : JS_UNDEFINED;
+    JSValue ret;
+
+    ret = JS_Call(ctx, func_data[1], JS_UNDEFINED, 1, &error);
+    JS_FreeValue(ctx, ret);
+    js_free_unresolved_modules(ctx);
+    return JS_UNDEFINED;
+}
+
+/* Loads the graph rooted at 'm', then links, evaluates, and settles
+   'resolving_funcs' with the root's namespace object. */
+static void js_load_module_async_internal(JSContext *ctx, JSModuleDef *m,
+                                          JSValueConst *resolving_funcs)
+{
+    JSValue load_promise, func_obj, ret, err;
+    JSValue load_resolving_funcs[2];
+    JSValueConst fd[3];
+
+    load_promise = js_load_requested_modules(ctx, m);
+    if (JS_IsException(load_promise)) {
+        err = JS_GetException(ctx);
+        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, err);
+        return;
+    }
+
+    func_obj = JS_NewModuleValue(ctx, m);
+    fd[0] = resolving_funcs[0];
+    fd[1] = resolving_funcs[1];
+    fd[2] = func_obj;
+    load_resolving_funcs[0] = JS_NewCFunctionData(ctx, js_module_graph_loaded, 0, 0, 3, fd);
+    /* two data slots, not three: see js_module_graph_failed() */
+    load_resolving_funcs[1] = JS_NewCFunctionData(ctx, js_module_graph_failed, 0, 0, 2, fd);
+    JS_FreeValue(ctx, func_obj);
+    ret = js_promise_then(ctx, load_promise, 2, vc(load_resolving_funcs));
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, load_resolving_funcs[0]);
+    JS_FreeValue(ctx, load_resolving_funcs[1]);
+    JS_FreeValue(ctx, load_promise);
+}
+
+/* Loads a module the host has to fetch by name, then its graph. This is the
+   path dynamic import() and JS_LoadModule() take when an async loader is
+   installed: there is no referrer module to record the result in, so the
+   waiter carries the caller's promise instead. */
+static void js_load_module_by_name_async(JSContext *ctx, const char *basename,
+                                         const char *filename,
+                                         JSValueConst attributes,
+                                         JSValueConst *resolving_funcs)
+{
+    JSRuntime *rt = ctx->rt;
+    char *cname;
+    JSAtom module_name;
+    JSModuleDef *m;
+    JSModuleLoadHandle *h;
+    JSModuleLoadWaiter *w;
+    JSValue ret, err;
+
+    cname = js_host_normalize_module_name(ctx, basename, filename, attributes);
+    if (!cname)
+        goto fail;
+
+    module_name = JS_NewAtom(ctx, cname);
+    if (module_name == JS_ATOM_NULL) {
+        js_free(ctx, cname);
+        goto fail;
+    }
+    m = js_find_loaded_module(ctx, module_name, attributes);
+    JS_FreeAtom(ctx, module_name);
+    if (m) {
+        /* already known: go straight to loading whatever it still needs */
+        js_free(ctx, cname);
+        js_load_module_async_internal(ctx, m, resolving_funcs);
+        return;
+    }
+    if (JS_HasException(ctx)) {
+        js_free(ctx, cname);
+        goto fail;
+    }
+
+    if (!rt->u.module_loader_async_func) {
+        JS_ThrowReferenceError(ctx, "could not load module '%s'", cname);
+        js_free(ctx, cname);
+        goto fail;
+    }
+
+    h = js_module_load_enqueue(ctx, &cname, attributes, &w);
+    if (!h) {
+        js_free(ctx, cname);
+        goto fail;
+    }
+    w->state = NULL; /* a root fetch */
+    w->resolving_funcs[0] = js_dup(resolving_funcs[0]);
+    w->resolving_funcs[1] = js_dup(resolving_funcs[1]);
+
+    js_module_load_dispatch(ctx, h);
+    return;
+ fail:
+    err = JS_GetException(ctx);
+    ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, err);
+}
+
+JSValue JS_EvalModuleAsync(JSContext *ctx, const char *input, size_t input_len,
+                           const char *filename)
+{
+    JSValue promise, resolving_funcs[2], func_val, err, ret;
+    JSModuleDef *m;
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        return JS_EXCEPTION;
+
+    func_val = JS_Eval(ctx, input, input_len, filename,
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
+                       JS_EVAL_FLAG_ASYNC_LOAD);
+    if (JS_IsException(func_val)) {
+        err = JS_GetException(ctx);
+        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, err);
+    } else {
+        assert(JS_VALUE_GET_TAG(func_val) == JS_TAG_MODULE);
+        m = JS_VALUE_GET_PTR(func_val);
+        JS_FreeValue(ctx, func_val);
+        js_load_module_async_internal(ctx, m, vc(resolving_funcs));
+    }
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     return promise;
@@ -38216,7 +38937,9 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     /* Could add a flag to avoid resolution if necessary */
     if (m) {
         m->func_obj = fun_obj;
-        if (js_resolve_module(ctx, m) < 0)
+        /* JS_EVAL_FLAG_ASYNC_LOAD hands the module back unresolved, for
+           js_load_requested_modules() to load its graph asynchronously */
+        if (!(flags & JS_EVAL_FLAG_ASYNC_LOAD) && js_resolve_module(ctx, m) < 0)
             goto fail1;
         fun_obj = JS_NewModuleValue(ctx, m);
     }
@@ -38331,7 +39054,7 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
         JSModuleDef *m = JS_VALUE_GET_PTR(obj);
         if (js_resolve_module(ctx, m) < 0) {
-            js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
+            js_free_unresolved_modules(ctx);
             return -1;
         }
     }
