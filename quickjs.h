@@ -1266,6 +1266,25 @@ JS_EXTERN int JS_RejectModuleLoad(JSContext *ctx, JSModuleLoadHandle *handle,
 JS_EXTERN JSValue JS_EvalModuleAsync(JSContext *ctx, const char *input,
                                      size_t input_len, const char *filename);
 
+/* Same, for a root the caller compiled itself with JS_EVAL_FLAG_ASYNC_LOAD.
+   Does not consume 'm': the caller still owns the module value it compiled. */
+JS_EXTERN JSValue JS_LoadModuleAsync(JSContext *ctx, JSModuleDef *m);
+
+/* Fills in the import.meta object of 'm', called the first time that module
+   evaluates `import.meta`. This is ECMA-262's HostGetImportMetaProperties.
+   Identify 'm' with JS_GetModuleName().
+
+   The synchronous loaders let a host set import.meta on the JSModuleDef they
+   return, but JS_SetModuleLoaderFuncAsync() never hands one out - the engine
+   compiles the source the host delivers - so this is the only place an async
+   host can set import.meta.url. It is skipped for a module whose import.meta
+   object already exists, so a synchronous loader that filled it in at load
+   time keeps precedence. */
+typedef void JSModuleMetaFunc(JSContext *ctx, JSModuleDef *m,
+                              JSValueConst meta_obj, void *opaque);
+JS_EXTERN void JS_SetModuleMetaFunc(JSRuntime *rt, JSModuleMetaFunc *func,
+                                    void *opaque);
+
 /* return the import.meta object of a module */
 JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
 JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);

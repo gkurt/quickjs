@@ -38,6 +38,8 @@ static const FakeFile files[] = {
       "}\n", 2 },
     /* a graph whose dependency 404s, for the reclamation test */
     { "broken.js", "import { z } from './nope.js';\nexport const q = z;\n", 1 },
+    /* reports the url the host gave it, for the import.meta test */
+    { "meta.js", "export const where = import.meta.url;\n", 2 },
 };
 
 typedef struct PendingLoad {
@@ -249,6 +251,144 @@ static void run_case(const char *title, const char *root_src,
         }
     }
     printf("       %d host fetches issued\n", net.requests);
+    JS_FreeValue(ctx, r.value);
+ done:
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+/* The host has to be able to set import.meta.url. With an async loader it
+   never sees a JSModuleDef, so JS_SetModuleMetaFunc is the only hook for it -
+   and the root here is compiled by the caller and handed to
+   JS_LoadModuleAsync, which is the other half of the same story. */
+static void meta_func(JSContext *ctx, JSModuleDef *m, JSValueConst meta_obj,
+                      void *opaque)
+{
+    int *calls = opaque;
+    JSAtom name = JS_GetModuleName(ctx, m);
+    const char *str = JS_AtomToCString(ctx, name);
+
+    (*calls)++;
+    JS_SetPropertyStr(ctx, meta_obj, "url",
+                      JS_NewString(ctx, str ? str : "<unnamed>"));
+    JS_FreeCString(ctx, str);
+    JS_FreeAtom(ctx, name);
+}
+
+static void run_import_meta(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    FakeNet net;
+    Result r;
+    JSValue promise, mod;
+    int meta_calls = 0;
+    const char *src = "import { where } from './meta.js';\n"
+                      "export const out = import.meta.url + '|' + where;\n";
+
+    printf("\n== import.meta.url comes from the host ==\n");
+    memset(&net, 0, sizeof(net));
+    memset(&r, 0, sizeof(r));
+    r.value = JS_UNDEFINED;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    JS_SetModuleLoaderFuncAsync(rt, NULL, fake_loader, NULL, &net);
+    JS_SetModuleMetaFunc(rt, meta_func, &meta_calls);
+
+    /* compiled here rather than by JS_EvalModuleAsync, so the graph is started
+       from a module value the caller owns */
+    mod = JS_Eval(ctx, src, strlen(src), "http://localhost:3100/root.js",
+                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
+                  JS_EVAL_FLAG_ASYNC_LOAD);
+    check("a root compiled with JS_EVAL_FLAG_ASYNC_LOAD is a module",
+          !JS_IsException(mod));
+    if (JS_IsException(mod)) {
+        JS_FreeValue(ctx, mod);
+        goto done;
+    }
+
+    promise = JS_LoadModuleAsync(ctx, JS_VALUE_GET_PTR(mod));
+    JS_FreeValue(ctx, mod);
+    check("JS_LoadModuleAsync returned without loading anything",
+          net.requests > 0 && r.settled == 0);
+    track(ctx, promise, &r);
+    pump(ctx, rt, &net, &r);
+    JS_FreeValue(ctx, promise);
+
+    check("graph resolved", r.settled == 1);
+    if (r.settled == 1) {
+        JSValue v = JS_GetPropertyStr(ctx, r.value, "out");
+        const char *str = JS_ToCString(ctx, v);
+        const char *want = "http://localhost:3100/root.js|"
+                           "http://localhost:3100/meta.js";
+        char buf[256];
+        snprintf(buf, sizeof(buf), "both urls came from the host (got '%s')",
+                 str ? str : "<null>");
+        check(buf, str && !strcmp(str, want));
+        JS_FreeCString(ctx, str);
+        JS_FreeValue(ctx, v);
+    }
+    /* once per module that read import.meta, not once per module loaded */
+    check("the hook ran twice", meta_calls == 2);
+    JS_FreeValue(ctx, r.value);
+ done:
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+/* A host that fills import.meta in itself keeps precedence: that is what the
+   synchronous loaders do, and the hook must not overwrite it. */
+static void run_import_meta_precedence(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    FakeNet net;
+    Result r;
+    JSValue promise, mod, meta;
+    JSModuleDef *m;
+    int meta_calls = 0;
+    const char *src = "export const out = import.meta.url;\n";
+
+    printf("\n== a pre-filled import.meta wins over the hook ==\n");
+    memset(&net, 0, sizeof(net));
+    memset(&r, 0, sizeof(r));
+    r.value = JS_UNDEFINED;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    JS_SetModuleLoaderFuncAsync(rt, NULL, fake_loader, NULL, &net);
+    JS_SetModuleMetaFunc(rt, meta_func, &meta_calls);
+
+    mod = JS_Eval(ctx, src, strlen(src), "root.js",
+                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
+                  JS_EVAL_FLAG_ASYNC_LOAD);
+    if (JS_IsException(mod)) {
+        check("root compiled", false);
+        JS_FreeValue(ctx, mod);
+        goto done;
+    }
+    m = JS_VALUE_GET_PTR(mod);
+    meta = JS_GetImportMeta(ctx, m);
+    JS_SetPropertyStr(ctx, meta, "url", JS_NewString(ctx, "set-by-hand"));
+    JS_FreeValue(ctx, meta);
+
+    promise = JS_LoadModuleAsync(ctx, m);
+    JS_FreeValue(ctx, mod);
+    track(ctx, promise, &r);
+    pump(ctx, rt, &net, &r);
+    JS_FreeValue(ctx, promise);
+
+    check("graph resolved", r.settled == 1);
+    if (r.settled == 1) {
+        JSValue v = JS_GetPropertyStr(ctx, r.value, "out");
+        const char *str = JS_ToCString(ctx, v);
+        check("import.meta.url is still the host's value",
+              str && !strcmp(str, "set-by-hand"));
+        JS_FreeCString(ctx, str);
+        JS_FreeValue(ctx, v);
+    }
+    check("the hook did not run", meta_calls == 0);
     JS_FreeValue(ctx, r.value);
  done:
     JS_FreeContext(ctx);
@@ -580,6 +720,8 @@ int main(void)
              "export const out = z;\n",
              false, NULL, NULL);
 
+    run_import_meta();
+    run_import_meta_precedence();
     run_dynamic_import();
     run_dynamic_import_failure();
     run_failure_reclaim();

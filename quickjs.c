@@ -397,6 +397,8 @@ struct JSRuntime {
     } u;
     JSModuleCheckSupportedImportAttributes *module_check_attrs;
     void *module_loader_opaque;
+    JSModuleMetaFunc *module_meta_func;
+    void *module_meta_opaque;
     /* JSModuleLoadHandle.link - one entry per specifier being fetched, so
        that concurrent requests for the same module share a single load */
     struct list_head module_inflight_loads;
@@ -30618,6 +30620,12 @@ void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
     rt->normalize_u.module_normalize_func2 = module_normalize;
 }
 
+void JS_SetModuleMetaFunc(JSRuntime *rt, JSModuleMetaFunc *func, void *opaque)
+{
+    rt->module_meta_func = func;
+    rt->module_meta_opaque = opaque;
+}
+
 int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val)
 {
     set_value(ctx, &m->private_value, val);
@@ -31821,8 +31829,11 @@ JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
 
 static JSValue js_import_meta(JSContext *ctx)
 {
+    JSRuntime *rt = ctx->rt;
     JSAtom filename;
     JSModuleDef *m;
+    JSValue obj;
+    bool fresh;
 
     filename = JS_GetScriptOrModuleName(ctx, 0);
     if (filename == JS_ATOM_NULL)
@@ -31837,7 +31848,15 @@ static JSValue js_import_meta(JSContext *ctx)
         JS_ThrowTypeError(ctx, "import.meta not supported in this context");
         return JS_EXCEPTION;
     }
-    return JS_GetImportMeta(ctx, m);
+    /* spec: HostGetImportMetaProperties, on the first evaluation of
+       `import.meta` in this module. A host that already populated the object
+       through JS_GetImportMeta() -- which a synchronous loader can do, having
+       the JSModuleDef in hand -- is left alone. */
+    fresh = JS_IsUndefined(m->meta_obj);
+    obj = JS_GetImportMeta(ctx, m);
+    if (fresh && rt->module_meta_func && !JS_IsException(obj))
+        rt->module_meta_func(ctx, m, obj, rt->module_meta_opaque);
+    return obj;
 }
 
 static JSValue JS_NewModuleValue(JSContext *ctx, JSModuleDef *m)
@@ -32563,6 +32582,19 @@ static void js_load_module_by_name_async(JSContext *ctx, const char *basename,
     ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
     JS_FreeValue(ctx, ret);
     JS_FreeValue(ctx, err);
+}
+
+JSValue JS_LoadModuleAsync(JSContext *ctx, JSModuleDef *m)
+{
+    JSValue promise, resolving_funcs[2];
+
+    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+    if (JS_IsException(promise))
+        return JS_EXCEPTION;
+    js_load_module_async_internal(ctx, m, vc(resolving_funcs));
+    JS_FreeValue(ctx, resolving_funcs[0]);
+    JS_FreeValue(ctx, resolving_funcs[1]);
+    return promise;
 }
 
 JSValue JS_EvalModuleAsync(JSContext *ctx, const char *input, size_t input_len,
