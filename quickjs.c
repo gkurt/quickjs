@@ -382,6 +382,7 @@ struct JSRuntime {
     void *host_promise_rejection_tracker_opaque;
 
     struct list_head job_list; /* list of JSJobEntry.link */
+    bool in_job_pump; /* JS_ExecutePendingJob is on the stack */
 
     bool module_normalize_has_attr;
     union {
@@ -2548,10 +2549,20 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     JSValue res;
     int i, ret;
 
-    if (list_empty(&rt->job_list)) {
+    /* Refuse to run a job from inside one. A job can evaluate a module, and
+       js_inner_module_evaluation threads its stack through JSModuleDef.stack_prev
+       -- one field per module, shared by every traversal in flight, while
+       stack_top is a local in js_evaluate_module. Two overlapping traversals
+       splice each other's chains, and the second to finish pops until it reaches
+       the module it started from, which is no longer there: it walks off the end
+       and dereferences NULL. An embedder gets here by calling back into the
+       engine from a native binding a job reached. The outer loop still drains
+       whatever the nested code queued, so refusing costs nothing. */
+    if (rt->in_job_pump || list_empty(&rt->job_list)) {
         *pctx = NULL;
         return 0;
     }
+    rt->in_job_pump = true;
 
     /* get the first pending job and execute it */
     e = list_entry(rt->job_list.next, JSJobEntry, link);
@@ -2567,6 +2578,8 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     JS_FreeValue(ctx, res);
     js_free(ctx, e);
     *pctx = ctx;
+
+    rt->in_job_pump = false;
     return ret;
 }
 

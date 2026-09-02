@@ -1302,6 +1302,8 @@ JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 
 JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
 JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
+/* Not reentrant: called while a job is already running it does nothing and
+   returns 0, leaving the job for the pump already on the stack. */
 JS_EXTERN int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);
 
 /* Structure to retrieve (de)serialized SharedArrayBuffer objects. */

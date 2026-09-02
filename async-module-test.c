@@ -687,6 +687,77 @@ static void run_abandoned(void)
     }
 }
 
+/* The job pump must refuse to run a job from inside one. A job can evaluate a
+   module, and js_inner_module_evaluation threads its stack through a field on
+   JSModuleDef that every traversal in flight shares -- overlap two and the
+   second to finish walks off the end of a spliced chain. An embedder reaches
+   this by calling back into the engine from a native binding, which is what
+   `reenter` stands in for here. */
+static JSValue js_reenter_pump(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSContext *c;
+    int ran = 0;
+
+    while (JS_ExecutePendingJob(rt, &c) > 0)
+        ran++;
+    return JS_NewInt32(ctx, ran);
+}
+
+static void run_job_pump_reentrancy(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue global, val;
+    JSContext *c;
+    int outer = 0;
+    const char *src =
+        "globalThis.log = [];\n"
+        "globalThis.nested = -1;\n"
+        "Promise.resolve().then(() => { log.push('outer'); nested = reenter(); });\n"
+        "Promise.resolve().then(() => { log.push('inner'); });\n";
+
+    printf("\n== the job pump is not reentrant ==\n");
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+
+    global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "reenter",
+                      JS_NewCFunction(ctx, js_reenter_pump, "reenter", 0));
+    JS_FreeValue(ctx, global);
+
+    val = JS_Eval(ctx, src, strlen(src), "reentry.js", JS_EVAL_TYPE_GLOBAL);
+    check("setup evaluated", !JS_IsException(val));
+    JS_FreeValue(ctx, val);
+
+    while (JS_ExecutePendingJob(rt, &c) > 0)
+        outer++;
+
+    val = JS_Eval(ctx, "nested", 6, "check.js", JS_EVAL_TYPE_GLOBAL);
+    {
+        int32_t nested = -1;
+        JS_ToInt32(ctx, &nested, val);
+        check("the nested pump ran nothing", nested == 0);
+    }
+    JS_FreeValue(ctx, val);
+
+    /* Refusing must not lose the job -- the outer loop still drains it. */
+    val = JS_Eval(ctx, "log.join(',')", 13, "check.js", JS_EVAL_TYPE_GLOBAL);
+    {
+        const char *s = JS_ToCString(ctx, val);
+        check("both jobs still ran, in order", s && strcmp(s, "outer,inner") == 0);
+        JS_FreeCString(ctx, s);
+    }
+    JS_FreeValue(ctx, val);
+
+    check("the outer pump ran both", outer == 2);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     /* unbuffered: an assert() must not swallow the progress log */
@@ -727,6 +798,7 @@ int main(void)
     run_failure_reclaim();
     run_concurrent();
     run_abandoned();
+    run_job_pump_reentrancy();
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");
