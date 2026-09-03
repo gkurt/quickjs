@@ -40,6 +40,14 @@ static const FakeFile files[] = {
     { "broken.js", "import { z } from './nope.js';\nexport const q = z;\n", 1 },
     /* reports the url the host gave it, for the import.meta test */
     { "meta.js", "export const where = import.meta.url;\n", 2 },
+    /* victim.js reaches back into the host from its own module body, which is the
+       one moment it is EVALUATING and sitting on an evaluation stack. leaf.js gives
+       that stack a second entry so a spliced chain has somewhere to go wrong. */
+    { "leaf.js", "export const leaf = 'leaf';\n", 1 },
+    { "victim.js",
+      "import { leaf } from './leaf.js';\n"
+      "export const victim = 'victim:' + leaf;\n"
+      "pumpJobs();\n", 1 },
 };
 
 typedef struct PendingLoad {
@@ -687,6 +695,101 @@ static void run_abandoned(void)
     }
 }
 
+/* Linking and evaluation push onto a stack threaded through the same field on
+   JSModuleDef, and each is kept off the other's modules only by a status check.
+   js_inner_module_linking did not list EVALUATING, so a link pass reaching a module
+   whose body was running pushed it, overwrote the link its evaluation was holding,
+   and left that evaluation walking off the end of a spliced chain into NULL.
+
+   Upstream cannot get here: loading is synchronous, so linking and evaluation never
+   interleave. Loading asynchronously is what made them able to, which is what makes
+   this ours rather than upstream's. Two roots sharing a module is the ordinary case
+   - an entry document with two script tags - and `pumpJobs` is any host binding a
+   module body can reach that drains the queue. That is how it took down an editor. */
+static JSValue js_pump_jobs(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSContext *c;
+    int ran = 0;
+
+    while (JS_ExecutePendingJob(rt, &c) > 0)
+        ran++;
+    printf("    [host] a module body drained %d job(s)\n", ran);
+    return JS_NewInt32(ctx, ran);
+}
+
+static void run_link_during_evaluation(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    FakeNet net;
+    Result ra, rb;
+    JSValue global, promise, val;
+    int turn = 0;
+    const char *root_a = "import { victim } from './victim.js';\n"
+                         "globalThis.first = 'first(' + victim + ')';\n"
+                         "export const out = victim;\n";
+    const char *root_b = "import { victim } from './victim.js';\n"
+                         "globalThis.second = 'second(' + victim + ')';\n"
+                         "export const out = victim;\n";
+
+    printf("\n== two graphs sharing a module, one pumping from its body ==\n");
+    memset(&net, 0, sizeof(net));
+    memset(&ra, 0, sizeof(ra));
+    memset(&rb, 0, sizeof(rb));
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    JS_SetModuleLoaderFuncAsync(rt, NULL, fake_loader, NULL, &net);
+
+    global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "pumpJobs",
+                      JS_NewCFunction(ctx, js_pump_jobs, "pumpJobs", 0));
+    JS_FreeValue(ctx, global);
+
+    promise = JS_EvalModuleAsync(ctx, root_a, strlen(root_a), "rootA.js");
+    track(ctx, promise, &ra);
+    JS_FreeValue(ctx, promise);
+
+    promise = JS_EvalModuleAsync(ctx, root_b, strlen(root_b), "rootB.js");
+    track(ctx, promise, &rb);
+    JS_FreeValue(ctx, promise);
+
+    while ((ra.settled == 0 || rb.settled == 0) && turn < 200) {
+        JSContext *c;
+        turn++;
+        net_tick(ctx, &net, turn);
+        while (JS_ExecutePendingJob(rt, &c) > 0)
+            ;
+        if (net.pending == NULL && !JS_IsJobPending(rt))
+            break;
+    }
+
+    check("the graph whose body pumped resolved", ra.settled == 1);
+    check("the graph it pumped into resolved", rb.settled == 1);
+
+    val = JS_Eval(ctx, "globalThis.first + '/' + globalThis.second", 41,
+                  "check.js", JS_EVAL_TYPE_GLOBAL);
+    {
+        const char *got = JS_ToCString(ctx, val);
+        const char *want = "first(victim:leaf)/second(victim:leaf)";
+        check("both graphs ran, sharing one copy of the module",
+              got && strcmp(got, want) == 0);
+        if (!got || strcmp(got, want) != 0)
+            printf("    got '%s'\n", got ? got : "(none)");
+        JS_FreeCString(ctx, got);
+    }
+    JS_FreeValue(ctx, val);
+
+    check("every request was settled", net.fetches_started == 0);
+
+    JS_FreeValue(ctx, ra.value);
+    JS_FreeValue(ctx, rb.value);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     /* unbuffered: an assert() must not swallow the progress log */
@@ -727,6 +830,7 @@ int main(void)
     run_failure_reclaim();
     run_concurrent();
     run_abandoned();
+    run_link_during_evaluation();
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "ALL PASSED",
            failures, failures == 1 ? "" : "s");

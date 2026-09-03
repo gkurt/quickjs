@@ -31562,8 +31562,17 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
     }
 #endif
 
+    /* EVALUATING belongs here as much as the rest: a module cannot be evaluating
+       unless it was linked first, so there is nothing left to do for it. Leaving it
+       out let a link pass fall through to the push below and overwrite stack_prev on
+       a module an evaluation was holding on its own stack - both phases thread their
+       stack through that one field - which left the evaluation walking off the end of
+       a spliced chain into NULL. It only became reachable once modules could be
+       loaded asynchronously; while loading was synchronous the two phases could not
+       interleave, and the assert below stood in for the check. */
     if (m->status == JS_MODULE_STATUS_LINKING ||
         m->status == JS_MODULE_STATUS_LINKED ||
+        m->status == JS_MODULE_STATUS_EVALUATING ||
         m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
         m->status == JS_MODULE_STATUS_EVALUATED)
         return index;
@@ -33028,6 +33037,14 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
     if (m->status == JS_MODULE_STATUS_EVALUATING) {
         *pvalue = JS_UNDEFINED;
         return index;
+    }
+    /* The mirror of the above. Falling through with either of these would push a
+       module a link pass is holding, and the assert is not there in a release build. */
+    if (m->status == JS_MODULE_STATUS_UNLINKED ||
+        m->status == JS_MODULE_STATUS_LINKING) {
+        JS_ThrowTypeError(ctx, "module is being evaluated before it is linked");
+        *pvalue = JS_GetException(ctx);
+        return -1;
     }
     assert(m->status == JS_MODULE_STATUS_LINKED);
 
