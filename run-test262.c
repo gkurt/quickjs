@@ -394,7 +394,8 @@ void namelist_free(namelist_t *lp)
 static int add_test_file(const char *filename)
 {
     namelist_t *lp = &test_list;
-    if (js__has_suffix(filename, ".js") && !js__has_suffix(filename, "_FIXTURE.js"))
+    if ((js__has_suffix(filename, ".js") || js__has_suffix(filename, ".ts")) &&
+        !js__has_suffix(filename, "_FIXTURE.js"))
         namelist_add(lp, NULL, filename);
     return 0;
 }
@@ -1974,13 +1975,14 @@ int run_test(ThreadLocalStorage *tls, const char *filename, int *msec)
         atomic_inc(&test_skipped);
         ret = -2;
     } else {
+        eval_flags = js_eval_flags_for_filename(filename);
         if (local && detect_module) {
-            is_module = JS_DetectModule(buf, buf_len);
+            is_module = JS_DetectModule2(buf, buf_len, eval_flags);
         }
         if (is_module) {
-            eval_flags = JS_EVAL_TYPE_MODULE;
+            eval_flags |= JS_EVAL_TYPE_MODULE;
         } else {
-            eval_flags = JS_EVAL_TYPE_GLOBAL;
+            eval_flags |= JS_EVAL_TYPE_GLOBAL;
         }
         ret = 0;
         if (use_nostrict) {
@@ -2039,10 +2041,11 @@ int run_test262_harness_test(ThreadLocalStorage *tls, const char *filename,
 
     buf = load_file(filename, &buf_len);
 
+    eval_flags = js_eval_flags_for_filename(filename);
     if (is_module) {
-      eval_flags = JS_EVAL_TYPE_MODULE;
+      eval_flags |= JS_EVAL_TYPE_MODULE;
     } else {
-      eval_flags = JS_EVAL_TYPE_GLOBAL;
+      eval_flags |= JS_EVAL_TYPE_GLOBAL;
     }
     res_val = JS_Eval(ctx, buf, buf_len, filename, eval_flags);
     ret_code = 0;

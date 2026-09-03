@@ -11,5 +11,6 @@ cmake-*
 out/
 CMakeUserPresets.json
 fuzz
+fuzz_parse
 .vscode/
 microbench*.txt

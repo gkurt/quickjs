@@ -17,6 +17,7 @@ usage: qjs [options] [file [args]]
 -i  --interactive  go to interactive mode
 -m  --module       load as ES6 module (default=autodetect)
     --script       load as ES6 script (default=autodetect)
+    --ts           parse as TypeScript, erasing types (default for .ts/.mts/.cts)
 -I  --include file include an additional file
     --std          make 'std', 'os' and 'bjson' available to script
 -T  --trace        trace memory allocation

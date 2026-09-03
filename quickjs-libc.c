@@ -507,7 +507,7 @@ static JSValue js_loadScript(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     }
     ret = JS_Eval(ctx, (char *)buf, buf_len, filename,
-                  JS_EVAL_TYPE_GLOBAL);
+                  JS_EVAL_TYPE_GLOBAL | js_eval_flags_for_filename(filename));
     js_free(ctx, buf);
     JS_FreeCString(ctx, filename);
     return ret;
@@ -877,6 +877,19 @@ static int js_module_import_type(JSContext *ctx, JSValueConst attributes)
     return res;
 }
 
+int js_eval_flags_for_filename(const char *filename)
+{
+    if (js__has_suffix(filename, ".ts") ||
+        js__has_suffix(filename, ".mts") ||
+        js__has_suffix(filename, ".cts"))
+        return JS_EVAL_FLAG_TYPESCRIPT;
+    if (js__has_suffix(filename, ".tsx"))
+        return JS_EVAL_FLAG_TYPESCRIPT | JS_EVAL_FLAG_JSX;
+    if (js__has_suffix(filename, ".jsx"))
+        return JS_EVAL_FLAG_JSX;
+    return 0;
+}
+
 JSModuleDef *js_module_load(JSContext *ctx, const char *module_name,
                             void *opaque, JSValueConst attributes,
                             JSLoadFileFunc *load_file)
@@ -904,7 +917,8 @@ JSModuleDef *js_module_load(JSContext *ctx, const char *module_name,
     switch (type) {
     case JS_IMPORT_TYPE_JS:
         val = JS_Eval(ctx, buf, buf_len, module_name,
-                      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+                      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
+                      js_eval_flags_for_filename(module_name));
         break;
     case JS_IMPORT_TYPE_JSON:
         val = JS_ParseJSON(ctx, buf, buf_len, module_name);
@@ -1103,12 +1117,16 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
     bool compile_only = false;
     bool compile_module = false;
     bool is_async = false;
+    bool typescript = false;
     int flags;
 
     if (argc >= 2) {
         options_obj = argv[1];
         if (get_bool_option(ctx, &backtrace_barrier, options_obj,
                             "backtrace_barrier"))
+            return JS_EXCEPTION;
+        if (get_bool_option(ctx, &typescript, options_obj,
+                            "typescript"))
             return JS_EXCEPTION;
         if (get_bool_option(ctx, &eval_function, options_obj,
                             "eval_function"))
@@ -1157,11 +1175,30 @@ static JSValue js_evalScript(JSContext *ctx, JSValueConst this_val,
         flags |= JS_EVAL_FLAG_COMPILE_ONLY;
     if (is_async)
         flags |= JS_EVAL_FLAG_ASYNC;
+    if (typescript)
+        flags |= JS_EVAL_FLAG_TYPESCRIPT;
     if (eval_function) {
         obj = JS_DupValue(ctx, argv[0]);
         ret = JS_EvalFunction(ctx, obj); // takes ownership of |obj|
     } else {
-        ret = JS_Eval(ctx, str, len, "<evalScript>", flags);
+        /* optional "filename" option: used in stack traces and to resolve
+           relative imports of module code */
+        const char *filename = NULL;
+        JSValue filename_val = JS_UNDEFINED;
+        if (argc >= 2 && JS_IsObject(argv[1]))
+            filename_val = JS_GetPropertyStr(ctx, argv[1], "filename");
+        if (JS_IsException(filename_val)) {
+            ret = JS_EXCEPTION;
+        } else {
+            if (!JS_IsUndefined(filename_val))
+                filename = JS_ToCString(ctx, filename_val);
+            if (!JS_IsUndefined(filename_val) && !filename)
+                ret = JS_EXCEPTION;
+            else
+                ret = JS_Eval(ctx, str, len, filename ? filename : "<evalScript>", flags);
+            JS_FreeCString(ctx, filename);
+            JS_FreeValue(ctx, filename_val);
+        }
     }
     JS_FreeCString(ctx, str);
     if (!ts->recv_pipe && --ts->eval_script_recurse == 0) {

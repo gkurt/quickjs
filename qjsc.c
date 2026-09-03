@@ -248,7 +248,8 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
 
         /* compile the module */
         func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
-                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY |
+                           js_eval_flags_for_filename(module_name));
         js_free(ctx, buf);
         if (JS_IsException(func_val))
             return NULL;
@@ -282,10 +283,11 @@ static void compile_file(JSContext *ctx, FILE *fo,
         fprintf(stderr, "Could not load '%s'\n", filename);
         exit(1);
     }
-    eval_flags = JS_EVAL_FLAG_COMPILE_ONLY;
+    eval_flags = JS_EVAL_FLAG_COMPILE_ONLY | js_eval_flags_for_filename(filename);
     if (module < 0) {
         module = (js__has_suffix(filename, ".mjs") ||
-                  JS_DetectModule((const char *)buf, buf_len));
+                  js__has_suffix(filename, ".mts") ||
+                  JS_DetectModule2((const char *)buf, buf_len, eval_flags));
     }
     if (module)
         eval_flags |= JS_EVAL_TYPE_MODULE;

@@ -54,6 +54,10 @@ amalgam: $(QJS)
 	cd $(TEMP) && $(RM) quickjs-amalgam.zip quickjs-amalgam.c quickjs.h quickjs-libc.h
 	$(RM) -d $(TEMP)
 
+fuzz-parse:
+	clang -g -O1 -fsanitize=address,undefined,fuzzer -o fuzz_parse fuzz_parse.c
+	./fuzz_parse
+
 fuzz:
 	clang -g -O1 -fsanitize=address,undefined,fuzzer -o fuzz fuzz.c
 	./fuzz
@@ -98,6 +102,7 @@ jscheck:
 	$(CC) $(CFLAGS) api-test.c
 	$(CC) $(CFLAGS) ctest.c
 	$(CC) $(CFLAGS) fuzz.c
+	$(CC) $(CFLAGS) fuzz_parse.c
 	$(CC) $(CFLAGS) gen/function_source.c
 	$(CC) $(CFLAGS) gen/hello.c
 	$(CC) $(CFLAGS) gen/hello_module.c
@@ -146,4 +151,4 @@ unicode_gen: $(BUILD_DIR)
 libunicode-table.h: unicode_gen
 	$(BUILD_DIR)/unicode_gen unicode $@
 
-.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)
+.PHONY: all amalgam ctest cxxtest debug fuzz fuzz-parse jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)

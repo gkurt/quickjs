@@ -66,6 +66,10 @@ JS_LIBC_EXTERN JSModuleDef *js_module_load(JSContext *ctx, const char *module_na
                                            JSLoadFileFunc *load_file);
 JS_LIBC_EXTERN int js_module_check_attributes(JSContext *ctx, void *opaque,
                                               JSValueConst attributes);
+// returns the JS_EVAL_FLAG_* language flags implied by the file extension:
+// .ts/.mts/.cts -> JS_EVAL_FLAG_TYPESCRIPT, .tsx -> TYPESCRIPT|JSX,
+// .jsx -> JS_EVAL_FLAG_JSX, anything else -> 0
+JS_LIBC_EXTERN int js_eval_flags_for_filename(const char *filename);
 JS_LIBC_EXTERN void js_std_eval_binary(JSContext *ctx, const uint8_t *buf,
                                        size_t buf_len, int flags);
 JS_LIBC_EXTERN void js_std_promise_rejection_tracker(JSContext *ctx,

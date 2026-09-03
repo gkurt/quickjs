@@ -378,6 +378,11 @@ optional properties:
   script and a promise is returned. The promise is resolved with an
   object whose `value` property holds the value returned by the
   script.
+- `typescript` - Boolean (default = false). If true, the string is parsed
+  as TypeScript and the types are erased (see the TypeScript page).
+- `filename` - String (default = `"<evalScript>"`). Name used in error
+  messages and stack traces, and to resolve relative module specifiers
+  when compiling a module.
 
 ### `loadScript(filename)`
 

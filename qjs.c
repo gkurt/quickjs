@@ -149,7 +149,8 @@ end:
     return ret;
 }
 
-static int eval_file(JSContext *ctx, const char *filename, int module)
+static int eval_file(JSContext *ctx, const char *filename, int module,
+                     int lang_flags)
 {
     uint8_t *buf;
     int ret, eval_flags;
@@ -161,14 +162,17 @@ static int eval_file(JSContext *ctx, const char *filename, int module)
         exit(1);
     }
 
+    /* .ts/.mts/.cts files are parsed as TypeScript (types erased) */
+    eval_flags = lang_flags | js_eval_flags_for_filename(filename);
     if (module < 0) {
         module = (js__has_suffix(filename, ".mjs") ||
-                  JS_DetectModule((const char *)buf, buf_len));
+                  js__has_suffix(filename, ".mts") ||
+                  JS_DetectModule2((const char *)buf, buf_len, eval_flags));
     }
     if (module)
-        eval_flags = JS_EVAL_TYPE_MODULE;
+        eval_flags |= JS_EVAL_TYPE_MODULE;
     else
-        eval_flags = JS_EVAL_TYPE_GLOBAL;
+        eval_flags |= JS_EVAL_TYPE_GLOBAL;
     ret = eval_buf(ctx, buf, buf_len, filename, eval_flags);
     js_free(ctx, buf);
     return ret;
@@ -389,6 +393,7 @@ void help(int exit_status)
            "-i  --interactive  go to interactive mode\n"
            "-C  --script       load as JS classic script (default=autodetect)\n"
            "-m  --module       load as ES module (default=autodetect)\n"
+           "    --ts           parse as TypeScript, erasing types (default for .ts/.mts/.cts)\n"
            "-I  --include file include an additional file\n"
            "    --std          make 'std', 'os' and 'bjson' available to script\n"
            "-T  --trace        trace memory allocation\n"
@@ -427,6 +432,7 @@ int main(int argc, char **argv)
     int trace_memory = 0;
     int empty_run = 0;
     int module = -1;
+    int lang_flags = 0;
     int load_std = 0;
     char *include_list[32];
     int i, include_count = 0;
@@ -514,6 +520,10 @@ int main(int argc, char **argv)
             }
             if (opt == 'C' || !strcmp(longopt, "script")) {
                 module = 0;
+                continue;
+            }
+            if (!strcmp(longopt, "ts")) {
+                lang_flags |= JS_EVAL_FLAG_TYPESCRIPT;
                 continue;
             }
             if (opt == 'd' || !strcmp(longopt, "dump")) {
@@ -656,7 +666,7 @@ start:
         }
 
         for(i = 0; i < include_count; i++) {
-            if (eval_file(ctx, include_list[i], 0))
+            if (eval_file(ctx, include_list[i], 0, lang_flags))
                 goto fail;
         }
 
@@ -688,7 +698,7 @@ start:
             JS_FreeValue(ctx, args[1]);
             JS_FreeValue(ctx, args[2]);
         } else if (expr) {
-            int flags = module ? JS_EVAL_TYPE_MODULE : 0;
+            int flags = (module ? JS_EVAL_TYPE_MODULE : 0) | lang_flags;
             if (eval_buf(ctx, expr, strlen(expr), "<cmdline>", flags))
                 goto fail;
         } else if (optind >= argc) {
@@ -697,7 +707,7 @@ start:
         } else {
             const char *filename;
             filename = argv[optind];
-            if (eval_file(ctx, filename, module))
+            if (eval_file(ctx, filename, module, lang_flags))
                 goto fail;
         }
         if (interactive) {

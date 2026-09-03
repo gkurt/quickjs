@@ -464,6 +464,15 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 /* allow top-level await in normal script. JS_Eval() returns a
    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
 #define JS_EVAL_FLAG_ASYNC (1 << 7)
+/* accept TypeScript syntax and erase it: type annotations, generics,
+   type aliases, interfaces, `as`/`satisfies`, non-null `!`, ambient
+   declarations, type-only imports and exports. Only erasable syntax is
+   supported: enums, namespaces, parameter properties and
+   `import x = require()` are rejected with a SyntaxError (same rules as
+   Node's --experimental-strip-types / tsc --erasableSyntaxOnly). */
+#define JS_EVAL_FLAG_TYPESCRIPT (1 << 8)
+/* reserved for JSX; not implemented yet, currently rejected */
+#define JS_EVAL_FLAG_JSX (1 << 9)
 
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
@@ -1034,6 +1043,9 @@ JS_EXTERN JSValue JS_CallConstructor2(JSContext *ctx, JSValueConst func_obj,
  * Returns false if QuickJS was built with -DQJS_DISABLE_PARSER.
  */
 JS_EXTERN bool JS_DetectModule(const char *input, size_t input_len);
+/* same, with JS_EVAL_FLAG_* flags (e.g. JS_EVAL_FLAG_TYPESCRIPT) */
+JS_EXTERN bool JS_DetectModule2(const char *input, size_t input_len,
+                                int eval_flags);
 /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
 JS_EXTERN JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
                           const char *filename, int eval_flags);
