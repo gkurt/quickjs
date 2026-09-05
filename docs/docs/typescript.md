@@ -124,6 +124,31 @@ ts-blank-space, `tsc`'s `transpileModule` and babel run in JavaScript.
 `--per-file` prints the same table for every file and `--json` saves all
 measurements.
 
+### Compared with Node and Bun
+
+Node and Bun also run TypeScript by erasing types, Node with a stripping
+pass (amaro, swc compiled to wasm) before V8 compiles the output, Bun in
+its own transpiler, which every file goes through before JavaScriptCore
+compiles it. `bench/ts_runtimes_bench.mjs` measures, for each of the
+three, the time to get the TypeScript of the corpus ready to run against
+the time for the same code with the types blanked out. V8 and
+JavaScriptCore compile lazily and QuickJS compiles everything, so only
+the overheads are comparable, not the columns. Milliseconds, totals over
+the corpus, same machine as above:
+
+| runtime                              | TypeScript | blanked JS | overhead | of which erasing types                   |
+|--------------------------------------|-----------:|-----------:|---------:|------------------------------------------|
+| `qjs --ts` 0.16.2, compile           |       40.6 |       33.0 |     +23% | 7.7 ms in the parser                     |
+| node 22.22, strip + compile          |      179.0 |       47.3 |    +278% | 131.8 ms in `stripTypeScriptTypes`       |
+| bun 1.4.2, transpile + compile       |       48.6 |       46.2 |      +5% | 2.3 ms more in the transpiler (35.3 vs 33.0) |
+
+Bun's transpiler parses TypeScript natively, like QuickJS, and erasing
+costs it almost nothing; the stripping pass Node runs first costs more
+than V8's compile of the whole corpus. Bun's compile step is approximated
+with `new Function` on the transpiler output with its import and export
+statements removed, since module code cannot be compiled without being
+run.
+
 ### Other benchmarks
 
 `bench/ts_parse_bench.js` measures, inside `qjs`, the compile time of each
