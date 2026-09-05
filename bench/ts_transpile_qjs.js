@@ -10,7 +10,11 @@
 // running it.
 //
 // Modules are compiled against empty stubs of their imports (see
-// ts_module_stubs.js), so only the file itself is measured.
+// ts_module_stubs.js), so only the file itself is measured. A context
+// keeps every module it compiled, so compiling a source thousands of
+// times retains memory, which slows down what is measured after it: every
+// source is measured in a worker thread of its own, which has a fresh
+// runtime.
 //
 // job:    { rounds, min_ms, files: [{ name, module, sources: { label: { code, typescript } } }] }
 // result: { version, files: { name: { label: microseconds | { error } } } }
@@ -18,12 +22,6 @@ import * as std from "qjs:std";
 import * as os from "qjs:os";
 import { stubImports } from "./ts_module_stubs.js";
 
-const [, job_path, result_path] = scriptArgs;
-if (!result_path) {
-    console.log("usage: qjs bench/ts_transpile_qjs.js <job.json> <result.json>");
-    std.exit(1);
-}
-const job = JSON.parse(std.loadFile(job_path));
 // milliseconds; os.now() counts microseconds
 const now = os.now ? () => os.now() / 1000 : () => Date.now();
 
@@ -49,25 +47,51 @@ function measure(fn, rounds, min_ms) {
     return best;
 }
 
-const files = {};
-for (const { name, module, sources } of job.files) {
-    const results = files[name] = {};
-    if (module)
-        stubImports(name + ".ts", sources.ts.code);
-    for (const [label, { code, typescript }] of Object.entries(sources)) {
-        const filename = name + (typescript ? ".ts" : ".js");
-        try {
-            compile(code, filename, module, typescript);
-        } catch (e) {
-            results[label] = { error: String(e) };
-            continue;
-        }
-        results[label] = measure(() => compile(code, filename, module, typescript), job.rounds, job.min_ms);
+// worker: measure one source
+function measureSource({ name, module, imports, code, typescript, rounds, min_ms }) {
+    const filename = name + (typescript ? ".ts" : ".js");
+    try {
+        if (module)
+            stubImports(filename, imports);
+        compile(code, filename, module, typescript);
+    } catch (e) {
+        return { error: String(e) };
     }
+    return measure(() => compile(code, filename, module, typescript), rounds, min_ms);
 }
 
-const version = typeof navigator === "object" && navigator.userAgent
-    ? navigator.userAgent.replace(/^quickjs-ng\//, "") : "";
-const out = std.open(result_path, "w");
-out.puts(JSON.stringify({ version, files }));
-out.close();
+if (os.Worker.parent) {
+    const parent = os.Worker.parent;
+    parent.onmessage = e => {
+        parent.postMessage(measureSource(e.data));
+        parent.onmessage = null; // done: terminates the worker
+    };
+} else {
+    const [, job_path, result_path] = scriptArgs;
+    if (!result_path) {
+        console.log("usage: qjs bench/ts_transpile_qjs.js <job.json> <result.json>");
+        std.exit(1);
+    }
+    const job = JSON.parse(std.loadFile(job_path));
+    const inWorker = msg => new Promise(resolve => {
+        const worker = new os.Worker("./ts_transpile_qjs.js");
+        worker.onmessage = e => {
+            worker.onmessage = null;
+            resolve(e.data);
+        };
+        worker.postMessage(msg);
+    });
+    const files = {};
+    for (const { name, module, sources } of job.files) {
+        const results = files[name] = {};
+        // the imports of the TypeScript source cover those of every output
+        const imports = sources.ts.code;
+        for (const [label, { code, typescript }] of Object.entries(sources))
+            results[label] = await inWorker({ name, module, imports, code, typescript, rounds: job.rounds, min_ms: job.min_ms });
+    }
+    const version = typeof navigator === "object" && navigator.userAgent
+        ? navigator.userAgent.replace(/^quickjs-ng\//, "") : "";
+    const out = std.open(result_path, "w");
+    out.puts(JSON.stringify({ version, files }));
+    out.close();
+}

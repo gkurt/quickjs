@@ -8,9 +8,13 @@
 // ts-blank-space or amaro (Node's type stripping) and to compile the
 // output. This measures both for every file of a corpus: the time each
 // transpiler takes, the time QuickJS then takes to compile its output, and
-// the time QuickJS takes to compile the TypeScript directly. Every
-// transpiler is configured to only erase types (no import elision, no
-// downleveling), so all outputs are the same program. Times are the best
+// the time QuickJS takes to compile the TypeScript directly. For the
+// overhead of the erasure itself, QuickJS also compiles pre-stripped
+// JavaScript: the ts-blank-space output (types replaced by blanks, so the
+// same length as the source) with and without the TypeScript flag, and a
+// compact transpiler output. Every transpiler is configured to only erase
+// types (no import elision, no downleveling), so all outputs are the same
+// program. Times are the best
 // of a few rounds of repeated in-process calls, i.e. warm; for the Node
 // tools that means after JIT warm-up.
 //
@@ -285,6 +289,9 @@ try {
             if (r.code !== undefined)
                 sources[name] = { code: r.code, typescript: false };
         }
+        // the TypeScript flag on JavaScript without types
+        if (sources["ts-blank-space"])
+            sources.blank_flag = { code: sources["ts-blank-space"].code, typescript: true };
         const job = { rounds: opts.rounds, min_ms: opts.min_ms, files: [{ name: f.name, module: f.module, sources }] };
         fs.writeFileSync(job_path, JSON.stringify(job));
         execFileSync(opts.qjs, [path.join(bench_dir, "ts_transpile_qjs.js"), job_path, result_path], { stdio: "inherit" });
@@ -306,10 +313,13 @@ const us = t => typeof t === "number" ? t.toFixed(0) : "-";
 const mbps = (bytes, t) => typeof t === "number" ? (bytes / t).toFixed(1) : "-";
 const ratio = (t, base) => typeof t === "number" && typeof base === "number" ? (t / base).toFixed(2) + "x" : "-";
 
-const per_file = {};    // file -> { bytes, quickjs: us | error, tools: { name -> { transpile, compile, error } } }
+// pre-stripped JavaScript compiled by QuickJS: the blanked twin, with and
+// without the TypeScript flag, and the first available compact output
+const compact = ["oxc", "swc", "sucrase", "esbuild", "amaro", "tsc", "babel"].find(name => tools[name]);
+const per_file = {};    // file -> { bytes, quickjs: us | error, quickjs_blank_flag: us | error | undefined, tools: { name -> { transpile, compile, error } } }
 for (const f of files) {
     const q = qjs.files[f.name];
-    const entry = per_file[f.name] = { bytes: f.bytes, quickjs: q.ts, tools: {} };
+    const entry = per_file[f.name] = { bytes: f.bytes, quickjs: q.ts, quickjs_blank_flag: q.blank_flag, tools: {} };
     for (const [name, tool] of Object.entries(tools)) {
         const r = tool.results[f.name];
         if (r.error)
@@ -332,9 +342,9 @@ const bytes_of = list => list.reduce((s, f) => s + f.bytes, 0);
 
 // rows: [name, version, files, bytes, transpile, compile, total, quickjs total on the same files, failures]
 function table(rows) {
-    console.log("tool                version  files    transpile  qjs compile        total  vs qjs --ts    MB/s  fail");
+    console.log("tool                    version  files    transpile  qjs compile        total  vs qjs --ts    MB/s  fail");
     for (const [name, ver, n, bytes, transpile, compile, total, base, fail] of rows) {
-        console.log(name.padEnd(18), String(ver).padStart(10), String(n).padStart(6), us(transpile).padStart(12),
+        console.log(name.padEnd(22), String(ver).padStart(10), String(n).padStart(6), us(transpile).padStart(12),
                     us(compile).padStart(12), us(total).padStart(12), ratio(total, base).padStart(12),
                     mbps(bytes, total).padStart(7), (fail ? String(fail) : "").padStart(5));
     }
@@ -342,13 +352,31 @@ function table(rows) {
 function rowsFor(list) {
     const ts = sum(list, e => e.quickjs);
     const rows = [["quickjs --ts", qjs.version || "", list.length, bytes_of(list), undefined, ts, ts, ts, 0]];
+    // QuickJS on pre-stripped JavaScript
+    const pre = [];
+    if (tools["ts-blank-space"]) {
+        pre.push(["qjs, blanked JS", list => list.filter(f => !per_file[f.name].tools["ts-blank-space"].error),
+                  e => e.tools["ts-blank-space"].compile]);
+        pre.push(["qjs --ts, blanked JS", list => list.filter(f => typeof per_file[f.name].quickjs_blank_flag === "number"),
+                  e => e.quickjs_blank_flag]);
+    }
+    if (compact)
+        pre.push([`qjs, ${compact} JS`, list => list.filter(f => !per_file[f.name].tools[compact].error), e => e.tools[compact].compile]);
+    for (const [name, filter, time] of pre) {
+        const handled = filter(list);
+        const compile = sum(handled, time);
+        rows.push([name, qjs.version || "", handled.length, bytes_of(handled), undefined, compile,
+                   handled.length ? compile : undefined, sum(handled, e => e.quickjs), list.length - handled.length]);
+    }
+    const first_tool = rows.length;
     for (const [name, tool] of Object.entries(tools)) {
         const handled = list.filter(f => !per_file[f.name].tools[name].error);
         const transpile = sum(handled, e => e.tools[name].transpile), compile = sum(handled, e => e.tools[name].compile);
         rows.push([name, tool.version, handled.length, bytes_of(handled), transpile, compile,
                    handled.length ? transpile + compile : undefined, sum(handled, e => e.quickjs), list.length - handled.length]);
     }
-    rows.splice(1, rows.length - 1, ...rows.slice(1).sort((a, b) => (a[6] ?? Infinity) - (b[6] ?? Infinity)));
+    rows.splice(first_tool, rows.length - first_tool,
+                ...rows.slice(first_tool).sort((a, b) => (a[6] ?? Infinity) - (b[6] ?? Infinity)));
     return rows;
 }
 
@@ -357,11 +385,17 @@ console.log(`\n${ok_files.length} files, ${(bytes_of(ok_files) / 1024).toFixed(0
             "each tool over the files it handles, quickjs --ts compared on the same files.");
 console.log(`node ${process.versions.node}, quickjs-ng ${qjs.version || "?"} (${opts.qjs})\n`);
 table(rowsFor(ok_files));
-const blank_ok = ok_files.filter(f => !per_file[f.name].tools["ts-blank-space"]?.error);
-if (tools["ts-blank-space"] && blank_ok.length) {
+const pct = (a, b) => ((a / b - 1) * 100).toFixed(1) + "%";
+const blank_ok = ok_files.filter(f => !per_file[f.name].tools["ts-blank-space"]?.error &&
+                                      typeof per_file[f.name].quickjs_blank_flag === "number");
+if (blank_ok.length) {
     const blanked = sum(blank_ok, e => e.tools["ts-blank-space"].compile), ts = sum(blank_ok, e => e.quickjs);
-    console.log(`\nquickjs compiles the same code without types (the ts-blank-space output) in ${us(blanked)} us: ` +
-                `erasing the types costs ${((ts / blanked - 1) * 100).toFixed(1)}%`);
+    const flag = sum(blank_ok, e => e.quickjs_blank_flag);
+    console.log(`\nquickjs --ts overhead: erasing the types costs ${pct(ts, blanked)} over compiling the same code ` +
+                `with the types blanked out; the flag costs ${pct(flag, blanked)} on JavaScript without types` +
+                (compact && !per_file[blank_ok[0].name].tools[compact].error
+                 ? `; the TypeScript compiles ${pct(ts, sum(blank_ok.filter(f => !per_file[f.name].tools[compact].error), e => e.tools[compact].compile))} slower than the compact ${compact} output`
+                 : ""));
 }
 const notes = Object.entries(tools).filter(([, t]) => t.note).map(([n, t]) => `${n}: ${t.note}`);
 if (notes.length)
