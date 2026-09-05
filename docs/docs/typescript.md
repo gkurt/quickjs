@@ -64,8 +64,8 @@ Decorators and JSX (`.tsx`) are not supported yet.
 
 Types are erased in the same single pass that produces the bytecode, so
 there is no transpile step and nothing to re-parse. On real-world code a
-TypeScript file compiles 20-25% slower than the same code with the types
-blanked out, and the flag costs 1-2% on code without types
+TypeScript file compiles 25-30% slower than the same code with the types
+blanked out, and the flag costs about 2% on code without types
 (ambiguous syntax such as `<` and `(` needs a look-ahead).
 
 ### Compared with transpilers
@@ -90,31 +90,39 @@ The corpus is the TypeScript source of a few libraries that ship it on
 npm (rxjs, zod, effect, mobx, Redux Toolkit, redux, immer, TanStack
 query-core), 167 files of 1 KB to 380 KB. Any directory of `.ts` files can
 be passed instead. Totals over the 167 files (2.2 MB) of the corpus, in
-milliseconds, Node 22 on Linux x86-64, one run on one machine:
+milliseconds, Node 22 on Linux x86-64, one run on one machine. The first
+rows are QuickJS alone: the TypeScript, then the JavaScript a transpiler
+would hand it, compiled without and with the flag:
 
-| tool           | version | transpile | qjs compile | total | vs `qjs --ts` |
-|----------------|---------|----------:|------------:|------:|--------------:|
-| `qjs --ts`     | 0.16.2  |         - |        25.9 |  25.9 |         1.00x |
-| oxc            | 0.148.0 |      25.2 |        18.0 |  43.1 |         1.67x |
-| swc            | 1.16.2  |      49.7 |        18.5 |  68.3 |         2.64x |
-| amaro          | 1.1.11  |      58.3 |        21.9 |  80.1 |         3.10x |
-| sucrase        | 3.35.1  |      64.8 |        17.3 |  82.1 |         3.45x |
-| ts-blank-space | 0.9.0   |     109.0 |        21.7 | 130.7 |         5.06x |
-| esbuild        | 0.28.2  |     206.7 |        17.5 | 224.2 |         8.67x |
-| tsc            | 5.9.3   |     509.1 |        19.0 | 528.1 |        20.43x |
-| babel          | 7.29.7  |     579.2 |        19.5 | 598.7 |        23.16x |
+| tool                    | version | transpile | qjs compile |  total | vs `qjs --ts` |
+|-------------------------|---------|----------:|------------:|-------:|--------------:|
+| `qjs --ts`, TypeScript  | 0.16.2  |         - |        41.3 |   41.3 |         1.00x |
+| `qjs`, blanked JS       | 0.16.2  |         - |        32.2 |   32.2 |         0.78x |
+| `qjs --ts`, blanked JS  | 0.16.2  |         - |        32.8 |   32.8 |         0.79x |
+| `qjs`, oxc JS           | 0.16.2  |         - |        27.4 |   27.4 |         0.66x |
+| oxc                     | 0.148.0 |      36.0 |        27.4 |   63.4 |         1.54x |
+| swc                     | 1.16.2  |      80.9 |        28.3 |  109.2 |         2.65x |
+| amaro                   | 1.1.11  |      96.2 |        31.8 |  127.9 |         3.10x |
+| sucrase                 | 3.35.1  |     156.6 |        27.9 |  184.5 |         4.85x |
+| ts-blank-space          | 0.9.0   |     197.7 |        32.2 |  229.9 |         5.57x |
+| esbuild                 | 0.28.2  |     324.6 |        26.7 |  351.3 |         8.51x |
+| tsc                     | 5.9.3   |     891.3 |        29.0 |  920.3 |        22.29x |
+| babel                   | 7.29.7  |    1162.1 |        28.0 | 1190.2 |        28.83x |
 
 `qjs compile` is parsing plus bytecode generation of the JavaScript each
-tool produced, the same program in every case. Compiling the TypeScript
-directly costs 20-25% more than compiling it with the types blanked out
-(the ts-blank-space row, whose output is as long as the source) and about
-45% more than compiling a transpiler's compact output, which is
-still well below the cost of running any transpiler first. The native
-transpilers come closest: oxc and swc through N-API, amaro (swc compiled
-to wasm), and esbuild, whose asynchronous API includes a round trip to
-its service process. sucrase, ts-blank-space, `tsc`'s `transpileModule`
-and babel run in JavaScript. `--per-file` prints the same table for every
-file and `--json` saves all measurements.
+tool produced, the same program in every case. "Blanked JS" is the
+ts-blank-space output, in which every type is replaced by blanks, so it is
+as long as the source: the difference to the TypeScript row, about 28%,
+is the cost of erasing the types, and the difference between the two
+blanked rows, about 2%, is the cost of the flag on code without types.
+"oxc JS" is a compact transpiler output; the TypeScript compiles about
+50% slower than it, which is still well below the cost of running any
+transpiler first. The native transpilers come closest: oxc and swc
+through N-API, amaro (swc compiled to wasm), and esbuild, whose
+asynchronous API includes a round trip to its service process. sucrase,
+ts-blank-space, `tsc`'s `transpileModule` and babel run in JavaScript.
+`--per-file` prints the same table for every file and `--json` saves all
+measurements.
 
 ### Other benchmarks
 
