@@ -29,6 +29,10 @@ import defaultHelper from "./fixture_ts_module.ts";
                   
                           
                                                    
+                                                            
+                                                                 
+                                                                          
+                                                                                                          
                                        
                                            
                                        
@@ -648,4 +652,6 @@ export function exportedFn   (x   )    { return x; }
 export function exportedOverload(x     )      { return x; }
 export class ExportedClass                     { x = 1; y = 2; v    ; }
 export { n as exportedN,                                       };
+                                                        
+                                                            
 export default class DefaultClass    { v     }
