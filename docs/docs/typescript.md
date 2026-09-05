@@ -129,6 +129,8 @@ measurements.
 `bench/ts_parse_bench.js` measures, inside `qjs`, the compile time of each
 corpus file as TypeScript against its type-blanked JavaScript twin (the
 cost of erasure) and the twin with the TypeScript flag on (the cost of the
-flag on code without types). `bench/ts_parse_depth.js` checks that nested
+flag on code without types). `bench/ts_corpus_check.js` checks that every
+corpus file compiles to the same bytecode as its twin, debug information
+included, like `tests/test_ts_bytecode.js` does for the test file. `bench/ts_parse_depth.js` checks that nested
 ambiguous constructs such as `a < b < c < ...` do not blow up the parse
 time: speculative parses are memoized and do not build error objects.
