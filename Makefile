@@ -145,10 +145,15 @@ test262-check: $(QJS)
 microbench: $(QJS)
 	$(QJS) tests/microbench.js
 
+# TypeScript type erasure vs. transpilers (sucrase, esbuild, swc, ...); needs node
+ts-bench: $(QJS)
+	cd bench && npm install --no-audit --no-fund
+	node bench/ts_transpile_bench.mjs --qjs $(abspath $(QJS)) $(TS_CORPUS)
+
 unicode_gen: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target unicode_gen
 
 libunicode-table.h: unicode_gen
 	$(BUILD_DIR)/unicode_gen unicode $@
 
-.PHONY: all amalgam ctest cxxtest debug fuzz fuzz-parse jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)
+.PHONY: all amalgam ctest cxxtest debug fuzz fuzz-parse jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench ts-bench unicode_gen $(QJS) $(QJSC)

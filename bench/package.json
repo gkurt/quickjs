@@ -1,0 +1,17 @@
+{
+  "name": "quickjs-ts-bench",
+  "private": true,
+  "description": "TypeScript transpilers compared with QuickJS-ng's built-in type erasure. Run `npm install` here, then `node ts_transpile_bench.mjs`.",
+  "type": "module",
+  "dependencies": {
+    "@babel/core": "^7",
+    "@babel/preset-typescript": "^7",
+    "@swc/core": "^1",
+    "amaro": "^1",
+    "esbuild": "^0.28",
+    "oxc-transform": "^0.148",
+    "sucrase": "^3",
+    "ts-blank-space": "^0.9",
+    "typescript": "^5"
+  }
+}

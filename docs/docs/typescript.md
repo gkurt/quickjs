@@ -64,8 +64,47 @@ Decorators and JSX (`.tsx`) are not supported yet.
 
 Types are erased in the same single pass that produces the bytecode, so
 there is no transpile step and nothing to re-parse. On real-world code a
-TypeScript file compiles about 25% slower than the equivalent JavaScript,
-and the flag costs a few percent on code without types (ambiguous syntax
-such as `<` and `(` needs a look-ahead). `bench/ts_parse_bench.js`
-measures this on a corpus of files and `bench/ts_parse_depth.js` checks
-that nested ambiguous constructs do not blow up the parse time.
+TypeScript file compiles a few percent slower than the equivalent
+JavaScript, and the flag costs a few percent on code without types
+(ambiguous syntax such as `<` and `(` needs a look-ahead).
+
+### Compared with transpilers
+
+The alternative to built-in erasure is to transpile to JavaScript first
+and compile the output. `bench/ts_transpile_bench.mjs` measures both on a
+corpus of TypeScript files: the time each transpiler takes in Node, the
+time `qjs` then takes to compile its output, and the time `qjs` takes to
+compile the TypeScript directly. All transpilers are configured to only
+erase types (no import elision, no downleveling), and every measurement is
+the best of a few rounds of repeated in-process calls, so the Node tools
+are timed after JIT warm-up.
+
+```
+$ make            # a release build of qjs
+$ cd bench && npm install && cd ..
+$ node bench/ts_corpus.mjs           # downloads the corpus from npm
+$ node bench/ts_transpile_bench.mjs  # or: make ts-bench
+```
+
+The corpus is the TypeScript source of a few libraries that ship it on
+npm (rxjs, zod, effect, mobx, Redux Toolkit, redux, immer, TanStack
+query-core), 167 files of 1 KB to 380 KB. Any directory of `.ts` files can
+be passed instead.
+
+In the table it prints, `qjs compile` is parsing plus bytecode generation of the JavaScript each
+tool produced, which is about the same for all of them since the outputs
+are the same program; QuickJS does it directly from the TypeScript for a
+few percent more. The native transpilers (oxc, swc, and esbuild, whose
+asynchronous API includes a round trip to its service process) come
+closest; sucrase, ts-blank-space, babel and `tsc`'s `transpileModule` run
+in JavaScript. `--per-file` prints the same table for every file and
+`--json` saves all measurements.
+
+### Other benchmarks
+
+`bench/ts_parse_bench.js` measures, inside `qjs`, the compile time of each
+corpus file as TypeScript against its type-blanked JavaScript twin (the
+cost of erasure) and the twin with the TypeScript flag on (the cost of the
+flag on code without types). `bench/ts_parse_depth.js` checks that nested
+ambiguous constructs such as `a < b < c < ...` do not blow up the parse
+time: speculative parses are memoized and do not build error objects.
