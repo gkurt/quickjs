@@ -25475,6 +25475,31 @@ static int ts_skip_type_args(JSParseState *s)
 }
 
 /* skip '<' T [extends X] [= Y] (',' ...)* '>'; the current token is '<' */
+static int ts_skip_type_params(JSParseState *s);
+
+/* Skip the type parameters of a method or arrow function, the current
+   token is '<', and return the position the function starts at: the '('
+   that follows, as in the equivalent JavaScript source, unless the type
+   parameters span lines, in which case the equivalent JavaScript has its
+   '(' where the '<' was (a line break must not appear where there was
+   none: `return <\nT>(x) => x` returns the function) and the function
+   starts there. */
+static int ts_skip_function_type_params(JSParseState *s, int *pline_num, int *pcol_num)
+{
+    int lt_line_num = s->token.line_num, lt_col_num = s->token.col_num;
+
+    if (ts_skip_type_params(s))
+        return -1;
+    if (s->token.line_num != lt_line_num) {
+        *pline_num = lt_line_num;
+        *pcol_num = lt_col_num;
+    } else {
+        *pline_num = s->token.line_num;
+        *pcol_num = s->token.col_num;
+    }
+    return 0;
+}
+
 static int ts_skip_type_params(JSParseState *s)
 {
     if (next_token(s))
@@ -27455,6 +27480,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
         } else {
             JSParseFunctionEnum func_type;
             JSFunctionKindEnum func_kind;
+            int func_line_num, func_col_num;
 
             func_type = JS_PARSE_FUNC_METHOD;
             func_kind = JS_FUNC_NORMAL;
@@ -27479,14 +27505,19 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             }
             if (s->ts && s->token.val == '<') {
                 /* method type parameters: the function starts at the
-                   '(' as in the equivalent JavaScript source */
-                if (ts_skip_type_params(s))
+                   '(' as in the equivalent JavaScript source. When the
+                   type parameters span lines the equivalent JavaScript
+                   has its '(' where the '<' was (an erased line break
+                   could change the meaning of the code, e.g. after
+                   `return`), so the function starts there. */
+                if (ts_skip_function_type_params(s, &func_line_num, &func_col_num))
                     goto fail;
+            } else {
+                func_line_num = s->token.line_num;
+                func_col_num = s->token.col_num;
             }
             if (js_parse_function_decl2(s, func_type, func_kind, JS_ATOM_NULL,
-                                        start_ptr,
-                                        s->token.line_num,
-                                        s->token.col_num,
+                                        start_ptr, func_line_num, func_col_num,
                                         JS_PARSE_EXPORT_NONE, &method_fd))
                 goto fail;
             if (func_type == JS_PARSE_FUNC_DERIVED_CLASS_CONSTRUCTOR ||
@@ -30013,15 +30044,17 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
     } else if (s->ts && !s->jsx && s->token.val == '<' &&
                (ret = ts_is_generic_arrow(s)) != 0) {
         /* generic arrow function: <T>(x: T) => x. The function starts
-           at the '(' as in the equivalent JavaScript source */
+           at the '(' as in the equivalent JavaScript source, or where
+           the '<' was when the type parameters span lines, see
+           ts_skip_function_type_params() */
+        int line_num, col_num;
         if (ret < 0)
             return -1;
-        if (ts_skip_type_params(s))
+        if (ts_skip_function_type_params(s, &line_num, &col_num))
             return -1;
         return js_parse_function_decl(s, JS_PARSE_FUNC_ARROW,
                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
-                                      s->token.ptr, s->token.line_num,
-                                      s->token.col_num);
+                                      s->token.ptr, line_num, col_num);
     } else if (token_is_pseudo_keyword(s, JS_ATOM_async)) {
         const uint8_t *source_ptr;
         int tok, source_line_num, source_col_num;

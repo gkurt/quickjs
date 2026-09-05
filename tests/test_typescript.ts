@@ -134,6 +134,22 @@ function overload(x: number): number;
 function overload(x: any): any { return x; }
 assert(overload("s"), "s");
 assert(overload(2), 2);
+// type parameters spanning lines: the function starts where the '<' was,
+// as in the equivalent JavaScript (checked by the bytecode oracle)
+const multiLineGeneric = <
+    T,
+>(x: T): T => x;
+assert(multiLineGeneric(7), 7);
+class MultiLineGeneric {
+    id<
+        T,
+    >(x: T): T { return x; }
+    static make<
+        T,
+    >(x: T): T { return x; }
+}
+assert(new MultiLineGeneric().id("m"), "m");
+assert(MultiLineGeneric.make(8), 8);
 function generic<T extends object, U = T>(x: T, y?: U): T { return x; }
 assert(generic({ a: 1 }).a, 1);
 assert(generic<{ a: number }>({ a: 2 }).a, 2);

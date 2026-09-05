@@ -134,6 +134,22 @@ assert(withThisOnly.length, 0);
 function overload(x     )      { return x; }
 assert(overload("s"), "s");
 assert(overload(2), 2);
+// type parameters spanning lines: the function starts where the '<' was,
+// as in the equivalent JavaScript (checked by the bytecode oracle)
+const multiLineGeneric = (
+      
+  x   )    => x;
+assert(multiLineGeneric(7), 7);
+class MultiLineGeneric {
+    id(
+          
+      x   )    { return x; }
+    static make(
+          
+      x   )    { return x; }
+}
+assert(new MultiLineGeneric().id("m"), "m");
+assert(MultiLineGeneric.make(8), 8);
 function generic                         (x   , y    )    { return x; }
 assert(generic({ a: 1 }).a, 1);
 assert(generic               ({ a: 2 }).a, 2);
