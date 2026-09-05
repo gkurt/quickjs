@@ -1,7 +1,8 @@
 // Does erasing types cost QuickJS more than it costs Node or Bun?
 //
 //   node bench/ts_runtimes_bench.mjs [--qjs PATH] [--node PATH] [--bun PATH]
-//                                    [--files N] [--rounds N] [--min-ms N] [--json FILE] [corpus]
+//                                    [--only quickjs,node,bun] [--files N] [--rounds N] [--min-ms N]
+//                                    [--json FILE] [corpus]
 //
 // For every file of the corpus (bench/corpus by default, see
 // bench/ts_corpus.mjs; the type-blanked twins are needed) each runtime
@@ -32,7 +33,7 @@ import { fileURLToPath } from "node:url";
 
 const bench_dir = path.dirname(fileURLToPath(import.meta.url));
 const root_dir = path.dirname(bench_dir);
-const opts = { rounds: 3, min_ms: 50, files: 0, json: null, qjs: null, node: process.execPath, bun: "bun" };
+const opts = { rounds: 3, min_ms: 50, files: 0, json: null, qjs: null, node: process.execPath, bun: "bun", only: null };
 let corpus = path.join(bench_dir, "corpus");
 for (let i = 2; i < process.argv.length; i++) {
     const a = process.argv[i];
@@ -43,8 +44,9 @@ for (let i = 2; i < process.argv.length; i++) {
     else if (a === "--rounds") opts.rounds = +process.argv[++i];
     else if (a === "--min-ms") opts.min_ms = +process.argv[++i];
     else if (a === "--json") opts.json = process.argv[++i];
+    else if (a === "--only") opts.only = new Set(process.argv[++i].split(","));
     else if (a.startsWith("-")) {
-        console.log("usage: node bench/ts_runtimes_bench.mjs [--qjs PATH] [--node PATH] [--bun PATH] [--files N] [--rounds N] [--min-ms N] [--json FILE] [corpus]");
+        console.log("usage: node bench/ts_runtimes_bench.mjs [--qjs PATH] [--node PATH] [--bun PATH] [--only quickjs,node,bun] [--files N] [--rounds N] [--min-ms N] [--json FILE] [corpus]");
         process.exit(a === "-h" || a === "--help" ? 0 : 1);
     } else corpus = a;
 }
@@ -90,10 +92,13 @@ function run(label, cmd, args, job) {
     return JSON.parse(fs.readFileSync(result_path, "utf8"));
 }
 
+const want = name => !opts.only || opts.only.has(name);
+
 // ---- QuickJS, one process per file
-const qjs = { version: "", files: {} };
-process.stderr.write(`${opts.qjs}...`);
-for (const f of files) {
+const qjs = want("quickjs") ? { version: "", files: {} } : null;
+if (qjs)
+    process.stderr.write(`${opts.qjs}...`);
+for (const f of qjs ? files : []) {
     const job = { rounds: opts.rounds, min_ms: opts.min_ms,
                   files: [{ name: f.name, module: f.module, sources: { ts: { code: f.ts, typescript: true }, js: { code: f.js, typescript: false } } }] };
     fs.writeFileSync(job_path, JSON.stringify(job));
@@ -102,12 +107,13 @@ for (const f of files) {
     qjs.version = r.version;
     Object.assign(qjs.files, r.files);
 }
-process.stderr.write(" done\n");
+if (qjs)
+    process.stderr.write(" done\n");
 
 // ---- Node and Bun
 const job = { rounds: opts.rounds, min_ms: opts.min_ms, files: files.map(f => ({ name: f.name, ts: f.ts, js: f.js })) };
-const node = run("node", opts.node, ["--no-warnings", "--experimental-vm-modules", "--expose-gc", path.join(bench_dir, "ts_runtimes_node.mjs")], job);
-const bun = run("bun", opts.bun, [path.join(bench_dir, "ts_runtimes_bun.ts")], job);
+const node = want("node") && run("node", opts.node, ["--no-warnings", "--experimental-vm-modules", "--expose-gc", path.join(bench_dir, "ts_runtimes_node.mjs")], job);
+const bun = want("bun") && run("bun", opts.bun, [path.join(bench_dir, "ts_runtimes_bun.ts")], job);
 fs.rmSync(tmp, { recursive: true, force: true });
 
 // ---- report
@@ -120,7 +126,7 @@ const errors = res => files.filter(f => res && !ok(res, f)).map(f => `${f.name}:
 console.log(`\n${files.length} files, ${(total_bytes / 1024).toFixed(0)} KB of TypeScript. Best of ${opts.rounds} rounds of >= ${opts.min_ms} ms, milliseconds, totals over the corpus.\n`);
 console.log("runtime                                    TypeScript  blanked JS  overhead   of which erasing types");
 const rows = [];
-{
+if (qjs) {
     const ts = sum(qjs, r => r.ts), js = sum(qjs, r => r.js);
     rows.push([`quickjs ${qjs.version} --ts (compile)`, ts, js, `${ms(ts - js)} ms in the parser`]);
 }
@@ -142,5 +148,5 @@ for (const [label, res] of [["node", node], ["bun", bun]])
         console.log(`${label} fails on ${e}`);
 if (opts.json)
     fs.writeFileSync(opts.json, JSON.stringify({ date: new Date().toISOString(), rounds: opts.rounds, min_ms: opts.min_ms,
-        files: Object.fromEntries(files.map(f => [f.name, { bytes: f.bytes, quickjs: qjs.files[f.name], node: node?.files[f.name], bun: bun?.files[f.name] }])),
-        versions: { quickjs: qjs.version, node: node?.version, v8: node?.v8, bun: bun?.version } }, null, 1));
+        files: Object.fromEntries(files.map(f => [f.name, { bytes: f.bytes, quickjs: qjs?.files[f.name], node: node?.files[f.name], bun: bun?.files[f.name] }])),
+        versions: { quickjs: qjs?.version, node: node?.version, v8: node?.v8, bun: bun?.version } }, null, 1));
