@@ -140,11 +140,13 @@ the corpus, same machine as above:
 |--------------------------------------|-----------:|-----------:|---------:|------------------------------------------|
 | `qjs --ts` 0.16.2, compile           |       40.6 |       33.0 |     +23% | 7.7 ms in the parser                     |
 | node 22.22, strip + compile          |      179.0 |       47.3 |    +278% | 131.8 ms in `stripTypeScriptTypes`       |
+| node 26.8, strip + compile           |      112.1 |       33.3 |    +236% | 78.5 ms in `stripTypeScriptTypes`        |
 | bun 1.4.2, transpile + compile       |       48.6 |       46.2 |      +5% | 2.3 ms more in the transpiler (35.3 vs 33.0) |
 
 Bun's transpiler parses TypeScript natively, like QuickJS, and erasing
 costs it almost nothing; the stripping pass Node runs first costs more
-than V8's compile of the whole corpus. Bun's compile step is approximated
+than V8's compile of the whole corpus, in Node 26 (amaro 1.1.11, V8 14.6)
+as in Node 22 (amaro 1.1.5, V8 12.4). Bun's compile step is approximated
 with `new Function` on the transpiler output with its import and export
 statements removed, since module code cannot be compiled without being
 run.
