@@ -22431,10 +22431,6 @@ typedef struct JSParseState {
        a conditional type cannot appear unparenthesized and `infer U
        extends C` is a constraint, see ts_skip_type() */
     bool ts_no_conditional;
-    /* > 0 while skipping TypeScript type syntax: identifiers are looked
-       up but not interned, an unknown one has atom JS_ATOM_NULL, see
-       ts_lookup_end() */
-    int ts_lookup_only;
 } JSParseState;
 
 typedef struct JSOpCode {
@@ -22623,15 +22619,12 @@ static int js_parse_expect(JSParseState *s, int tok)
     case TOK_REGEXP:
         return js_parse_error(s, "Unexpected regexp");
     case TOK_IDENT:
-        if (s->token.u.ident.atom == JS_ATOM_NULL)
-            goto default_token; /* not interned, see ts_lookup_end() */
         return js_parse_error(s, "Unexpected identifier '%s'",
                               JS_AtomGetStr(s->ctx, buf, sizeof(buf),
                                             s->token.u.ident.atom));
     case TOK_ERROR:
         return js_parse_error(s, "Invalid or unexpected token");
     default:
-    default_token:
         return js_parse_error(s, "Unexpected token '%.*s'",
                               (int)(s->buf_ptr - s->token.ptr),
                               (const char *)s->token.ptr);
@@ -23088,14 +23081,7 @@ static JSAtom parse_ident(JSParseState *s, const uint8_t **pp,
         }
     }
     /* buf is pure ASCII or UTF-8 encoded */
-    if (s->ts_lookup_only) {
-        /* type syntax being skipped: the identifier is dropped right
-           away, so look it up (keywords and names used elsewhere are
-           found) but do not intern it. JS_ATOM_NULL if unknown. */
-        atom = __JS_FindAtom(s->ctx->rt, buf, ident_pos, JS_ATOM_TYPE_STRING);
-    } else {
-        atom = JS_NewAtomLen(s->ctx, buf, ident_pos);
-    }
+    atom = JS_NewAtomLen(s->ctx, buf, ident_pos);
  done:
     if (unlikely(buf != ident_buf))
         js_free(s->ctx, buf);
@@ -23267,17 +23253,12 @@ static __exception int next_token(JSParseState *s)
         ident_has_escape = false;
     has_ident:
         atom = parse_ident(s, &p, &ident_has_escape, c, false);
+        if (atom == JS_ATOM_NULL)
+            goto fail;
         s->token.u.ident.atom = atom;
         s->token.u.ident.has_escape = ident_has_escape;
         s->token.u.ident.is_reserved = false;
         s->token.val = TOK_IDENT;
-        if (atom == JS_ATOM_NULL) {
-            if (!s->ts_lookup_only || JS_HasException(s->ctx))
-                goto fail;
-            /* unknown identifier in type syntax being skipped: not
-               interned (it is not a keyword either) */
-            break;
-        }
         update_token_ident(s);
         break;
     case '#':
@@ -23300,10 +23281,9 @@ static __exception int next_token(JSParseState *s)
             p = p_next;
             ident_has_escape = false; /* not used */
             atom = parse_ident(s, &p, &ident_has_escape, c, true);
-            if (atom == JS_ATOM_NULL &&
-                (!s->ts_lookup_only || JS_HasException(s->ctx)))
+            if (atom == JS_ATOM_NULL)
                 goto fail;
-            s->token.u.ident.atom = atom; /* JS_ATOM_NULL: see has_ident */
+            s->token.u.ident.atom = atom;
             s->token.val = TOK_PRIVATE_NAME;
         }
         break;
@@ -25249,76 +25229,6 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
 static int ts_skip_type(JSParseState *s);
 static int ts_skip_type_operand(JSParseState *s);
 
-/* Lookup-only lexing of type syntax.
-
-   Type syntax is lexed with the normal lexer but its identifiers are
-   dropped as soon as they are read, so while s->ts_lookup_only is set
-   parse_ident() looks identifiers up without interning them: keywords
-   and names that also appear in code are found (and classified as
-   usual), a name that only appears in types gets atom JS_ATOM_NULL,
-   which costs neither an allocation nor a free. The type skippers only
-   ever compare atoms against keywords, so an unknown one is just "some
-   identifier" to them.
-
-   The one token that must not stay that way is the token after the
-   type: it is lexed while the mode is on, and the parser proper then
-   uses its atom. Every type skipper the parser calls is wrapped in
-   ts_lookup_begin()/ts_lookup_end(), and when the outermost one returns
-   ts_lookup_end() re-lexes that token normally if it was not interned.
-   Speculative parses that back out re-lex from the saved position and
-   need nothing. */
-static void ts_lookup_begin(JSParseState *s)
-{
-    s->ts_lookup_only++;
-}
-
-/* re-lex the current token, an identifier or private name with atom
-   JS_ATOM_NULL, in normal mode. It has no line terminator, so only the
-   state next_token() sets before scanning must be preserved. */
-static __exception int ts_intern_token(JSParseState *s)
-{
-    const uint8_t *last_ptr = s->last_ptr;
-    int last_line_num = s->last_line_num, last_col_num = s->last_col_num;
-    bool got_lf = s->got_lf;
-
-    s->buf_ptr = s->token.ptr;
-    if (next_token(s))
-        return -1;
-    s->last_ptr = last_ptr;
-    s->last_line_num = last_line_num;
-    s->last_col_num = last_col_num;
-    s->got_lf = got_lf;
-    return 0;
-}
-
-static int ts_lookup_end(JSParseState *s, int ret)
-{
-    if (--s->ts_lookup_only == 0 && ret >= 0 &&
-        (s->token.val == TOK_IDENT || s->token.val == TOK_PRIVATE_NAME) &&
-        s->token.u.ident.atom == JS_ATOM_NULL) {
-        if (ts_intern_token(s))
-            return -1;
-    }
-    return ret;
-}
-
-/* A type skipper hands over to the parser proper for a while (an
-   `abstract class` is a class): lex normally until ts_lookup_resume(). */
-static __exception int ts_lookup_suspend(JSParseState *s, int *psaved)
-{
-    *psaved = s->ts_lookup_only;
-    s->ts_lookup_only = 0;
-    if ((s->token.val == TOK_IDENT || s->token.val == TOK_PRIVATE_NAME) &&
-        s->token.u.ident.atom == JS_ATOM_NULL)
-        return ts_intern_token(s);
-    return 0;
-}
-
-static void ts_lookup_resume(JSParseState *s, int saved)
-{
-    s->ts_lookup_only = saved;
-}
-
 /* the return type of a function type: a conditional type is allowed
    there even inside the `extends` type of a conditional type */
 static int ts_skip_return_type(JSParseState *s)
@@ -25429,7 +25339,7 @@ static bool ts_is_gt_token(int tok)
 /* consume the '>' closing a type argument list. The tokenizer may have
    merged it with what follows ('>>', '>=', ...): re-scan from the second
    character in that case. */
-static int ts_expect_gt_in(JSParseState *s)
+static int ts_expect_gt(JSParseState *s)
 {
     if (s->token.val == '>')
         return next_token(s);
@@ -25440,17 +25350,8 @@ static int ts_expect_gt_in(JSParseState *s)
     return js_parse_expect(s, '>');
 }
 
-static int ts_expect_gt(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_expect_gt_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* skip an optional ': type' */
-static int ts_skip_type_annotation_in(JSParseState *s)
+static int ts_skip_type_annotation(JSParseState *s)
 {
     if (s->token.val != ':')
         return 0;
@@ -25459,19 +25360,10 @@ static int ts_skip_type_annotation_in(JSParseState *s)
     return ts_skip_type(s);
 }
 
-static int ts_skip_type_annotation(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_type_annotation_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* skip a balanced (...), [...] or {...} group; the current token is the
    opening bracket. Template literals are handled, regexps are not (they
    cannot appear in types). */
-static int ts_skip_balanced_in(JSParseState *s)
+static int ts_skip_balanced(JSParseState *s)
 {
     char state[256];
     int level = 0, open;
@@ -25532,15 +25424,6 @@ static int ts_skip_balanced_in(JSParseState *s)
     }
 }
 
-static int ts_skip_balanced(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_balanced_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* skip a template literal type; the current token is TOK_TEMPLATE */
 static int ts_skip_template_type(JSParseState *s)
 {
@@ -25580,7 +25463,7 @@ static int ts_skip_type_args1(JSParseState *s)
 }
 
 /* skip '<' type (',' type)* '>'; the current token is '<' */
-static int ts_skip_type_args_in(JSParseState *s)
+static int ts_skip_type_args(JSParseState *s)
 {
     const uint8_t *start = s->token.ptr;
 
@@ -25591,17 +25474,8 @@ static int ts_skip_type_args_in(JSParseState *s)
     return 0;
 }
 
-static int ts_skip_type_args(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_type_args_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* skip '<' T [extends X] [= Y] (',' ...)* '>'; the current token is '<' */
-static int ts_skip_type_params_in(JSParseState *s)
+static int ts_skip_type_params(JSParseState *s)
 {
     if (next_token(s))
         return -1;
@@ -25642,15 +25516,6 @@ static int ts_skip_type_params_in(JSParseState *s)
     return 0;
 }
 
-static int ts_skip_type_params(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_type_params_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* true if the next token can start a type */
 static bool ts_peek_starts_type(JSParseState *s)
 {
@@ -25661,7 +25526,7 @@ static bool ts_peek_starts_type(JSParseState *s)
 }
 
 /* skip one type; the current token is its first token */
-static int ts_skip_type_in(JSParseState *s)
+static int ts_skip_type(JSParseState *s)
 {
     bool no_conditional = s->ts_no_conditional;
 
@@ -25705,17 +25570,8 @@ static int ts_skip_type_in(JSParseState *s)
     return 0;
 }
 
-static int ts_skip_type(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_type_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* skip a type without union/intersection/conditional continuation */
-static int ts_skip_type_operand_in(JSParseState *s)
+static int ts_skip_type_operand(JSParseState *s)
 {
     switch (s->token.val) {
     case '(':
@@ -25937,20 +25793,11 @@ static int ts_skip_type_operand_in(JSParseState *s)
     return 0;
 }
 
-static int ts_skip_type_operand(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_type_operand_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* In an expression, the current token is '<'. Try to parse a type
    argument list: consume it and return 1 if it is followed by a token that
    makes it unambiguous (f<T>(x), f<T>`...`, instantiation expressions),
    otherwise restore the position and return 0. */
-static int ts_try_type_args_in(JSParseState *s)
+static int ts_try_type_args(JSParseState *s)
 {
     JSParsePos pos;
     int ok;
@@ -25999,22 +25846,13 @@ static int ts_try_type_args_in(JSParseState *s)
     return ok;
 }
 
-static int ts_try_type_args(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_try_type_args_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* The current token is the '=>' of an arrow function with a return type
    annotation in the true branch of a conditional expression:
    `a ? (b): c => d : e`. As in TypeScript, the return type is accepted
    only if the ':' of the conditional follows the arrow function body.
    Scan the body without parsing it; return 1 if it is followed by ':',
    0 otherwise, -1 on error. */
-static int ts_arrow_body_followed_by_colon_in(JSParseState *s)
+static int ts_arrow_body_followed_by_colon(JSParseState *s)
 {
     int pending = 0; /* '?' of nested conditional expressions */
 
@@ -26055,15 +25893,6 @@ static int ts_arrow_body_followed_by_colon_in(JSParseState *s)
         if (next_token(s))
             return -1;
     }
-}
-
-static int ts_arrow_body_followed_by_colon(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_arrow_body_followed_by_colon_in(s);
-    return ts_lookup_end(s, ret);
 }
 
 /* The current token is '('. Return 1 if it starts the parameter list of
@@ -26109,7 +25938,7 @@ static int js_parse_is_arrow_params(JSParseState *s, bool allow_ret_type)
 
 /* The current token is '<'. Return 1 if it starts a generic arrow
    function <T>(x: T) => x, 0 if not, -1 on error. */
-static int ts_is_generic_arrow_in(JSParseState *s)
+static int ts_is_generic_arrow(JSParseState *s)
 {
     JSParsePos pos;
     int ret = 0;
@@ -26130,19 +25959,10 @@ static int ts_is_generic_arrow_in(JSParseState *s)
     return ret;
 }
 
-static int ts_is_generic_arrow(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_is_generic_arrow_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* The current token is 'function' or 'async'. If the declaration is an
    overload signature (no body), consume it and return 1; otherwise leave
    the position unchanged and return 0. */
-static int ts_skip_function_overload_in(JSParseState *s)
+static int ts_skip_function_overload(JSParseState *s)
 {
     JSParsePos pos;
 
@@ -26189,15 +26009,6 @@ static int ts_skip_function_overload_in(JSParseState *s)
     if (js_parse_seek_token(s, &pos))
         return -1;
     return 0;
-}
-
-static int ts_skip_function_overload(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_function_overload_in(s);
-    return ts_lookup_end(s, ret);
 }
 
 /* skip optional import attributes: with { type: "json" } */
@@ -26461,7 +26272,7 @@ static int ts_skip_type_only_namespace(JSParseState *s)
    namespaces; enums and namespaces with runtime code are rejected.
    Return 1 if one was parsed (and erased), 0 if the current token does
    not start one, -1 on error. */
-static int ts_parse_declaration_in(JSParseState *s, JSParseExportEnum export_flag)
+static int ts_parse_declaration(JSParseState *s, JSParseExportEnum export_flag)
 {
     JSParsePos pos;
     int tok;
@@ -26489,12 +26300,9 @@ static int ts_parse_declaration_in(JSParseState *s, JSParseExportEnum export_fla
         if (next_token(s))
             return -1;
         if (s->token.val == TOK_CLASS && !s->got_lf) {
-            int saved, ret;
-            if (ts_lookup_suspend(s, &saved))
+            if (js_parse_class(s, false, export_flag))
                 return -1;
-            ret = js_parse_class(s, false, export_flag);
-            ts_lookup_resume(s, saved);
-            return ret ? -1 : 1;
+            return 1;
         }
         return js_parse_seek_token(s, &pos) ? -1 : 0;
     case JS_ATOM_namespace:
@@ -26510,19 +26318,10 @@ static int ts_parse_declaration_in(JSParseState *s, JSParseExportEnum export_fla
     }
 }
 
-static int ts_parse_declaration(JSParseState *s, JSParseExportEnum export_flag)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_parse_declaration_in(s, export_flag);
-    return ts_lookup_end(s, ret);
-}
-
 /* TypeScript-only export forms; the current token follows `export`.
    Return 1 if the statement was consumed (erased), 0 if it is a regular
    export, -1 on error. */
-static int ts_parse_export_declaration_in(JSParseState *s)
+static int ts_parse_export_declaration(JSParseState *s)
 {
     JSParsePos pos;
     int ret, tok;
@@ -26608,20 +26407,11 @@ static int ts_parse_export_declaration_in(JSParseState *s)
     return ts_parse_declaration(s, JS_PARSE_EXPORT_NAMED);
 }
 
-static int ts_parse_export_declaration(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_parse_export_declaration_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* In an import or export clause, the current token is `type`. If it
    starts a type-only specifier (`type X`, `type X as Y`, `type as`,
    `type as as X`), consume the specifier and return 1. Otherwise `type`
    is a binding name: leave the position unchanged and return 0. */
-static int ts_skip_type_specifier_in(JSParseState *s)
+static int ts_skip_type_specifier(JSParseState *s)
 {
     JSParsePos pos;
     bool type_only;
@@ -26664,19 +26454,10 @@ static int ts_skip_type_specifier_in(JSParseState *s)
     return 1;
 }
 
-static int ts_skip_type_specifier(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_type_specifier_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* `import type ...`: the current token is `type` (after `import`). If this
    is a type-only import, skip the whole statement and return 1; otherwise
    restore the position and return 0. */
-static int ts_skip_type_only_import_in(JSParseState *s)
+static int ts_skip_type_only_import(JSParseState *s)
 {
     JSParsePos pos;
 
@@ -26724,22 +26505,13 @@ static int ts_skip_type_only_import_in(JSParseState *s)
     return js_parse_expect_semi(s) ? -1 : 1;
 }
 
-static int ts_skip_type_only_import(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_type_only_import_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 #define TS_MOD_DECLARE  (1 << 0)
 #define TS_MOD_ABSTRACT (1 << 1)
 
 /* skip TypeScript class member modifiers (public, private, protected,
    readonly, override, abstract, declare) when followed by a member name
    on the same line */
-static int ts_parse_class_modifiers_in(JSParseState *s, int *pmods)
+static int ts_parse_class_modifiers(JSParseState *s, int *pmods)
 {
     JSAtom atom;
     int tok;
@@ -26770,18 +26542,9 @@ static int ts_parse_class_modifiers_in(JSParseState *s, int *pmods)
     }
 }
 
-static int ts_parse_class_modifiers(JSParseState *s, int *pmods)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_parse_class_modifiers_in(s, pmods);
-    return ts_lookup_end(s, ret);
-}
-
 /* the current token is '['. Return 1 if it starts an index signature
    `[key: string]: T` */
-static int ts_is_index_signature_in(JSParseState *s)
+static int ts_is_index_signature(JSParseState *s)
 {
     JSParsePos pos;
     int ret = 0;
@@ -26799,19 +26562,10 @@ static int ts_is_index_signature_in(JSParseState *s)
     return ret;
 }
 
-static int ts_is_index_signature(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_is_index_signature_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* The current token follows a class member name: '(' or '<'. Return 1 if
    the member is a method signature without a body (overload signature or
    abstract method), 0 if it has a body, -1 on error. */
-static int ts_is_method_signature_in(JSParseState *s)
+static int ts_is_method_signature(JSParseState *s)
 {
     JSParsePos pos;
     int ret = 0;
@@ -26839,20 +26593,11 @@ static int ts_is_method_signature_in(JSParseState *s)
     return ret;
 }
 
-static int ts_is_method_signature(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_is_method_signature_in(s);
-    return ts_lookup_end(s, ret);
-}
-
 /* The current token is the '[' of a computed class member name. Return 1
    if the member is erased (a method signature without a body, or an
    abstract or declared property): its key expression is not evaluated, as
    in the output of tsc. */
-static int ts_is_erased_computed_member_in(JSParseState *s, int mods)
+static int ts_is_erased_computed_member(JSParseState *s, int mods)
 {
     JSParsePos pos;
     int ret = 0;
@@ -26883,17 +26628,8 @@ static int ts_is_erased_computed_member_in(JSParseState *s, int mods)
     return ret;
 }
 
-static int ts_is_erased_computed_member(JSParseState *s, int mods)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_is_erased_computed_member_in(s, mods);
-    return ts_lookup_end(s, ret);
-}
-
 /* skip `<T>(params): T;` */
-static int ts_skip_signature_in(JSParseState *s)
+static int ts_skip_signature(JSParseState *s)
 {
     if (s->token.val == '<') {
         if (ts_skip_type_params(s))
@@ -26909,15 +26645,6 @@ static int ts_skip_signature_in(JSParseState *s)
         return -1;
     ts_erased(s);
     return 0;
-}
-
-static int ts_skip_signature(JSParseState *s)
-{
-    int ret;
-
-    ts_lookup_begin(s);
-    ret = ts_skip_signature_in(s);
-    return ts_lookup_end(s, ret);
 }
 
 static void set_object_name(JSParseState *s, JSAtom name)
