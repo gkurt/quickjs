@@ -26,6 +26,10 @@ type K = keyof Obj;
 type V = Obj["a"];
 type TO = typeof constObj;
 type Inf<T> = T extends Array<infer U> ? U : never;
+type InfC<T> = T extends infer U extends string ? U : never;
+type InfT<T> = T extends `${infer U extends string}` ? U : never;
+type InfF<T> = T extends () => infer R extends string ? 1 : 0 ? R : never;
+type InfN<T> = T extends infer U extends string ? (U extends infer V extends `${number}` ? V : 0) : never;
 type U2 = ((x: number) => void) | null;
 type Ctor = new (...args: any[]) => object;
 type ACtor = abstract new () => object;
@@ -645,4 +649,6 @@ export function exportedOverload(x: string): string;
 export function exportedOverload(x: any): any { return x; }
 export class ExportedClass<T> implements Point { x = 1; y = 2; v?: T; }
 export { n as exportedN, type Point as PointAgain, type Point3 };
+export default function DefaultClass(x: string): string;
+export default async function DefaultClass(): Promise<void>;
 export default class DefaultClass<T> { v?: T }

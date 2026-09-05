@@ -22427,6 +22427,10 @@ typedef struct JSParseState {
     /* > 0 while speculatively parsing TypeScript syntax that will be
        backtracked on failure: syntax errors are not materialized */
     int ts_trial;
+    /* set while skipping the `extends` type of a conditional type, where
+       a conditional type cannot appear unparenthesized and `infer U
+       extends C` is a constraint, see ts_skip_type() */
+    bool ts_no_conditional;
 } JSParseState;
 
 typedef struct JSOpCode {
@@ -25225,6 +25229,19 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
 static int ts_skip_type(JSParseState *s);
 static int ts_skip_type_operand(JSParseState *s);
 
+/* the return type of a function type: a conditional type is allowed
+   there even inside the `extends` type of a conditional type */
+static int ts_skip_return_type(JSParseState *s)
+{
+    bool no_conditional = s->ts_no_conditional;
+    int ret;
+
+    s->ts_no_conditional = false;
+    ret = ts_skip_type(s);
+    s->ts_no_conditional = no_conditional;
+    return ret;
+}
+
 /* true if the current token is the identifier or keyword `atom`, written
    without escapes */
 static bool ts_token_is(JSParseState *s, JSAtom atom)
@@ -25511,6 +25528,8 @@ static bool ts_peek_starts_type(JSParseState *s)
 /* skip one type; the current token is its first token */
 static int ts_skip_type(JSParseState *s)
 {
+    bool no_conditional = s->ts_no_conditional;
+
     if (js_check_stack_overflow(s->ctx->rt, 0)) {
         JS_ThrowStackOverflow(s->ctx);
         return -1;
@@ -25528,12 +25547,16 @@ static int ts_skip_type(JSParseState *s)
         if (next_token(s))
             return -1;
     }
-    /* conditional type: T extends U ? X : Y */
-    if (s->token.val == TOK_EXTENDS) {
+    /* conditional type: T extends U ? X : Y. U cannot itself be a
+       conditional type (`T extends A extends B ? X : Y ? Z : W` is not
+       allowed); X and Y can. */
+    if (!no_conditional && s->token.val == TOK_EXTENDS) {
         if (next_token(s))
             return -1;
+        s->ts_no_conditional = true;
         if (ts_skip_type(s))
             return -1;
+        s->ts_no_conditional = false;
         if (js_parse_expect(s, '?'))
             return -1;
         if (ts_skip_type(s))
@@ -25594,7 +25617,7 @@ static int ts_skip_type_operand(JSParseState *s)
                     return js_parse_error(s, "expecting '=>' in function type");
                 if (next_token(s))
                     return -1;
-                return ts_skip_type(s);
+                return ts_skip_return_type(s);
             }
         }
         break;
@@ -25610,7 +25633,7 @@ static int ts_skip_type_operand(JSParseState *s)
             return js_parse_error(s, "expecting '=>' in function type");
         if (next_token(s))
             return -1;
-        return ts_skip_type(s);
+        return ts_skip_return_type(s);
     case '{':
     case '[':
         /* object, mapped and tuple types */
@@ -25676,6 +25699,25 @@ static int ts_skip_type_operand(JSParseState *s)
                     return -1;
                 if (next_token(s)) /* the type variable */
                     return -1;
+                /* `infer U extends C`: a constraint, except where a
+                   conditional type may appear and a '?' follows, in
+                   which case `infer U` is the checked type of a
+                   conditional type `infer U extends C ? X : Y` */
+                if (s->token.val == TOK_EXTENDS) {
+                    JSParsePos pos;
+                    bool no_conditional = s->ts_no_conditional;
+                    js_parse_get_pos(s, &pos);
+                    if (next_token(s))
+                        return -1;
+                    s->ts_no_conditional = true;
+                    if (ts_skip_type(s))
+                        return -1;
+                    s->ts_no_conditional = no_conditional;
+                    if (!no_conditional && s->token.val == '?') {
+                        if (js_parse_seek_token(s, &pos))
+                            return -1;
+                    }
+                }
                 return 0;
             }
         } else if (ts_token_is(s, JS_ATOM_asserts)) {
@@ -26329,6 +26371,12 @@ static int ts_parse_export_declaration(JSParseState *s)
         }
         if (ts_token_is(s, JS_ATOM_abstract)) {
             ret = ts_parse_declaration(s, JS_PARSE_EXPORT_DEFAULT);
+            if (ret != 0)
+                return ret;
+        }
+        if (s->token.val == TOK_FUNCTION || token_is_pseudo_keyword(s, JS_ATOM_async)) {
+            /* export default function f(): void; overload signature */
+            ret = ts_skip_function_overload(s);
             if (ret != 0)
                 return ret;
         }
