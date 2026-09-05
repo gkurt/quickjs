@@ -64,8 +64,8 @@ Decorators and JSX (`.tsx`) are not supported yet.
 
 Types are erased in the same single pass that produces the bytecode, so
 there is no transpile step and nothing to re-parse. On real-world code a
-TypeScript file compiles about 25% slower than the same code with the
-types blanked out, and the flag costs about 2% on code without types
+TypeScript file compiles 20-25% slower than the same code with the types
+blanked out, and the flag costs 1-2% on code without types
 (ambiguous syntax such as `<` and `(` needs a look-ahead).
 
 ### Compared with transpilers
@@ -89,26 +89,26 @@ $ node bench/ts_transpile_bench.mjs  # or: make ts-bench
 The corpus is the TypeScript source of a few libraries that ship it on
 npm (rxjs, zod, effect, mobx, Redux Toolkit, redux, immer, TanStack
 query-core), 167 files of 1 KB to 380 KB. Any directory of `.ts` files can
-be passed instead. Totals over the 162 files (2.1 MB) of the corpus, in
+be passed instead. Totals over the 167 files (2.2 MB) of the corpus, in
 milliseconds, Node 22 on Linux x86-64, one run on one machine:
 
 | tool           | version | transpile | qjs compile | total | vs `qjs --ts` |
 |----------------|---------|----------:|------------:|------:|--------------:|
-| `qjs --ts`     | 0.16.2  |         - |        36.3 |  36.3 |         1.00x |
-| oxc            | 0.148.0 |      30.2 |        24.8 |  55.0 |         1.51x |
-| swc            | 1.16.2  |      65.5 |        25.7 |  91.2 |         2.51x |
-| amaro          | 1.1.11  |      86.4 |        29.3 | 115.7 |         3.19x |
-| sucrase        | 3.35.1  |     116.2 |        23.4 | 139.6 |         4.21x |
-| ts-blank-space | 0.9.0   |     178.5 |        29.1 | 207.6 |         5.72x |
-| esbuild        | 0.28.2  |     296.7 |        23.7 | 320.3 |         8.82x |
-| tsc            | 5.9.3   |     718.1 |        25.5 | 743.6 |        20.48x |
-| babel          | 7.29.7  |     960.7 |        25.7 | 986.4 |        27.16x |
+| `qjs --ts`     | 0.16.2  |         - |        25.9 |  25.9 |         1.00x |
+| oxc            | 0.148.0 |      25.2 |        18.0 |  43.1 |         1.67x |
+| swc            | 1.16.2  |      49.7 |        18.5 |  68.3 |         2.64x |
+| amaro          | 1.1.11  |      58.3 |        21.9 |  80.1 |         3.10x |
+| sucrase        | 3.35.1  |      64.8 |        17.3 |  82.1 |         3.45x |
+| ts-blank-space | 0.9.0   |     109.0 |        21.7 | 130.7 |         5.06x |
+| esbuild        | 0.28.2  |     206.7 |        17.5 | 224.2 |         8.67x |
+| tsc            | 5.9.3   |     509.1 |        19.0 | 528.1 |        20.43x |
+| babel          | 7.29.7  |     579.2 |        19.5 | 598.7 |        23.16x |
 
 `qjs compile` is parsing plus bytecode generation of the JavaScript each
 tool produced, the same program in every case. Compiling the TypeScript
-directly costs about 25% more than compiling it with the types blanked
-out (the ts-blank-space row, whose output is as long as the source) and
-about 45% more than compiling a transpiler's compact output, which is
+directly costs 20-25% more than compiling it with the types blanked out
+(the ts-blank-space row, whose output is as long as the source) and about
+45% more than compiling a transpiler's compact output, which is
 still well below the cost of running any transpiler first. The native
 transpilers come closest: oxc and swc through N-API, amaro (swc compiled
 to wasm), and esbuild, whose asynchronous API includes a round trip to
