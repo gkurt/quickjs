@@ -158,6 +158,68 @@ function test_function()
     assert(r.x, 1);
 }
 
+/* the properties of the function objects created by closures */
+function test_function_properties()
+{
+    function f(a, b, c) {}
+    var g = () => 1;
+    async function h(a) {}
+    class C { m(a, b) {} static s() {} get x() { return 1; } }
+    var o = { meth() {}, ["k" + 1]: function() {}, arrow: (a) => a };
+    var d;
+
+    for (const fn of [f, g, h, C, C.prototype.m, C.s, o.meth, o.k1, o.arrow]) {
+        d = Object.getOwnPropertyDescriptor(fn, "length");
+        assert(d.writable, false, "length");
+        assert(d.enumerable, false, "length");
+        assert(d.configurable, true, "length");
+        d = Object.getOwnPropertyDescriptor(fn, "name");
+        assert(d.writable, false, "name");
+        assert(d.enumerable, false, "name");
+        assert(d.configurable, true, "name");
+    }
+    assert(Object.getOwnPropertyNames(f).join(), "length,name,prototype");
+    assert(Object.getOwnPropertyNames(g).join(), "length,name");
+    assert(Object.getOwnPropertyNames(h).join(), "length,name");
+    assert(Object.getOwnPropertyNames(C.prototype.m).join(), "length,name");
+    assert(Object.getOwnPropertyNames(o.k1).join(), "length,name,prototype");
+    assert(f.length, 3);
+    assert(f.name, "f");
+    assert(o.meth.name, "meth");
+    assert(o.k1.name, "k1");
+    assert(o.arrow.length, 1);
+    assert(Object.getOwnPropertyDescriptor(C.prototype, "x").get.name, "get x");
+    assert(Object.getPrototypeOf(h) !== Function.prototype);
+    assert(Object.getPrototypeOf(g), Function.prototype);
+
+    /* the prototype object is created lazily and is per function */
+    d = Object.getOwnPropertyDescriptor(f, "prototype");
+    assert(d.writable, true, "prototype");
+    assert(d.enumerable, false, "prototype");
+    assert(d.configurable, false, "prototype");
+    assert(f.prototype.constructor, f);
+    assert(f.prototype !== o.k1.prototype);
+    assert(Object.getOwnPropertyDescriptor(f.prototype, "constructor").enumerable, false);
+    assert(new f() instanceof f, true);
+    assertThrows(TypeError, () => new g());
+    assertThrows(TypeError, () => new C.prototype.m());
+
+    /* the properties can be modified independently of other functions */
+    Object.defineProperty(f, "length", { value: 7 });
+    assert(f.length, 7);
+    assert(o.k1.length, 0);
+    assert(delete f.name, true);
+    assert(f.name, "");
+    assert(o.k1.name, "k1");
+    assert(Object.getOwnPropertyNames(f).join(), "length,prototype");
+    f.prototype = 5;
+    assert(f.prototype, 5);
+    assert(typeof o.k1.prototype, "object");
+    o.k1.extra = 1;
+    assert(Object.getOwnPropertyNames(o.k1).join(), "length,name,prototype,extra");
+    assert(Object.getOwnPropertyNames(function() {}).join(), "length,name,prototype");
+}
+
 function test()
 {
     var r, a, b, c, err;
@@ -1325,6 +1387,7 @@ function test_cur_pc()
 
 test();
 test_function();
+test_function_properties();
 test_enum();
 test_array();
 test_string();

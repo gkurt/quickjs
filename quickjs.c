@@ -583,6 +583,11 @@ struct JSContext {
     JSShape *mapped_arguments_shape;  /* shape for mapped arguments objects */
     JSShape *regexp_shape;  /* shape for regexp objects */
     JSShape *regexp_result_shape;  /* shape for regexp result objects */
+    /* shapes of the function objects created by js_closure(): 'length'
+       and 'name', plus 'prototype' for the constructors. Indexed by
+       JSFunctionKindEnum, created on first use */
+    JSShape *closure_shape[4];
+    JSShape *ctor_closure_shape;
 
     JSValue *class_proto;
     JSValue function_proto;
@@ -3090,6 +3095,13 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     if (ctx->regexp_shape)
         mark_func(rt, &ctx->regexp_shape->header);
 
+    for(i = 0; i < countof(ctx->closure_shape); i++) {
+        if (ctx->closure_shape[i])
+            mark_func(rt, &ctx->closure_shape[i]->header);
+    }
+    if (ctx->ctor_closure_shape)
+        mark_func(rt, &ctx->ctor_closure_shape->header);
+
     if (ctx->regexp_result_shape)
         mark_func(rt, &ctx->regexp_result_shape->header);
 }
@@ -3166,6 +3178,9 @@ void JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
+    for(i = 0; i < countof(ctx->closure_shape); i++)
+        js_free_shape_null(ctx->rt, ctx->closure_shape[i]);
+    js_free_shape_null(ctx->rt, ctx->ctor_closure_shape);
 
     list_del(&ctx->link);
     remove_gc_object(&ctx->header);
@@ -18023,6 +18038,33 @@ static const uint16_t func_kind_to_class_id[] = {
     [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
 };
 
+/* Shape of the function objects created for 'b': the properties are
+   the ones defined by js_function_set_properties() and
+   JS_DefineAutoInitProperty() for 'prototype', in the same order, so
+   that the object is created with its properties in place instead of
+   adding them one by one */
+static JSShape *js_closure_shape(JSContext *ctx, JSFunctionBytecode *b)
+{
+    static const JSShapeProperty props[] = {
+        {.atom=JS_ATOM_length,    .flags=JS_PROP_CONFIGURABLE},
+        {.atom=JS_ATOM_name,      .flags=JS_PROP_CONFIGURABLE},
+        {.atom=JS_ATOM_prototype, .flags=JS_PROP_WRITABLE|JS_PROP_AUTOINIT},
+    };
+    JSShape **psh;
+
+    if (b->has_prototype)
+        psh = &ctx->ctor_closure_shape;
+    else
+        psh = &ctx->closure_shape[b->func_kind];
+    if (unlikely(!*psh)) {
+        if (js_new_shape_with(ctx, psh,
+                              ctx->class_proto[func_kind_to_class_id[b->func_kind]],
+                              2 + b->has_prototype, props))
+            return NULL;
+    }
+    return *psh;
+}
+
 static JSValue js_closure(JSContext *ctx, JSValue bfunc,
                           JSVarRef **cur_var_refs,
                           JSStackFrame *sf)
@@ -18032,8 +18074,40 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     JSAtom name_atom;
 
     b = JS_VALUE_GET_PTR(bfunc);
+    name_atom = b->func_name;
+    if (name_atom == JS_ATOM_NULL)
+        name_atom = JS_ATOM_empty_string;
+    if (likely(!(b->func_kind & JS_FUNC_GENERATOR))) {
+        /* common case: the object is created with its properties */
+        JSShape *sh;
+        JSObject *p;
+
+        sh = js_closure_shape(ctx, b);
+        if (unlikely(!sh))
+            goto fail_bfunc;
+        func_obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh),
+                                         func_kind_to_class_id[b->func_kind],
+                                         NULL);
+        if (JS_IsException(func_obj))
+            goto fail_bfunc;
+        p = JS_VALUE_GET_OBJ(func_obj);
+        p->prop[0].u.value = js_int32(b->defined_arg_count);
+        p->prop[1].u.value = JS_AtomToString(ctx, name_atom);
+        if (b->has_prototype) {
+            /* the prototype object is created on the fly when first
+               accessed, see JS_DefineAutoInitProperty() */
+            p->is_constructor = true;
+            p->prop[2].u.init.realm_and_id =
+                (uintptr_t)JS_DupContext(ctx) | JS_AUTOINIT_ID_PROTOTYPE;
+            p->prop[2].u.init.opaque = NULL;
+        }
+        /* bfunc is freed when func_obj is freed */
+        return js_closure2(ctx, func_obj, b, cur_var_refs, sf);
+    }
+
     func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
     if (JS_IsException(func_obj)) {
+    fail_bfunc:
         JS_FreeValue(ctx, bfunc);
         return JS_EXCEPTION;
     }
@@ -18042,9 +18116,6 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
         /* bfunc has been freed */
         goto fail;
     }
-    name_atom = b->func_name;
-    if (name_atom == JS_ATOM_NULL)
-        name_atom = JS_ATOM_empty_string;
     js_function_set_properties(ctx, func_obj, name_atom,
                                b->defined_arg_count);
 
