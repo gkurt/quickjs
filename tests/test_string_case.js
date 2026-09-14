@@ -143,6 +143,12 @@ check("ABC\u4e16", "ABC\u4e16", "abc\u4e16");
     assert("abc".padEnd(6, "d").toUpperCase(), "ABCDDD");
     assert((123).toString().toUpperCase(), "123");
     assert("Mixed".normalize().toLowerCase(), "mixed");
+    // normalize() and localeCompare() reallocate through a callback; both
+    // used to be called through a mistyped function pointer
+    assert("\u0041\u030a".normalize("NFC").toLowerCase(), "\u00e5");
+    assert("\u00c5".normalize("NFD").toLowerCase(), "a\u030a");
+    assert("\u00c5".toLowerCase().localeCompare("\u0041\u030a".toLowerCase()), 0);
+    assert("A".toLowerCase().localeCompare("b"), -1);
     assert(String(Symbol("Desc").description).toUpperCase(), "DESC");
 }
 
