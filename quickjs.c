@@ -1681,6 +1681,31 @@ static JSValue js_dup(JSValueConst v)
     return unsafe_unconst(v);
 }
 
+/* JS_FreeValue() and JS_FreeValueRT() are exported functions and the
+   compiler does not inline them into the very large functions of this
+   file, the interpreter loop in particular, so releasing a value costs a
+   call even when it is an int or undefined. Inside this file use these
+   always-inline versions instead: the tag test and the decrement stay
+   inline and only a reference count reaching zero calls out. */
+static void js_free_value_rt(JSRuntime *rt, JSValue v);
+
+static force_inline void js_free_value_rt_inline(JSRuntime *rt, JSValue v)
+{
+    if (JS_VALUE_HAS_REF_COUNT(v)) {
+        void *p = JS_VALUE_GET_PTR(v);
+        if (--JS_REF_COUNT(p) <= 0)
+            js_free_value_rt(rt, v);
+    }
+}
+
+static force_inline void js_free_value_inline(JSContext *ctx, JSValue v)
+{
+    js_free_value_rt_inline(ctx->rt, v);
+}
+
+#define JS_FreeValueRT(rt, v) js_free_value_rt_inline(rt, v)
+#define JS_FreeValue(ctx, v)  js_free_value_inline(ctx, v)
+
 JSValue JS_DupValue(JSContext *ctx, JSValueConst v)
 {
     return js_dup(v);
@@ -2947,7 +2972,7 @@ void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 
 /* set the new value and free the old value after (freeing the value
    can reallocate the object data) */
-static inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
+static force_inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
 {
     JSValue old_val;
     old_val = *pval;
@@ -6840,9 +6865,11 @@ static inline JSShapeProperty *find_own_property1(JSObject *p, JSAtom atom)
     return NULL;
 }
 
-static inline JSShapeProperty *find_own_property(JSProperty **ppr,
-                                                 JSObject *p,
-                                                 JSAtom atom)
+/* force_inline: this is the hot path of every property access and the
+   compiler does not inline it into the interpreter loop on its own */
+static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
+                                                       JSObject *p,
+                                                       JSAtom atom)
 {
     JSShape *sh;
     JSShapeProperty *pr, *prop;
@@ -7199,20 +7226,22 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
     }
 }
 
+/* the exported versions; see js_free_value_rt_inline() */
+#undef JS_FreeValueRT
+#undef JS_FreeValue
+
 void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
-    if (JS_VALUE_HAS_REF_COUNT(v)) {
-        void *p = JS_VALUE_GET_PTR(v);
-        if (--JS_REF_COUNT(p) <= 0) {
-            js_free_value_rt(rt, v);
-        }
-    }
+    js_free_value_rt_inline(rt, v);
 }
 
 void JS_FreeValue(JSContext *ctx, JSValue v)
 {
-    JS_FreeValueRT(ctx->rt, v);
+    js_free_value_rt_inline(ctx->rt, v);
 }
+
+#define JS_FreeValueRT(rt, v) js_free_value_rt_inline(rt, v)
+#define JS_FreeValue(ctx, v)  js_free_value_inline(ctx, v)
 
 /* garbage collection */
 
