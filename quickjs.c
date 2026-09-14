@@ -859,6 +859,17 @@ typedef enum JSFunctionKindEnum {
     JS_FUNC_ASYNC_GENERATOR = (JS_FUNC_GENERATOR | JS_FUNC_ASYNC),
 } JSFunctionKindEnum;
 
+/* inline cache of a property access opcode, see js_ic_fill() */
+#define JS_IC_MAX_DEPTH 3
+typedef struct JSInlineCache {
+    /* shapes[0] is the shape of the receiver, shapes[i] the shape of its
+       i-th prototype up to the object holding the property. Each holds
+       a reference. shapes[0] == NULL: empty */
+    JSShape *shapes[JS_IC_MAX_DEPTH + 1];
+    uint32_t prop_idx; /* index in JSObject.prop of the holder */
+    uint8_t depth; /* prototype level of the holder, JS_IC_DISABLED: never filled */
+} JSInlineCache;
+
 typedef struct JSFunctionBytecode {
     JSGCObjectHeader header; /* must come first */
     uint8_t is_strict_mode : 1;
@@ -888,6 +899,8 @@ typedef struct JSFunctionBytecode {
     int cpool_count;
     JSContext *realm; /* function realm */
     JSValue *cpool; /* constant pool (self pointer) */
+    JSInlineCache *ic; /* one per property access site */
+    int ic_count;
     JSAtom filename;
     int line_num;
     int col_num;
@@ -7344,9 +7357,17 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
         /* the template objects can be part of a cycle */
         {
             JSFunctionBytecode *b = (JSFunctionBytecode *)gp;
-            int i;
+            int i, k;
             for(i = 0; i < b->cpool_count; i++) {
                 JS_MarkValue(rt, b->cpool[i], mark_func);
+            }
+            /* the cached shapes reference prototype objects */
+            for(i = 0; i < b->ic_count; i++) {
+                JSInlineCache *ic = &b->ic[i];
+                if (ic->shapes[0]) {
+                    for(k = 0; k <= ic->depth; k++)
+                        mark_func(rt, &ic->shapes[k]->header);
+                }
             }
             if (b->realm)
                 mark_func(rt, &b->realm->header);
@@ -7584,6 +7605,10 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
     }
     if (b->closure_var) {
         js_func_size += b->closure_var_count * sizeof(*b->closure_var);
+    }
+    if (b->ic) {
+        memory_used_count++;
+        js_func_size += b->ic_count * sizeof(*b->ic);
     }
     if (b->byte_code_buf) {
         hp->js_func_code_size += b->byte_code_len;
@@ -9136,6 +9161,228 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
         return -1;
     pr->u.value = val;
     return 0;
+}
+
+/* Inline caches of the property access opcodes.
+
+   A cache entry remembers the lookup of a property: the shape of the
+   receiver, the shape of each prototype walked and the index of the
+   property in the object holding it. A shape determines the property
+   names and flags of an object as well as its prototype, so an object
+   whose shape is still the cached one has the property at the same
+   index with the same flags and the same prototype: the whole chain is
+   verified with one pointer comparison per level.
+
+   Only hashed shapes are cached. A shape that is not hashed belongs to
+   a single object and is modified in place when that object changes,
+   while a hashed shape referenced by more than its object (here: by a
+   cache entry) is cloned before any modification, see
+   js_shape_prepare_update() and add_property(). Hence a cached shape
+   never changes under the cache. The shape of an object which is not
+   hashed is hashed when it is cached, see js_shape_rehash(). Each entry
+   holds a reference to the shapes it stores, which are released when
+   the entry is refilled or the bytecode is freed. */
+
+#define JS_IC_DISABLED 0xff
+/* objects with more properties are not cached */
+#define JS_IC_MAX_PROPS 128
+
+/* allocate the inline caches of a function: 'count' entries, or one
+   shared never filled entry at index 0xffff when there are more sites
+   than slots */
+static int js_ic_alloc(JSContext *ctx, JSFunctionBytecode *b, int count)
+{
+    b->ic_count = count;
+    if (count == 0) {
+        b->ic = NULL;
+        return 0;
+    }
+    b->ic = js_mallocz(ctx, sizeof(*b->ic) * count);
+    if (!b->ic)
+        return -1;
+    if (count > 0xffff)
+        b->ic[0xffff].depth = JS_IC_DISABLED;
+    return 0;
+}
+
+static void js_ic_free_shapes(JSRuntime *rt, JSInlineCache *ic)
+{
+    int i;
+
+    if (!ic->shapes[0])
+        return;
+    for(i = 0; i <= ic->depth; i++)
+        js_free_shape(rt, ic->shapes[i]);
+    ic->shapes[0] = NULL;
+}
+
+static void js_ic_free(JSRuntime *rt, JSFunctionBytecode *b)
+{
+    int i;
+
+    for(i = 0; i < b->ic_count; i++)
+        js_ic_free_shapes(rt, &b->ic[i]);
+    js_free_rt(rt, b->ic);
+    b->ic = NULL;
+    b->ic_count = 0;
+}
+
+/* Hash the shape of 'p', made unique by an in place modification (see
+   js_shape_prepare_update()), so that it can be shared, here with an
+   inline cache. Most prototypes have such a shape: their lazily
+   initialized properties are updated in place. An identical hashed
+   shape is adopted instead when there is one, so that objects with the
+   same properties keep sharing one hash table entry */
+static void js_shape_rehash(JSRuntime *rt, JSObject *p)
+{
+    JSShape *sh = p->shape, *sh1;
+    JSShapeProperty *pr, *pr1;
+    uint32_t h, i, n;
+
+    pr = get_shape_prop(sh);
+    n = sh->prop_count;
+    h = shape_initial_hash(sh->proto);
+    for(i = 0; i < n; i++) {
+        h = shape_hash(h, pr[i].atom);
+        h = shape_hash(h, pr[i].flags);
+    }
+    for(sh1 = rt->shape_hash[get_shape_hash(h, rt->shape_hash_bits)];
+        sh1 != NULL; sh1 = sh1->shape_hash_next) {
+        /* p->prop has room for sh->prop_size properties: the adopted
+           shape must not need more */
+        if (sh1->hash != h || sh1->proto != sh->proto ||
+            sh1->prop_count != n || sh1->prop_size > sh->prop_size)
+            continue;
+        pr1 = get_shape_prop(sh1);
+        for(i = 0; i < n; i++) {
+            if (pr1[i].atom != pr[i].atom || pr1[i].flags != pr[i].flags)
+                goto next;
+        }
+        p->shape = js_dup_shape(sh1);
+        js_free_shape(rt, sh);
+        return;
+    next: ;
+    }
+    sh->hash = h;
+    sh->is_hashed = true;
+    js_shape_hash_link(rt, sh);
+}
+
+/* remember that the property was found at index 'prop_idx' of the
+   object 'depth' prototypes above 'p' */
+static void js_ic_fill(JSRuntime *rt, JSInlineCache *ic, JSObject *p,
+                       int depth, uint32_t prop_idx)
+{
+    JSObject *objs[JS_IC_MAX_DEPTH + 1];
+    JSShape *sh;
+    int i;
+
+    if (depth > JS_IC_MAX_DEPTH || ic->depth == JS_IC_DISABLED)
+        return;
+    for(i = 0;; i++) {
+        sh = p->shape;
+        /* a cached shape is cloned instead of modified in place when
+           the object changes: leave alone large objects used as
+           dictionaries, and the deleted properties of a shared shape
+           would be uninitialized in the objects created from it */
+        if (sh->prop_count > JS_IC_MAX_PROPS || sh->deleted_prop_count != 0)
+            return;
+        objs[i] = p;
+        if (i == depth)
+            break;
+        p = sh->proto;
+    }
+    for(i = 0; i <= depth; i++) {
+        if (!objs[i]->shape->is_hashed)
+            js_shape_rehash(rt, objs[i]);
+        js_dup_shape(objs[i]->shape);
+    }
+    js_ic_free_shapes(rt, ic);
+    for(i = 0; i <= depth; i++)
+        ic->shapes[i] = objs[i]->shape;
+    ic->depth = depth;
+    ic->prop_idx = prop_idx;
+}
+
+/* The shape does not identify the class: an exotic object can share the
+   shape of the ordinary object which filled a cache entry, so the
+   receiver of a cached read must be checked. Arrays are exotic for
+   integer indexed properties only, which are never cached */
+static force_inline bool js_ic_receiver_ok(const JSObject *p)
+{
+    return likely(!p->is_exotic) || p->class_id == JS_CLASS_ARRAY;
+}
+
+/* return the object holding the cached property if 'p' matches the
+   cache entry, NULL otherwise */
+static force_inline JSObject *js_ic_holder(const JSInlineCache *ic, JSObject *p)
+{
+    int i;
+
+    if (p->shape != ic->shapes[0] || !js_ic_receiver_ok(p))
+        return NULL;
+    for(i = 1; i <= ic->depth; i++) {
+        /* the shape fixes the prototype, non NULL as the holder is above */
+        p = p->shape->proto;
+        if (p->shape != ic->shapes[i])
+            return NULL;
+    }
+    return p;
+}
+
+/* Read the property 'atom' of the object 'p' on a cache miss and
+   refill the cache. Return the value (JS_UNDEFINED when the property
+   does not exist), or JS_UNINITIALIZED, which is never the value of a
+   property, if the generic JS_GetPropertyInternal() must be used
+   (accessor, exotic object...). The value is returned rather than
+   stored through a pointer so that the interpreter keeps it in
+   registers */
+static no_inline JSValue js_ic_get(JSContext *ctx, JSInlineCache *ic,
+                                   JSObject *p, JSAtom atom)
+{
+    JSObject *p1 = p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    int depth = 0;
+
+    for(;;) {
+        prs = find_own_property(&pr, p1, atom);
+        if (prs) {
+            if (unlikely(prs->flags & JS_PROP_TMASK))
+                return JS_UNINITIALIZED;
+            if (js_ic_receiver_ok(p))
+                js_ic_fill(ctx->rt, ic, p, depth, prs - get_shape_prop(p1->shape));
+            return js_dup(pr->u.value);
+        }
+        if (unlikely(p1->is_exotic)) {
+            /* only the integer indexed properties of arrays are exotic */
+            if (p1->class_id != JS_CLASS_ARRAY || __JS_AtomIsTaggedInt(atom))
+                return JS_UNINITIALIZED;
+        }
+        p1 = p1->shape->proto;
+        if (!p1)
+            return JS_UNDEFINED;
+        depth++;
+    }
+}
+
+/* Write the own writable data property 'atom' of 'p' on a cache miss
+   and refill the cache. Return 1 if done ('val' is consumed), 0 if the
+   generic JS_SetPropertyInternal() must be used */
+static no_inline int js_ic_put(JSContext *ctx, JSInlineCache *ic, JSObject *p,
+                               JSAtom atom, JSValue val)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+
+    prs = find_own_property(&pr, p, atom);
+    if (!prs ||
+        (prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) !=
+        JS_PROP_WRITABLE)
+        return 0;
+    set_value(ctx, &pr->u.value, val);
+    js_ic_fill(ctx->rt, ic, p, 0, prs - get_shape_prop(p->shape));
+    return 1;
 }
 
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
@@ -19592,47 +19839,34 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSValue val, obj;
                 JSAtom atom;
+                JSInlineCache *ic;
                 JSObject *p;
-                JSProperty *pr;
-                JSShapeProperty *prs;
 
                 atom = get_u32(pc);
-                pc += 4;
+                ic = &b->ic[get_u16(pc + 4)];
+                pc += 6;
 
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
-                    p = JS_VALUE_GET_OBJ(obj);
-                    for(;;) {
-                        prs = find_own_property(&pr, p, atom);
-                        if (prs) {
-                            /* found */
-                            if (unlikely(prs->flags & JS_PROP_TMASK))
-                                goto get_field_slow_path;
-                            val = js_dup(pr->u.value);
-                            break;
-                        }
-                        if (unlikely(p->is_exotic)) {
-                            /* XXX: should avoid the slow path for arrays
-                               and typed arrays by ensuring that 'prop' is
-                               not numeric */
-                            obj = JS_MKPTR(JS_TAG_OBJECT, p);
+                    p = js_ic_holder(ic, JS_VALUE_GET_OBJ(obj));
+                    if (likely(p)) {
+                        val = js_dup(p->prop[ic->prop_idx].u.value);
+                    } else {
+                        val = js_ic_get(ctx, ic, JS_VALUE_GET_OBJ(obj), atom);
+                        if (JS_IsUninitialized(val))
                             goto get_field_slow_path;
-                        }
-                        p = p->shape->proto;
-                        if (!p) {
-                            val = JS_UNDEFINED;
-                            break;
-                        }
                     }
                 } else {
                 get_field_slow_path:
                     sf->cur_pc = pc;
-                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+                    val = JS_GetPropertyInternal(ctx, obj, atom, obj, false);
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                 }
-                JS_FreeValue(ctx, sp[-1]);
+                /* store before the release so that the value need not
+                   survive a possible call to the finalizers */
                 sp[-1] = val;
+                JS_FreeValue(ctx, obj);
             }
             BREAK;
 
@@ -19640,37 +19874,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSValue val, obj;
                 JSAtom atom;
+                JSInlineCache *ic;
                 JSObject *p;
-                JSProperty *pr;
-                JSShapeProperty *prs;
 
                 atom = get_u32(pc);
-                pc += 4;
+                ic = &b->ic[get_u16(pc + 4)];
+                pc += 6;
 
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
-                    p = JS_VALUE_GET_OBJ(obj);
-                    for(;;) {
-                        prs = find_own_property(&pr, p, atom);
-                        if (prs) {
-                            /* found */
-                            if (unlikely(prs->flags & JS_PROP_TMASK))
-                                goto get_field2_slow_path;
-                            val = js_dup(pr->u.value);
-                            break;
-                        }
-                        if (unlikely(p->is_exotic)) {
-                            /* XXX: should avoid the slow path for arrays
-                               and typed arrays by ensuring that 'prop' is
-                               not numeric */
-                            obj = JS_MKPTR(JS_TAG_OBJECT, p);
+                    p = js_ic_holder(ic, JS_VALUE_GET_OBJ(obj));
+                    if (likely(p)) {
+                        val = js_dup(p->prop[ic->prop_idx].u.value);
+                    } else {
+                        val = js_ic_get(ctx, ic, JS_VALUE_GET_OBJ(obj), atom);
+                        if (JS_IsUninitialized(val))
                             goto get_field2_slow_path;
-                        }
-                        p = p->shape->proto;
-                        if (!p) {
-                            val = JS_UNDEFINED;
-                            break;
-                        }
                     }
                 } else {
                 get_field2_slow_path:
@@ -19683,29 +19902,61 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        CASE(OP_get_loc_field):
+            {
+                JSValue val, obj;
+                JSAtom atom;
+                JSInlineCache *ic;
+                JSObject *p;
+
+                atom = get_u32(pc);
+                ic = &b->ic[get_u16(pc + 4)];
+                obj = var_buf[pc[6]];
+                pc += 7;
+
+                if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+                    p = js_ic_holder(ic, JS_VALUE_GET_OBJ(obj));
+                    if (likely(p)) {
+                        val = js_dup(p->prop[ic->prop_idx].u.value);
+                    } else {
+                        val = js_ic_get(ctx, ic, JS_VALUE_GET_OBJ(obj), atom);
+                        if (JS_IsUninitialized(val))
+                            goto get_loc_field_slow_path;
+                    }
+                } else {
+                get_loc_field_slow_path:
+                    /* a getter or a proxy trap may overwrite the local
+                       variable: keep a reference on the object */
+                    sf->cur_pc = pc;
+                    obj = js_dup(obj);
+                    val = JS_GetPropertyInternal(ctx, obj, atom, obj, false);
+                    JS_FreeValue(ctx, obj);
+                    if (unlikely(JS_IsException(val)))
+                        goto exception;
+                }
+                *sp++ = val;
+            }
+            BREAK;
+
         CASE(OP_put_field):
             {
                 int ret;
                 JSValue obj;
                 JSAtom atom;
+                JSInlineCache *ic;
                 JSObject *p;
-                JSProperty *pr;
-                JSShapeProperty *prs;
 
                 atom = get_u32(pc);
-                pc += 4;
+                ic = &b->ic[get_u16(pc + 4)];
+                pc += 6;
 
                 obj = sp[-2];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
-                    prs = find_own_property(&pr, p, atom);
-                    if (!prs)
-                        goto put_field_slow_path;
-                    if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
-                                              JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
-                        /* fast path */
-                        set_value(ctx, &pr->u.value, sp[-1]);
-                    } else {
+                    if (likely(p->shape == ic->shapes[0])) {
+                        /* cached own writable data property */
+                        set_value(ctx, &p->prop[ic->prop_idx].u.value, sp[-1]);
+                    } else if (!js_ic_put(ctx, ic, p, atom, sp[-1])) {
                         goto put_field_slow_path;
                     }
                     JS_FreeValue(ctx, obj);
@@ -22383,6 +22634,7 @@ typedef struct JSFunctionDef {
 
     DynBuf byte_code;
     int last_opcode_pos; /* -1 if no last opcode */
+    int ic_count; /* inline cache slots allocated by resolve_labels() */
 
     LabelSlot *label_slots;
     int label_size; /* allocated size for label_slots[] */
@@ -24914,6 +25166,7 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
                         goto done1;
                     emit_op(s, OP_get_field2);
                     emit_atom(s, JS_ATOM_concat);
+                    emit_u16(s, 0); /* inline cache slot */
                 }
                 depth++;
             } else {
@@ -27741,6 +27994,7 @@ static __exception int js_parse_array_literal(JSParseState *s)
             emit_u32(s, idx);
             emit_op(s, OP_put_field);
             emit_atom(s, JS_ATOM_length);
+            emit_u16(s, 0); /* inline cache slot */
         }
         goto done;
     }
@@ -27779,6 +28033,7 @@ static __exception int js_parse_array_literal(JSParseState *s)
         emit_op(s, OP_dup1);    /* array length - array array length */
         emit_op(s, OP_put_field);
         emit_atom(s, JS_ATOM_length);
+        emit_u16(s, 0); /* inline cache slot */
     } else {
         emit_op(s, OP_drop);    /* array length - array */
     }
@@ -27892,6 +28147,7 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
         case OP_get_field:
             emit_op(s, OP_get_field2);
             emit_atom(s, name);
+            emit_u16(s, 0); /* inline cache slot */
             break;
         case OP_scope_get_private_field:
             emit_op(s, OP_scope_get_private_field2);
@@ -28056,6 +28312,7 @@ static void put_lvalue(JSParseState *s, int opcode, int scope,
     case OP_get_field:
         emit_op(s, OP_put_field);
         emit_u32(s, name);  /* name has refcount */
+        emit_u16(s, 0); /* inline cache slot */
         break;
     case OP_scope_get_private_field:
         emit_op(s, OP_scope_put_private_field);
@@ -28335,6 +28592,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                         /* get the named property from the source object */
                         emit_op(s, OP_get_field2);
                         emit_u32(s, prop_name);
+                        emit_u16(s, 0); /* inline cache slot */
                     }
                     if (js_parse_destructuring_element(s, tok, is_arg, true, -1, true, export_flag) < 0)
                         return -1;
@@ -28432,6 +28690,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     /* source -- val */
                     emit_op(s, OP_get_field);
                     emit_u32(s, prop_name);
+                    emit_u16(s, 0); /* inline cache slot */
                 }
             } else {
                 /* prop_type = PROP_TYPE_VAR, cannot be a computed property */
@@ -28463,6 +28722,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                 /* source -- source val */
                 emit_op(s, OP_get_field2);
                 emit_u32(s, prop_name);
+                emit_u16(s, 0); /* inline cache slot */
             }
         set_val:
             if (tok) {
@@ -29028,10 +29288,10 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     {
                         int opt_chain_label, next_label;
                         opt_chain_label = get_u32(fd->byte_code.buf +
-                                                  fd->last_opcode_pos + 1 + 4 + 1);
+                                                  fd->last_opcode_pos + 1 + 6 + 1);
                         /* keep the object on the stack */
                         fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
-                        fd->byte_code.size = fd->last_opcode_pos + 1 + 4;
+                        fd->byte_code.size = fd->last_opcode_pos + 1 + 6;
                         next_label = emit_goto(s, OP_goto, -1);
                         emit_label(s, opt_chain_label);
                         /* need an additional undefined value for the
@@ -29302,6 +29562,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     }
                     emit_op(s, OP_get_field);
                     emit_atom(s, s->token.u.ident.atom);
+                    emit_u16(s, 0); /* inline cache slot */
                 }
             }
             if (next_token(s))
@@ -29379,7 +29640,7 @@ static __exception int js_parse_delete(JSParseState *s)
             int ret, opt_chain_label, next_label;
             if (opcode == OP_get_field_opt_chain) {
                 opt_chain_label = get_u32(fd->byte_code.buf +
-                                          fd->last_opcode_pos + 1 + 4 + 1);
+                                          fd->last_opcode_pos + 1 + 6 + 1);
             } else {
                 opt_chain_label = -1;
             }
@@ -29947,12 +30208,14 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             emit_op(s, OP_check_object);
             emit_op(s, OP_get_field2);
             emit_atom(s, JS_ATOM_done);
+            emit_u16(s, 0); /* inline cache slot */
             label_next = emit_goto(s, OP_if_true, -1); /* end of loop */
             emit_label(s, label_yield);
             if (is_async) {
                 /* OP_async_yield_star takes the value as parameter */
                 emit_op(s, OP_get_field);
                 emit_atom(s, JS_ATOM_value);
+                emit_u16(s, 0); /* inline cache slot */
                 emit_op(s, OP_async_yield_star);
             } else {
                 /* OP_yield_star takes (value, done) as parameter */
@@ -29980,10 +30243,12 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             emit_op(s, OP_check_object);
             emit_op(s, OP_get_field2);
             emit_atom(s, JS_ATOM_done);
+            emit_u16(s, 0); /* inline cache slot */
             emit_goto(s, OP_if_false, label_yield);
 
             emit_op(s, OP_get_field);
             emit_atom(s, JS_ATOM_value);
+            emit_u16(s, 0); /* inline cache slot */
 
             emit_label(s, label_return1);
             emit_op(s, OP_nip);
@@ -30001,6 +30266,7 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             emit_op(s, OP_check_object);
             emit_op(s, OP_get_field2);
             emit_atom(s, JS_ATOM_done);
+            emit_u16(s, 0); /* inline cache slot */
             emit_goto(s, OP_if_false, label_yield);
             emit_goto(s, OP_goto, label_next);
             /* close the iterator and throw a type error exception */
@@ -30019,6 +30285,7 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             emit_label(s, label_next);
             emit_op(s, OP_get_field);
             emit_atom(s, JS_ATOM_value);
+            emit_u16(s, 0); /* inline cache slot */
             emit_op(s, OP_nip); /* keep the value associated with
                                    done = true */
             emit_op(s, OP_nip);
@@ -30307,6 +30574,7 @@ static void emit_iterator_close(JSParseState *s, bool is_async,
     label_done = emit_goto(s, OP_if_true, -1);
     emit_op(s, OP_get_field2);
     emit_atom(s, JS_ATOM_return);
+    emit_u16(s, 0); /* inline cache slot */
     /* completion? iter_obj return_func */
     emit_op(s, OP_dup);
     emit_op(s, OP_is_undefined_or_null);
@@ -35605,6 +35873,7 @@ static void free_bytecode_atoms(JSRuntime *rt,
         case OP_FMT_atom:
         case OP_FMT_atom_u8:
         case OP_FMT_atom_u16:
+        case OP_FMT_atom_u16_loc8:
         case OP_FMT_atom_label_u8:
         case OP_FMT_atom_label_u16:
             if ((pos + 1 + 4) > bc_len)
@@ -35913,6 +36182,12 @@ static void dump_byte_code(JSContext *ctx, int pass,
             print_atom(ctx, get_u32(tab + pos));
             printf(",%d", get_u16(tab + pos + 4));
             break;
+        case OP_FMT_atom_u16_loc8:
+            printf(" ");
+            print_atom(ctx, get_u32(tab + pos));
+            printf(",%d", get_u16(tab + pos + 4));
+            idx = get_u8(tab + pos + 6);
+            goto has_loc;
         case OP_FMT_atom_label_u8:
         case OP_FMT_atom_label_u16:
             printf(" ");
@@ -37637,6 +37912,7 @@ static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
             case OP_FMT_atom:
             case OP_FMT_atom_u8:
             case OP_FMT_atom_u16:
+            case OP_FMT_atom_u16_loc8:
                 atom = get_u32(bc_buf + pos + 1);
                 JS_FreeAtom(s->ctx, atom);
                 break;
@@ -38047,6 +38323,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                 JSAtom name = get_u32(bc_buf + pos + 1);
                 dbuf_putc(&bc_out, OP_get_field);
                 dbuf_put_u32(&bc_out, name);
+                dbuf_put_u16(&bc_out, get_u16(bc_buf + pos + 5));
             }
             break;
         case OP_get_array_el_opt_chain: /* equivalent to OP_get_array_el */
@@ -38493,6 +38770,17 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
     }
     js_free(ctx, label_state);
     return 0;
+}
+
+/* inline cache slot of a property access site. Slot 0xffff is shared by
+   the sites beyond the 65535th and is never filled. */
+static int alloc_ic_slot(JSFunctionDef *s)
+{
+    if (s->ic_count >= 0xffff) {
+        s->ic_count = 0x10000;
+        return 0xffff;
+    }
+    return s->ic_count++;
 }
 
 static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
@@ -38961,7 +39249,15 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     break;
                 }
             }
-            goto no_change;
+            /* fall thru */
+        case OP_get_field2:
+        case OP_put_field:
+            /* allocate the inline cache slot */
+            add_pc2line_info(s, bc_out.size, line_num, col_num);
+            dbuf_putc(&bc_out, op);
+            dbuf_put_u32(&bc_out, get_u32(bc_buf + pos + 1));
+            dbuf_put_u16(&bc_out, alloc_ic_slot(s));
+            break;
 
         case OP_push_atom_value:
             {
@@ -39047,6 +39343,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 dbuf_putc(&bc_out, OP_put_field);
                 dbuf_put_u32(&bc_out, cc.atom);
+                dbuf_put_u16(&bc_out, alloc_ic_slot(s));
                 pos_next = cc.pos;
                 break;
             }
@@ -39160,6 +39457,20 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     pos_next = cc.pos;
                     break;
                 }
+                /* transformation: get_loc(n) get_field(a) -> get_loc_field(a, n)
+                   ('length' is left to the get_length transformation) */
+                if (code_match(&cc, pos_next, OP_get_field, -1) &&
+                    cc.atom != JS_ATOM_length) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_get_loc_field);
+                    dbuf_put_u32(&bc_out, cc.atom);
+                    dbuf_put_u16(&bc_out, alloc_ic_slot(s));
+                    dbuf_putc(&bc_out, idx);
+                    pos_next = cc.pos;
+                    break;
+                }
                 /* transformation: get_loc(0) get_loc(1) -> get_loc0_loc1 */
                 if (idx == 0 && code_match(&cc, pos_next, OP_get_loc, 1, -1)) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
@@ -39236,6 +39547,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     dbuf_putc(&bc_out, OP_dec + (op - OP_post_dec));
                     dbuf_putc(&bc_out, OP_put_field);
                     dbuf_put_u32(&bc_out, cc.atom);
+                    dbuf_put_u16(&bc_out, alloc_ic_slot(s));
                     pos_next = cc.pos;
                     break;
                 }
@@ -39814,6 +40126,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (!b)
         goto fail;
     JS_REF_COUNT(b) = 1;
+    if (js_ic_alloc(ctx, b, fd->ic_count)) {
+        js_free(ctx, b);
+        goto fail;
+    }
 
     b->byte_code_buf = (void *)((uint8_t*)b + byte_code_offset);
     b->byte_code_len = fd->byte_code.size;
@@ -39912,6 +40228,8 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 
     if (b->byte_code_buf)
         free_bytecode_atoms(rt, b->byte_code_buf, b->byte_code_len, true);
+    if (b->ic)
+        js_ic_free(rt, b);
 
     if (b->vardefs) {
         for(i = 0; i < b->arg_count + b->var_count; i++) {
@@ -40844,6 +41162,7 @@ static __exception int js_parse_program(JSParseState *s)
                 emit_u16(s, fd->eval_ret_idx);
                 emit_op(s, OP_put_field);
                 emit_atom(s, JS_ATOM_value);
+                emit_u16(s, 0); /* inline cache slot */
             } else {
                 emit_op(s, OP_get_loc);
                 emit_u16(s, fd->eval_ret_idx);
@@ -40869,6 +41188,7 @@ static __exception int js_parse_program(JSParseState *s)
                 emit_u16(s, fd->eval_ret_idx);
                 emit_op(s, OP_put_field);
                 emit_atom(s, JS_ATOM_value);
+                emit_u16(s, 0); /* inline cache slot */
             } else {
                 emit_op(s, OP_get_loc);
                 emit_u16(s, fd->eval_ret_idx);
@@ -41307,7 +41627,7 @@ typedef enum BCTagEnum {
     BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 27
+#define BC_VERSION 28
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -41505,6 +41825,7 @@ static int JS_WriteFunctionBytecode(BCWriterState *s,
         case OP_FMT_atom:
         case OP_FMT_atom_u8:
         case OP_FMT_atom_u16:
+        case OP_FMT_atom_u16_loc8:
         case OP_FMT_atom_label_u8:
         case OP_FMT_atom_label_u16:
             atom = get_u32(bc_buf + pos + 1);
@@ -42396,7 +42717,7 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
                                    int byte_code_offset, uint32_t bc_len)
 {
     uint8_t *bc_buf;
-    int pos, len, op;
+    int pos, len, op, ic_count, ic_slot;
     JSAtom atom;
     uint32_t idx;
 
@@ -42405,6 +42726,7 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
         return -1;
     b->byte_code_buf = bc_buf;
 
+    ic_count = 0;
     pos = 0;
     while (pos < bc_len) {
         op = bc_buf[pos];
@@ -42413,6 +42735,7 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
         case OP_FMT_atom:
         case OP_FMT_atom_u8:
         case OP_FMT_atom_u16:
+        case OP_FMT_atom_u16_loc8:
         case OP_FMT_atom_label_u8:
         case OP_FMT_atom_label_u16:
             idx = get_u32(bc_buf + pos + 1);
@@ -42422,6 +42745,21 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
                 return -1;
             }
             put_u32(bc_buf + pos + 1, atom);
+            break;
+        default:
+            break;
+        }
+        switch(op) {
+        case OP_get_field:
+        case OP_get_field2:
+        case OP_put_field:
+        case OP_get_loc_field:
+            /* the inline caches are allocated once all the slots are known */
+            ic_slot = get_u16(bc_buf + pos + 5);
+            if (ic_slot == 0xffff)
+                ic_count = 0x10000;
+            else
+                ic_count = max_int(ic_count, ic_slot + 1);
             break;
         default:
             break;
@@ -42440,7 +42778,7 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
 #endif
         pos += len;
     }
-    return 0;
+    return js_ic_alloc(s->ctx, b, ic_count);
 }
 
 static JSValue JS_ReadBigInt(BCReaderState *s)
