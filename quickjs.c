@@ -868,17 +868,28 @@ typedef enum JSFunctionKindEnum {
 
 /* inline cache of a property access opcode, see js_ic_fill() */
 #define JS_IC_MAX_DEPTH 3
-typedef struct JSInlineCache {
+/* number of receiver shapes remembered by a site */
+#define JS_IC_WAYS 2
+typedef struct JSICEntry {
     /* shapes[0] is the shape of the receiver, shapes[i] the shape of its
        i-th prototype up to the object holding the property. Each holds
        a reference. shapes[0] == NULL: empty */
     JSShape *shapes[JS_IC_MAX_DEPTH + 1];
-    /* entry of a property add (see js_ic_fill_add()): the shape of the
-       receiver once the property is added, holds a reference. NULL
-       otherwise */
-    JSShape *new_shape;
     uint32_t prop_idx; /* index in JSObject.prop of the holder */
     uint8_t depth; /* prototype level of the holder, JS_IC_DISABLED: never filled */
+} JSICEntry;
+
+typedef struct JSInlineCache {
+    /* e[0] is checked first. e[1] is filled when the site sees a second
+       receiver shape (see js_ic_fill()) */
+    JSICEntry e[JS_IC_WAYS];
+    /* entry of a property add (see js_ic_fill_add()) in e[0]: the shape
+       of the receiver once the property is added, holds a reference.
+       NULL otherwise */
+    JSShape *new_shape;
+    /* number of times a third receiver shape replaced e[1]: the site
+       stops filling its entries when the limit is reached */
+    uint8_t misses;
 } JSInlineCache;
 
 typedef struct JSFunctionBytecode {
@@ -7402,12 +7413,16 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             /* the cached shapes reference prototype objects */
             for(i = 0; i < b->ic_count; i++) {
                 JSInlineCache *ic = &b->ic[i];
-                if (ic->shapes[0]) {
-                    for(k = 0; k <= ic->depth; k++)
-                        mark_func(rt, &ic->shapes[k]->header);
-                    if (ic->new_shape)
-                        mark_func(rt, &ic->new_shape->header);
+                int w;
+                for(w = 0; w < JS_IC_WAYS; w++) {
+                    JSICEntry *e = &ic->e[w];
+                    if (e->shapes[0]) {
+                        for(k = 0; k <= e->depth; k++)
+                            mark_func(rt, &e->shapes[k]->header);
+                    }
                 }
+                if (ic->new_shape)
+                    mark_func(rt, &ic->new_shape->header);
             }
             if (b->realm)
                 mark_func(rt, &b->realm->header);
@@ -9241,19 +9256,27 @@ static int js_ic_alloc(JSContext *ctx, JSFunctionBytecode *b, int count)
     if (!b->ic)
         return -1;
     if (count > 0xffff)
-        b->ic[0xffff].depth = JS_IC_DISABLED;
+        b->ic[0xffff].e[0].depth = JS_IC_DISABLED;
     return 0;
+}
+
+static void js_ic_free_entry(JSRuntime *rt, JSICEntry *e)
+{
+    int i;
+
+    if (!e->shapes[0])
+        return;
+    for(i = 0; i <= e->depth; i++)
+        js_free_shape(rt, e->shapes[i]);
+    e->shapes[0] = NULL;
 }
 
 static void js_ic_free_shapes(JSRuntime *rt, JSInlineCache *ic)
 {
     int i;
 
-    if (!ic->shapes[0])
-        return;
-    for(i = 0; i <= ic->depth; i++)
-        js_free_shape(rt, ic->shapes[i]);
-    ic->shapes[0] = NULL;
+    for(i = 0; i < JS_IC_WAYS; i++)
+        js_ic_free_entry(rt, &ic->e[i]);
     if (ic->new_shape) {
         js_free_shape(rt, ic->new_shape);
         ic->new_shape = NULL;
@@ -9312,16 +9335,42 @@ static void js_shape_rehash(JSRuntime *rt, JSObject *p)
     js_shape_hash_link(rt, sh);
 }
 
+/* number of receiver shapes beyond JS_IC_WAYS a site may see before it
+   stops filling its entries */
+#define JS_IC_MAX_MISSES 4
+
+/* return the entry to fill for the receiver shape 'sh', NULL if the
+   site is not cached: e[0] when it is empty or holds the same receiver
+   shape, e[1] otherwise, until the site has seen too many shapes. A
+   property add is always cached in e[0], see js_ic_fill_add() */
+static JSICEntry *js_ic_entry_to_fill(JSInlineCache *ic, JSShape *sh)
+{
+    if (ic->e[0].depth == JS_IC_DISABLED)
+        return NULL;
+    if (!ic->e[0].shapes[0] || ic->e[0].shapes[0] == sh)
+        return &ic->e[0];
+    if (ic->e[1].shapes[0] && ic->e[1].shapes[0] != sh) {
+        if (ic->misses >= JS_IC_MAX_MISSES)
+            return NULL;
+        ic->misses++;
+    }
+    return &ic->e[1];
+}
+
 /* remember that the property was found at index 'prop_idx' of the
    object 'depth' prototypes above 'p' */
 static void js_ic_fill(JSRuntime *rt, JSInlineCache *ic, JSObject *p,
                        int depth, uint32_t prop_idx)
 {
     JSObject *objs[JS_IC_MAX_DEPTH + 1];
+    JSICEntry *e;
     JSShape *sh;
     int i;
 
-    if (depth > JS_IC_MAX_DEPTH || ic->depth == JS_IC_DISABLED)
+    if (depth > JS_IC_MAX_DEPTH)
+        return;
+    e = js_ic_entry_to_fill(ic, p->shape);
+    if (!e)
         return;
     for(i = 0;; i++) {
         sh = p->shape;
@@ -9341,11 +9390,15 @@ static void js_ic_fill(JSRuntime *rt, JSInlineCache *ic, JSObject *p,
             js_shape_rehash(rt, objs[i]);
         js_dup_shape(objs[i]->shape);
     }
-    js_ic_free_shapes(rt, ic);
+    js_ic_free_entry(rt, e);
+    if (e == &ic->e[0] && ic->new_shape) {
+        js_free_shape(rt, ic->new_shape);
+        ic->new_shape = NULL;
+    }
     for(i = 0; i <= depth; i++)
-        ic->shapes[i] = objs[i]->shape;
-    ic->depth = depth;
-    ic->prop_idx = prop_idx;
+        e->shapes[i] = objs[i]->shape;
+    e->depth = depth;
+    e->prop_idx = prop_idx;
 }
 
 /* The shape does not identify the class: an exotic object can share the
@@ -9358,17 +9411,17 @@ static force_inline bool js_ic_receiver_ok(const JSObject *p)
 }
 
 /* return the object holding the cached property if 'p' matches the
-   cache entry, NULL otherwise */
-static force_inline JSObject *js_ic_holder(const JSInlineCache *ic, JSObject *p)
+   cache entry 'e', NULL otherwise */
+static force_inline JSObject *js_ic_holder(const JSICEntry *e, JSObject *p)
 {
     int i;
 
-    if (p->shape != ic->shapes[0] || !js_ic_receiver_ok(p))
+    if (p->shape != e->shapes[0] || !js_ic_receiver_ok(p))
         return NULL;
-    for(i = 1; i <= ic->depth; i++) {
+    for(i = 1; i <= e->depth; i++) {
         /* the shape fixes the prototype, non NULL as the holder is above */
         p = p->shape->proto;
-        if (p->shape != ic->shapes[i])
+        if (p->shape != e->shapes[i])
             return NULL;
     }
     return p;
@@ -9446,7 +9499,7 @@ static no_inline void js_ic_fill_add(JSContext *ctx, JSInlineCache *ic,
     JSProperty *unused;
     int i, depth;
 
-    if (ic->depth == JS_IC_DISABLED || !new_sh->is_hashed ||
+    if (ic->e[0].depth == JS_IC_DISABLED || !new_sh->is_hashed ||
         !old_sh->is_hashed || new_sh->prop_count != old_sh->prop_count + 1 ||
         new_sh->prop_count > JS_IC_MAX_PROPS || new_sh->proto != old_sh->proto ||
         new_sh->deleted_prop_count != 0 || old_sh->deleted_prop_count != 0 ||
@@ -9478,17 +9531,19 @@ static no_inline void js_ic_fill_add(JSContext *ctx, JSInlineCache *ic,
     }
     js_dup_shape(old_sh);
     js_dup_shape(new_sh);
-    js_ic_free_shapes(rt, ic);
-    ic->shapes[0] = old_sh;
+    js_ic_free_entry(rt, &ic->e[0]);
+    if (ic->new_shape)
+        js_free_shape(rt, ic->new_shape);
+    ic->e[0].shapes[0] = old_sh;
     for(i = 1; i <= depth; i++)
-        ic->shapes[i] = objs[i]->shape;
+        ic->e[0].shapes[i] = objs[i]->shape;
     ic->new_shape = new_sh;
-    ic->depth = depth;
-    ic->prop_idx = new_sh->prop_count - 1;
+    ic->e[0].depth = depth;
+    ic->e[0].prop_idx = new_sh->prop_count - 1;
 }
 
 /* Add the property of the transition entry 'ic' to 'p', whose shape is
-   ic->shapes[0]. 'val' is consumed. Return 0 if done, 1 if the generic
+   ic->e[0].shapes[0]. 'val' is consumed. Return 0 if done, 1 if the generic
    path must be used, -1 on error (exception, 'val' not consumed) */
 static force_inline int js_ic_add(JSContext *ctx, JSInlineCache *ic,
                                   JSObject *p, JSValue val)
@@ -9501,9 +9556,9 @@ static force_inline int js_ic_add(JSContext *ctx, JSInlineCache *ic,
        filled the entry */
     if (unlikely(!p->extensible || p->is_exotic))
         return 1;
-    for(i = 1; i <= ic->depth; i++) {
+    for(i = 1; i <= ic->e[0].depth; i++) {
         p1 = p1->shape->proto;
-        if (p1->shape != ic->shapes[i])
+        if (p1->shape != ic->e[0].shapes[i])
             return 1;
     }
     if (new_sh->prop_size != sh->prop_size) {
@@ -9516,7 +9571,7 @@ static force_inline int js_ic_add(JSContext *ctx, JSInlineCache *ic,
     }
     p->shape = js_dup_shape(new_sh);
     js_free_shape(ctx->rt, sh);
-    p->prop[ic->prop_idx].u.value = val;
+    p->prop[ic->e[0].prop_idx].u.value = val;
     return 0;
 }
 
@@ -20076,9 +20131,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
-                    p = js_ic_holder(ic, JS_VALUE_GET_OBJ(obj));
+                    p = js_ic_holder(&ic->e[0], JS_VALUE_GET_OBJ(obj));
                     if (likely(p)) {
-                        val = js_dup(p->prop[ic->prop_idx].u.value);
+                        val = js_dup(p->prop[ic->e[0].prop_idx].u.value);
+                    } else if ((p = js_ic_holder(&ic->e[1], JS_VALUE_GET_OBJ(obj)))) {
+                        /* second receiver shape of a polymorphic site */
+                        val = js_dup(p->prop[ic->e[1].prop_idx].u.value);
                     } else {
                         val = js_ic_get(ctx, ic, JS_VALUE_GET_OBJ(obj), atom);
                         if (JS_IsUninitialized(val))
@@ -20111,9 +20169,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 obj = sp[-1];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
-                    p = js_ic_holder(ic, JS_VALUE_GET_OBJ(obj));
+                    p = js_ic_holder(&ic->e[0], JS_VALUE_GET_OBJ(obj));
                     if (likely(p)) {
-                        val = js_dup(p->prop[ic->prop_idx].u.value);
+                        val = js_dup(p->prop[ic->e[0].prop_idx].u.value);
+                    } else if ((p = js_ic_holder(&ic->e[1], JS_VALUE_GET_OBJ(obj)))) {
+                        /* second receiver shape of a polymorphic site */
+                        val = js_dup(p->prop[ic->e[1].prop_idx].u.value);
                     } else {
                         val = js_ic_get(ctx, ic, JS_VALUE_GET_OBJ(obj), atom);
                         if (JS_IsUninitialized(val))
@@ -20143,9 +20204,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 7;
 
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
-                    p = js_ic_holder(ic, JS_VALUE_GET_OBJ(obj));
+                    p = js_ic_holder(&ic->e[0], JS_VALUE_GET_OBJ(obj));
                     if (likely(p)) {
-                        val = js_dup(p->prop[ic->prop_idx].u.value);
+                        val = js_dup(p->prop[ic->e[0].prop_idx].u.value);
+                    } else if ((p = js_ic_holder(&ic->e[1], JS_VALUE_GET_OBJ(obj)))) {
+                        /* second receiver shape of a polymorphic site */
+                        val = js_dup(p->prop[ic->e[1].prop_idx].u.value);
                     } else {
                         val = js_ic_get(ctx, ic, JS_VALUE_GET_OBJ(obj), atom);
                         if (JS_IsUninitialized(val))
@@ -20181,10 +20245,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 obj = sp[-2];
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
-                    if (likely(p->shape == ic->shapes[0])) {
+                    if (likely(p->shape == ic->e[0].shapes[0])) {
                         if (likely(!ic->new_shape)) {
                             /* cached own writable data property */
-                            set_value(ctx, &p->prop[ic->prop_idx].u.value, sp[-1]);
+                            set_value(ctx, &p->prop[ic->e[0].prop_idx].u.value, sp[-1]);
                         } else {
                             /* cached property add */
                             ret = js_ic_add(ctx, ic, p, sp[-1]);
@@ -20196,6 +20260,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 goto put_field_fail;
                             }
                         }
+                    } else if (p->shape == ic->e[1].shapes[0]) {
+                        /* second receiver shape, always a cached own
+                           writable data property */
+                        set_value(ctx, &p->prop[ic->e[1].prop_idx].u.value, sp[-1]);
                     } else if (!js_ic_put(ctx, ic, p, atom, sp[-1])) {
                         goto put_field_slow_path;
                     }
@@ -20300,8 +20368,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 /* the object comes from OP_object */
                 p = JS_VALUE_GET_OBJ(sp[-2]);
-                if (likely(p->shape == ic->shapes[0])) {
-                    /* cached property add */
+                if (likely(p->shape == ic->e[0].shapes[0])) {
+                    /* cached property add: the slot of a define_field
+                       is only filled by js_ic_fill_add() */
                     ret = js_ic_add(ctx, ic, p, sp[-1]);
                     if (likely(ret == 0)) {
                         sp--;

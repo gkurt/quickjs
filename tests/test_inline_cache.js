@@ -663,6 +663,139 @@ function test_polymorphic()
             assert(read(shapes[i]), i);
 }
 
+function test_two_shapes()
+{
+    /* a site remembers two receiver shapes: both must be invalidated
+       independently */
+    const read = o => o.k;
+    const a = { k: 1, a: 0 }, b = { b: 0, k: 2 };
+    for (let i = 0; i < 8; i++) {
+        assert(read(a), 1);
+        assert(read(b), 2);
+    }
+    delete b.k;
+    assert(read(a), 1);
+    assert(read(b), undefined);
+    b.k = 3;
+    assert(read(b), 3);
+    delete a.k;
+    assert(read(a), undefined);
+    assert(read(b), 3);
+    Object.defineProperty(a, "k", { get() { return 4; } });
+    assert(read(a), 4);
+    assert(read(b), 3);
+
+    /* the second shape finds the property on a prototype */
+    const proto1 = { k: "p1" }, proto2 = { k: "p2" };
+    const c = Object.create(proto1), d = Object.create(proto2);
+    c.c = 0;
+    d.d = 0;
+    d.e = 0;
+    for (let i = 0; i < 8; i++) {
+        assert(read(c), "p1");
+        assert(read(d), "p2");
+    }
+    proto2.k = "p2b";
+    assert(read(c), "p1");
+    assert(read(d), "p2b");
+    d.k = "own";
+    assert(read(d), "own");
+    assert(read(c), "p1");
+    Object.setPrototypeOf(c, { k: "p3" });
+    assert(read(c), "p3");
+    delete proto1.k;
+    assert(read(Object.create(proto1)), undefined);
+
+    /* two shapes at a write site */
+    const write = Function("o", "v", "o.x = v;");
+    const w1 = { x: 0, a: 0 }, w2 = { a: 0, x: 0 };
+    for (let i = 0; i < 8; i++) {
+        write(w1, i);
+        write(w2, -i);
+    }
+    assert(w1.x, 7);
+    assert(w2.x, -7);
+    Object.defineProperty(w2, "x", { writable: false });
+    write(w1, 8);
+    write(w2, 9);
+    assert(w1.x, 8);
+    assert(w2.x, -7);
+    Object.freeze(w1);
+    write(w1, 10);
+    assert(w1.x, 8);
+    let seen;
+    const w3 = { a: 0, set x(v) { seen = v; } };
+    write(w3, 11);
+    assert(seen, 11);
+    assert(Object.hasOwn(w3, "x"), true);
+
+    /* the site both adds the property to some objects and writes the
+       existing one of others */
+    function add_or_set(o, v) { o.y = v; }
+    const objs = [];
+    for (let i = 0; i < 8; i++) {
+        const fresh = { a: i };
+        add_or_set(fresh, i);
+        objs.push(fresh);
+        add_or_set(objs[0], -i);
+    }
+    for (let i = 1; i < 8; i++)
+        assert(objs[i].y, i);
+    assert(objs[0].y, -7);
+    Object.preventExtensions({ a: 0 });
+    const ne = Object.preventExtensions({ a: 100 });
+    assertThrows(TypeError, () => add_or_set(ne, 1));
+    assert(Object.hasOwn(ne, "y"), false);
+    Object.defineProperty(Object.prototype, "y", { set(v) { seen = v; }, configurable: true });
+    add_or_set({ a: 200 }, 12);
+    assert(seen, 12);
+    delete Object.prototype.y;
+    const after = { a: 300 };
+    add_or_set(after, 13);
+    assert(after.y, 13);
+
+    /* three and more shapes keep working once the site stops caching */
+    const many = [{ k: 0, a: 0 }, { a: 0, k: 1 }, { a: 0, b: 0, k: 2 }, { a: 0, b: 0, c: 0, k: 3 }];
+    for (let round = 0; round < 10; round++)
+        for (let i = 0; i < many.length; i++)
+            assert(read(many[i]), i);
+    for (let i = 0; i < many.length; i++) {
+        many[i].k = "m" + i;
+        assert(read(many[i]), "m" + i);
+        delete many[i].k;
+        assert(read(many[i]), undefined);
+    }
+    assert(read({ k: "new" }), "new");
+
+    /* method calls on instances of two classes */
+    class Shape { area() { return 0; } }
+    class Circle extends Shape { constructor(r) { super(); this.r = r; } area() { return 3 * this.r * this.r; } }
+    class Square extends Shape { constructor(s) { super(); this.s = s; } area() { return this.s * this.s; } }
+    const total = list => { let t = 0; for (const x of list) t += x.area(); return t; };
+    const list = [new Circle(1), new Square(2), new Circle(2), new Square(3)];
+    for (let i = 0; i < 8; i++)
+        assert(total(list), 3 + 4 + 12 + 9);
+    Square.prototype.area = function() { return -1; };
+    assert(total(list), 3 + 12 - 2);
+    list[0].area = () => 100;
+    assert(total(list), 100 + 12 - 2);
+    Object.setPrototypeOf(Circle.prototype, { area() { return 7; } });
+    delete Circle.prototype.area;
+    assert(total(list), 100 + 7 - 2);
+
+    /* both entries hold shapes of collected prototypes */
+    function two(o1, o2) { return o1.z + o2.z; }
+    for (let i = 0; i < 20; i++) {
+        const p1 = Object.create({ z: 1 }), p2 = Object.create({ z: 2 });
+        p1["a" + (i & 1)] = 0;
+        p2["b" + (i & 1)] = 0;
+        p2.c = 0;
+        for (let j = 0; j < 4; j++)
+            assert(two(p1, p2), 3);
+        std.gc();
+    }
+}
+
 function test_local_receiver()
 {
     /* reads of a local variable's property fuse into one instruction:
@@ -891,6 +1024,7 @@ test_arrays();
 test_shape_aliasing();
 test_proxy();
 test_polymorphic();
+test_two_shapes();
 test_local_receiver();
 test_dictionary_mode();
 test_class_instances();
