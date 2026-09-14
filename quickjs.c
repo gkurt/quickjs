@@ -354,6 +354,8 @@ struct JSRuntime {
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     struct list_head string_list; /* list of JSString.link */
 #endif
+    /* the one character strings, shared. Created on first use */
+    JSString *char_strings[256];
     /* stack limitation */
     uintptr_t stack_size; /* in bytes, 0 if no limit */
     uintptr_t stack_top;
@@ -2722,6 +2724,11 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     JS_RunGC(rt);
 
+    for(i = 0; i < countof(rt->char_strings); i++) {
+        if (rt->char_strings[i])
+            js_free_string(rt, rt->char_strings[i]);
+    }
+
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     /* leaking objects */
     if (check_dump_flag(rt, JS_DUMP_LEAKS)) {
@@ -4363,9 +4370,18 @@ static JSValue js_new_string16_len(JSContext *ctx, const uint16_t *buf, int len)
 
 static JSValue js_new_string_char(JSContext *ctx, uint16_t c)
 {
-    if (c < 0x100) {
-        char ch8 = c;
-        return js_new_string8_len(ctx, &ch8, 1);
+    if (c < countof(ctx->rt->char_strings)) {
+        JSRuntime *rt = ctx->rt;
+        JSString *str = rt->char_strings[c];
+        if (unlikely(!str)) {
+            str = js_alloc_string(ctx, 1, 0);
+            if (unlikely(!str))
+                return JS_EXCEPTION;
+            str8(str)[0] = c;
+            str8(str)[1] = '\0';
+            rt->char_strings[c] = str; /* holds one reference */
+        }
+        return js_dup(JS_MKPTR(JS_TAG_STRING, str));
     } else {
         uint16_t ch16 = c;
         return js_new_string16_len(ctx, &ch16, 1);
@@ -4384,6 +4400,9 @@ static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
     }
     if (len <= 0) {
         return js_empty_string(ctx->rt);
+    }
+    if (len == 1) {
+        return js_new_string_char(ctx, string_get(p, start));
     }
     if (len > (JS_STRING_SLICE_LEN_MAX >> p->is_wide_char)) {
         if (p->kind == JS_STRING_KIND_SLICE) {
@@ -10430,6 +10449,14 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
             /* fast path for array and typed array access */
             if (js_get_fast_array_element(ctx, p, idx, &val))
                 return val;
+        }
+    } else if (tag == JS_TAG_STRING) {
+        if (JS_VALUE_GET_TAG(prop) == JS_TAG_INT) {
+            /* fast path for the characters of a string */
+            JSString *p = JS_VALUE_GET_STRING(this_obj);
+            uint32_t idx = JS_VALUE_GET_INT(prop);
+            if (idx < p->len)
+                return js_new_string_char(ctx, string_get(p, idx));
         }
     } else if (unlikely(tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)) {
         // per spec: not allowed to call ToPropertyKey before ToObject

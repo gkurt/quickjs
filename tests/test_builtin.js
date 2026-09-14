@@ -502,6 +502,51 @@ function test_string()
            /*JS_STRING_KIND_SLICE*/1);
 }
 
+/* one character strings are shared */
+function test_one_char_string()
+{
+    var s, c, i, o;
+
+    s = "abé€";
+    for (i = 0; i < s.length; i++) {
+        c = s[i];
+        assert(c, s.charAt(i));
+        assert(c, s.slice(i, i + 1));
+        assert(c, s.substring(i, i + 1));
+        assert(c, String.fromCharCode(s.charCodeAt(i)));
+        assert(c.length, 1);
+        /* concatenation must not modify the shared string */
+        assert(c + "x", c.concat("x"));
+        assert(s[i], c);
+        assert((c + c).length, 2);
+        assert(c.repeat(2)[1], c);
+        assert(c.padEnd(3, "-"), c + "--");
+        assert(c, c.slice(0, 1));
+    }
+    assert(s[4], undefined);
+    assert(s[-1], undefined);
+    assert(s[1.5], undefined);
+    assert(s["1"], "b");
+    c = "a"; c += "b";
+    assert("ab".charAt(0), "a");
+    assert("ab"[0], "a");
+
+    /* one character strings as property keys */
+    o = {};
+    for (i = 0; i < s.length; i++)
+        o[s[i]] = i;
+    assert(Object.keys(o).join(), "a,b,é,€");
+    assert(o["b"], 1);
+    assert(o[s.charAt(2)], 2);
+    assert(o["0123"[1]], undefined);
+    o["0123"[1]] = "one";
+    assert(o[1], "one");
+    assert("abc".split("").join("+"), "a+b+c");
+    assert([..."abc"].length, 3);
+    assert(Array.from("ab").join(), "a,b");
+    assert("a" === "ba"[1], true);
+}
+
 function rope_concat(n, dir)
 {
     var i, s;
@@ -1447,6 +1492,7 @@ test_enum();
 test_array();
 test_array_append();
 test_string();
+test_one_char_string();
 test_rope();
 test_math();
 test_number();
