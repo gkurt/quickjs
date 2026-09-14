@@ -1681,6 +1681,31 @@ static JSValue js_dup(JSValueConst v)
     return unsafe_unconst(v);
 }
 
+/* JS_FreeValue() and JS_FreeValueRT() are exported functions and the
+   compiler does not inline them into the very large functions of this
+   file, the interpreter loop in particular, so releasing a value costs a
+   call even when it is an int or undefined. Inside this file use these
+   always-inline versions instead: the tag test and the decrement stay
+   inline and only a reference count reaching zero calls out. */
+static void js_free_value_rt(JSRuntime *rt, JSValue v);
+
+static force_inline void js_free_value_rt_inline(JSRuntime *rt, JSValue v)
+{
+    if (JS_VALUE_HAS_REF_COUNT(v)) {
+        void *p = JS_VALUE_GET_PTR(v);
+        if (--JS_REF_COUNT(p) <= 0)
+            js_free_value_rt(rt, v);
+    }
+}
+
+static force_inline void js_free_value_inline(JSContext *ctx, JSValue v)
+{
+    js_free_value_rt_inline(ctx->rt, v);
+}
+
+#define JS_FreeValueRT(rt, v) js_free_value_rt_inline(rt, v)
+#define JS_FreeValue(ctx, v)  js_free_value_inline(ctx, v)
+
 JSValue JS_DupValue(JSContext *ctx, JSValueConst v)
 {
     return js_dup(v);
@@ -2947,7 +2972,7 @@ void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 
 /* set the new value and free the old value after (freeing the value
    can reallocate the object data) */
-static inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
+static force_inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
 {
     JSValue old_val;
     old_val = *pval;
@@ -6840,9 +6865,11 @@ static inline JSShapeProperty *find_own_property1(JSObject *p, JSAtom atom)
     return NULL;
 }
 
-static inline JSShapeProperty *find_own_property(JSProperty **ppr,
-                                                 JSObject *p,
-                                                 JSAtom atom)
+/* force_inline: this is the hot path of every property access and the
+   compiler does not inline it into the interpreter loop on its own */
+static force_inline JSShapeProperty *find_own_property(JSProperty **ppr,
+                                                       JSObject *p,
+                                                       JSAtom atom)
 {
     JSShape *sh;
     JSShapeProperty *pr, *prop;
@@ -7199,20 +7226,22 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
     }
 }
 
+/* the exported versions; see js_free_value_rt_inline() */
+#undef JS_FreeValueRT
+#undef JS_FreeValue
+
 void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
-    if (JS_VALUE_HAS_REF_COUNT(v)) {
-        void *p = JS_VALUE_GET_PTR(v);
-        if (--JS_REF_COUNT(p) <= 0) {
-            js_free_value_rt(rt, v);
-        }
-    }
+    js_free_value_rt_inline(rt, v);
 }
 
 void JS_FreeValue(JSContext *ctx, JSValue v)
 {
-    JS_FreeValueRT(ctx->rt, v);
+    js_free_value_rt_inline(ctx->rt, v);
 }
+
+#define JS_FreeValueRT(rt, v) js_free_value_rt_inline(rt, v)
+#define JS_FreeValue(ctx, v)  js_free_value_inline(ctx, v)
 
 /* garbage collection */
 
@@ -20627,14 +20656,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
+/* Comparisons: ints are the common case. Doubles, and an int against a
+   double, are compared directly as well: for numbers the C comparison
+   has the JS semantics (NaN compares false, +0 equals -0), for every
+   operator here including == and ===. Everything else goes through the
+   generic path. */
 #define OP_CMP(opcode, binary_op, slow_call)              \
             CASE(opcode):                                 \
                 {                                         \
                 JSValue op1, op2;                         \
+                double d1, d2;                            \
                 op1 = sp[-2];                             \
                 op2 = sp[-1];                                   \
                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
                     sp[-2] = js_bool(JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
+                    sp--;                                               \
+                } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {          \
+                    sp[-2] = js_bool(JS_VALUE_GET_FLOAT64(op1) binary_op JS_VALUE_GET_FLOAT64(op2)); \
+                    sp--;                                               \
+                } else if ((JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) ||  \
+                            JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) && \
+                           js_arith_to_float64(op1, &d1) &&             \
+                           js_arith_to_float64(op2, &d2)) {             \
+                    sp[-2] = js_bool(d1 binary_op d2);                  \
                     sp--;                                               \
                 } else {                                                \
                     sf->cur_pc = pc;                                    \
@@ -38250,6 +38294,195 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
 }
 
 /* peephole optimizations and resolve goto/labels */
+/* intersect 'dst' with 'src'; return true if 'dst' changed */
+static bool tdz_state_meet(uint64_t *dst, const uint64_t *src, int nwords)
+{
+    bool changed = false;
+    int i;
+    for (i = 0; i < nwords; i++) {
+        uint64_t v = dst[i] & src[i];
+        if (v != dst[i]) {
+            dst[i] = v;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static inline void tdz_state_set(uint64_t *st, int idx)
+{
+    st[idx >> 6] |= (uint64_t)1 << (idx & 63);
+}
+
+/* Definite initialization analysis of the lexical variables.
+
+   The compiler accesses a lexical variable (let, const, class) with
+   OP_get_loc_check and OP_put_loc_check, which throw a ReferenceError
+   while the variable is in its temporal dead zone: between the
+   OP_set_loc_uninitialized emitted when its scope is entered and the
+   execution of its declaration. Most accesses come after the declaration
+   on every path (`const x = ...; use(x)`, loop bodies, ...). This pass
+   finds them with a forward must-analysis over the phase 2 byte code,
+   where jumps still refer to labels so the control flow is explicit, and
+   rewrites them in place to OP_get_loc and OP_put_loc: those are cheaper,
+   have one byte encodings and take part in the peephole optimizations of
+   resolve_labels() (inc_loc, get_loc0_loc1, set_loc, ...).
+
+   The state is the set of local slots known to be initialized. It is
+   empty at function entry, except for the pseudo variables that the
+   prologue emitted by resolve_labels() initializes; a write to a slot or
+   a checked read that did not throw adds the slot, OP_set_loc_uninitialized
+   removes it, and the states of all the edges reaching a label are
+   intersected. Exception handlers (OP_catch) and finally blocks (OP_gosub)
+   start with an empty state since they can be entered from anywhere.
+   Label states start full and only shrink, so the iteration converges;
+   should it not within the iteration limit, the checks are kept.
+
+   Closures cannot end the temporal dead zone of a variable of the
+   enclosing function: their writes use OP_put_var_ref_check, which throws
+   while the variable is uninitialized. Only this function's code matters. */
+static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
+{
+    uint8_t *bc_buf = s->byte_code.buf;
+    int bc_len = s->byte_code.size;
+    int nvars = s->var_count;
+    int nwords, pos, op, len, idx, label, iter, i;
+    uint64_t *label_state, *cur, *st;
+    bool changed, reachable, rewrite;
+
+    if (nvars <= 0)
+        return 0;
+    nwords = (nvars + 63) >> 6;
+    label_state = js_malloc(ctx, sizeof(uint64_t) * nwords * (s->label_count + 1));
+    if (!label_state)
+        return -1;
+    cur = label_state + (size_t)nwords * s->label_count;
+    memset(label_state, 0xff, sizeof(uint64_t) * nwords * s->label_count);
+
+    rewrite = false;
+    for (iter = 0;; iter++) {
+        changed = false;
+        /* function entry: only the prologue of resolve_labels() ran */
+        memset(cur, 0, sizeof(uint64_t) * nwords);
+        if (s->home_object_var_idx >= 0)
+            tdz_state_set(cur, s->home_object_var_idx);
+        if (s->this_active_func_var_idx >= 0)
+            tdz_state_set(cur, s->this_active_func_var_idx);
+        if (s->new_target_var_idx >= 0)
+            tdz_state_set(cur, s->new_target_var_idx);
+        if (s->this_var_idx >= 0 && !s->is_derived_class_constructor)
+            tdz_state_set(cur, s->this_var_idx);
+        if (s->arguments_var_idx >= 0)
+            tdz_state_set(cur, s->arguments_var_idx);
+        if (s->arguments_arg_idx >= 0 && s->arguments_arg_idx < nvars)
+            tdz_state_set(cur, s->arguments_arg_idx);
+        if (s->func_var_idx >= 0)
+            tdz_state_set(cur, s->func_var_idx);
+        if (s->var_object_idx >= 0)
+            tdz_state_set(cur, s->var_object_idx);
+        if (s->arg_var_object_idx >= 0)
+            tdz_state_set(cur, s->arg_var_object_idx);
+        reachable = true;
+
+        for (pos = 0; pos < bc_len; pos += len) {
+            op = bc_buf[pos];
+            len = opcode_info[op].size;
+            switch(op) {
+            case OP_label:
+                label = get_u32(bc_buf + pos + 1);
+                assert(label >= 0 && label < s->label_count);
+                st = label_state + (size_t)label * nwords;
+                if (reachable)
+                    changed |= tdz_state_meet(st, cur, nwords);
+                memcpy(cur, st, sizeof(uint64_t) * nwords);
+                reachable = true;
+                break;
+            case OP_set_loc_uninitialized:
+                idx = get_u16(bc_buf + pos + 1);
+                cur[idx >> 6] &= ~((uint64_t)1 << (idx & 63));
+                break;
+            case OP_get_loc_check:
+            case OP_put_loc_check:
+                idx = get_u16(bc_buf + pos + 1);
+                if (rewrite && reachable &&
+                    ((cur[idx >> 6] >> (idx & 63)) & 1)) {
+                    bc_buf[pos] = (op == OP_get_loc_check) ? OP_get_loc : OP_put_loc;
+                }
+                /* if the check did not throw, the variable is initialized */
+                tdz_state_set(cur, idx);
+                break;
+            case OP_put_loc:
+            case OP_set_loc:
+            case OP_put_loc_check_init:
+                idx = get_u16(bc_buf + pos + 1);
+                tdz_state_set(cur, idx);
+                break;
+            case OP_catch:
+            case OP_gosub:
+                /* an exception handler or a finally block can be entered
+                   from anywhere in its range: nothing is known there */
+                label = get_u32(bc_buf + pos + 1);
+                assert(label >= 0 && label < s->label_count);
+                st = label_state + (size_t)label * nwords;
+                for (i = 0; i < nwords; i++) {
+                    if (st[i]) {
+                        st[i] = 0;
+                        changed = true;
+                    }
+                }
+                break;
+            case OP_goto:
+                label = get_u32(bc_buf + pos + 1);
+                assert(label >= 0 && label < s->label_count);
+                if (reachable)
+                    changed |= tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords);
+                reachable = false;
+                break;
+            case OP_return:
+            case OP_return_undef:
+            case OP_return_async:
+            case OP_throw:
+            case OP_throw_error:
+            case OP_ret:
+            case OP_tail_call:
+            case OP_tail_call_method:
+                reachable = false;
+                break;
+            default:
+                switch(opcode_info[op].fmt) {
+                case OP_FMT_label:
+                case OP_FMT_label_u16:
+                    label = get_u32(bc_buf + pos + 1);
+                    break;
+                case OP_FMT_atom_label_u8:
+                case OP_FMT_atom_label_u16:
+                    label = get_u32(bc_buf + pos + 5);
+                    break;
+                default:
+                    label = -1;
+                    break;
+                }
+                if (label >= 0 && reachable) {
+                    assert(label < s->label_count);
+                    changed |= tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords);
+                }
+                break;
+            }
+        }
+        if (rewrite)
+            break;
+        if (!changed) {
+            /* converged: one more pass to rewrite the accesses */
+            rewrite = true;
+        } else if (iter >= 32) {
+            /* did not converge (should not happen): keep the checks */
+            break;
+        }
+    }
+    js_free(ctx, label_state);
+    return 0;
+}
+
 static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 {
     int pos, pos_next, bc_len, op, op1, len, i, line_num, col_num, patch_offsets;
@@ -38265,6 +38498,9 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 
     line_num = s->line_num;
     col_num = s->col_num;
+
+    if (resolve_tdz_checks(ctx, s))
+        return -1;
 
     cc.bc_buf = bc_buf = s->byte_code.buf;
     cc.bc_len = bc_len = s->byte_code.size;

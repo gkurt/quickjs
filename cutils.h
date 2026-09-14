@@ -78,6 +78,7 @@ extern "C" {
 #  define likely(x)       (x)
 #  define unlikely(x)     (x)
 #  define no_inline __declspec(noinline)
+#  define force_inline __forceinline
 #  define __maybe_unused
 #  define __attribute__(x)
 #  define __attribute(x)
@@ -85,6 +86,7 @@ extern "C" {
 #  define likely(x)       __builtin_expect(!!(x), 1)
 #  define unlikely(x)     __builtin_expect(!!(x), 0)
 #  define no_inline __attribute__((noinline))
+#  define force_inline inline __attribute__((always_inline))
 #  define __maybe_unused __attribute__((unused))
 #endif
 
