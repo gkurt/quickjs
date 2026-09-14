@@ -145,10 +145,15 @@ test262-check: $(QJS)
 microbench: $(QJS)
 	$(QJS) tests/microbench.js
 
+# runtime micro benchmarks, see bench/README.md
+# BENCH_ARGS: options and filters for bench/runtime.js, e.g. "--json out.json map"
+bench: $(QJS)
+	$(QJS) bench/runtime.js $(BENCH_ARGS)
+
 unicode_gen: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target unicode_gen
 
 libunicode-table.h: unicode_gen
 	$(BUILD_DIR)/unicode_gen unicode $@
 
-.PHONY: all amalgam ctest cxxtest debug fuzz fuzz-parse jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)
+.PHONY: all amalgam ctest cxxtest debug fuzz fuzz-parse jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench bench unicode_gen $(QJS) $(QJSC)
