@@ -20656,14 +20656,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
+/* Comparisons: ints are the common case. Doubles, and an int against a
+   double, are compared directly as well: for numbers the C comparison
+   has the JS semantics (NaN compares false, +0 equals -0), for every
+   operator here including == and ===. Everything else goes through the
+   generic path. */
 #define OP_CMP(opcode, binary_op, slow_call)              \
             CASE(opcode):                                 \
                 {                                         \
                 JSValue op1, op2;                         \
+                double d1, d2;                            \
                 op1 = sp[-2];                             \
                 op2 = sp[-1];                                   \
                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
                     sp[-2] = js_bool(JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
+                    sp--;                                               \
+                } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {          \
+                    sp[-2] = js_bool(JS_VALUE_GET_FLOAT64(op1) binary_op JS_VALUE_GET_FLOAT64(op2)); \
+                    sp--;                                               \
+                } else if ((JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) ||  \
+                            JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) && \
+                           js_arith_to_float64(op1, &d1) &&             \
+                           js_arith_to_float64(op2, &d2)) {             \
+                    sp[-2] = js_bool(d1 binary_op d2);                  \
                     sp--;                                               \
                 } else {                                                \
                     sf->cur_pc = pc;                                    \
