@@ -23681,6 +23681,30 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
     while (is_digit(*p))
         p++;
 
+    /* Fast path: an integer of at most 9 digits fits an int32 exactly, so
+       build it directly instead of going through strtod() and produce an
+       int-tagged value, which keeps later arithmetic and array indexing on
+       the integer fast paths. "-0" must stay a float64 -0.0. */
+    if (*p != '.' && *p != 'e' && *p != 'E') {
+        const uint8_t *q = p_start;
+        bool neg = false;
+        if (*q == '+' || *q == '-') {
+            neg = (*q == '-');
+            q++;
+        }
+        if (p - q <= 9) {
+            uint32_t v = 0;
+            while (q < p)
+                v = v * 10 + (*q++ - '0');
+            if (v != 0 || !neg) {
+                s->token.val = TOK_NUMBER;
+                s->token.u.num.val = js_int32(neg ? -(int32_t)v : (int32_t)v);
+                *pp = p;
+                return 0;
+            }
+        }
+    }
+
     if (*p == '.') {
         p++;
         if (!is_digit(*p))
@@ -50781,6 +50805,48 @@ exception:
     return ret;
 }
 
+/* Fast path for the case conversion of pure ASCII 8-bit strings: the
+   mapping is a per-byte transform that never changes the length, so the
+   generic Unicode machinery can be skipped. Returns JS_UNDEFINED if 'val'
+   has a non-ASCII byte (Latin-1 has special cases, e.g. U+00DF), 'val'
+   itself if it is already in the requested case and the converted string
+   otherwise. 'val' is consumed unless JS_UNDEFINED or JS_EXCEPTION is
+   returned. */
+static JSValue js_string_case_ascii(JSContext *ctx, JSValue val, bool to_lower)
+{
+    JSString *p = JS_VALUE_GET_STRING(val);
+    const uint8_t *src = str8(p);
+    uint8_t lo = to_lower ? 'A' : 'a';
+    int i, j, n = p->len;
+    JSString *r;
+    uint8_t *dst;
+
+    for (i = 0; i < n; i++) {
+        if (src[i] >= 0x80)
+            return JS_UNDEFINED;
+        if ((uint8_t)(src[i] - lo) < 26)
+            break;
+    }
+    if (i == n)
+        return val;
+    for (j = i + 1; j < n; j++) {
+        if (src[j] >= 0x80)
+            return JS_UNDEFINED;
+    }
+    r = js_alloc_string(ctx, n, 0);
+    if (!r)
+        return JS_EXCEPTION;
+    dst = str8(r);
+    memcpy(dst, src, i);
+    for (; i < n; i++) {
+        uint8_t ch = src[i];
+        dst[i] = ((uint8_t)(ch - lo) < 26) ? ch ^ 0x20 : ch;
+    }
+    dst[n] = '\0';
+    JS_FreeValue(ctx, val);
+    return JS_MKPTR(JS_TAG_STRING, r);
+}
+
 static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv, int to_lower)
 {
@@ -50796,6 +50862,14 @@ static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val,
     p = JS_VALUE_GET_STRING(val);
     if (p->len == 0)
         return val;
+    if (!p->is_wide_char) {
+        JSValue ret = js_string_case_ascii(ctx, val, to_lower);
+        if (!JS_IsUndefined(ret)) {
+            if (JS_IsException(ret))
+                JS_FreeValue(ctx, val);
+            return ret;
+        }
+    }
     if (string_buffer_init(ctx, b, p->len))
         goto fail;
     for(i = 0; i < p->len;) {
@@ -55880,7 +55954,22 @@ static JSValueConst map_normalize_key_const(JSContext *ctx, JSValueConst key)
     return safe_const(map_normalize_key(ctx, unsafe_unconst(key)));
 }
 
-/* XXX: better hash ? */
+/* Mix the bits of a raw hash so that every input bit affects the low
+   bits, which are the ones map_find_record() keeps after masking. Numbers
+   and pointers need this: a small integer converted to a double has zero in
+   the low bits of its high word and object pointers are 16-byte aligned, so
+   without mixing sequential integer keys or object keys all land in a
+   handful of buckets. (Low-bias 32-bit mixer by Chris Wellons.) */
+static inline uint32_t map_hash_mix(uint32_t h)
+{
+    h ^= h >> 16;
+    h *= 0x7feb352d;
+    h ^= h >> 15;
+    h *= 0x846ca68b;
+    h ^= h >> 16;
+    return h;
+}
+
 static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
 {
     uint32_t tag = JS_VALUE_GET_NORM_TAG(key);
@@ -55901,7 +55990,7 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
         break;
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:
-        h = (uintptr_t)JS_VALUE_GET_PTR(key) * 3163;
+        h = map_hash_mix((uintptr_t)JS_VALUE_GET_PTR(key));
         break;
     case JS_TAG_INT:
         d = JS_VALUE_GET_INT(key);
@@ -55920,7 +56009,7 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
             d = NAN;
     hash_float64:
         u.d = d;
-        h = (u.u32[0] ^ u.u32[1]) * 3163;
+        h = map_hash_mix(u.u32[0] ^ map_hash_mix(u.u32[1]));
         tag = JS_TAG_FLOAT64;
         break;
     default:
