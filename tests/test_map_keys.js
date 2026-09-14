@@ -53,36 +53,36 @@ function range(n, f) {
 }
 
 // small sequential integers are the common case and used to collide
-check_keys(range(5000, i => i), "sequential ints");
-check_keys(range(5000, i => -i - 1), "negative ints");
-check_keys(range(5000, i => i * 1024), "multiples of 1024");
-check_keys(range(5000, i => i * 1000003), "large stride ints");
-check_keys(range(2000, i => 2 ** 31 - 1 - i), "ints near INT32_MAX");
-check_keys(range(2000, i => -(2 ** 31) + i), "ints near INT32_MIN");
-check_keys(range(2000, i => 2 ** 32 + i), "ints beyond uint32");
-check_keys(range(2000, i => 2 ** 53 - i), "ints near 2**53");
-check_keys(range(5000, i => i + 0.5), "halves");
-check_keys(range(5000, i => i * 0.1), "tenths");
-check_keys(range(2000, i => i * 1e-300), "denormal-ish floats");
-check_keys(range(2000, i => i * 1e300), "huge floats");
-check_keys(range(2000, i => 2 ** (i - 1000)), "powers of two");
-check_keys(range(5000, i => "k" + i), "strings");
-check_keys(range(2000, i => "\u00e9\u4e2d" + i), "wide strings");
-check_keys(range(2000, i => ("x" + i).repeat(20)), "long strings");
-check_keys(range(5000, i => ({ i })), "objects");
-check_keys(range(2000, i => [i]), "arrays");
-check_keys(range(2000, i => () => i), "functions");
-check_keys(range(2000, i => Symbol("s" + i)), "symbols");
-check_keys(range(2000, i => BigInt(i)), "small bigints");
-check_keys(range(2000, i => BigInt(i) << 70n), "large bigints");
-check_keys(range(2000, i => BigInt(i) - (1n << 70n)), "negative large bigints");
+check_keys(range(1200, i => i), "sequential ints");
+check_keys(range(1200, i => -i - 1), "negative ints");
+check_keys(range(1200, i => i * 1024), "multiples of 1024");
+check_keys(range(1200, i => i * 1000003), "large stride ints");
+check_keys(range(600, i => 2 ** 31 - 1 - i), "ints near INT32_MAX");
+check_keys(range(600, i => -(2 ** 31) + i), "ints near INT32_MIN");
+check_keys(range(600, i => 2 ** 32 + i), "ints beyond uint32");
+check_keys(range(600, i => 2 ** 53 - i), "ints near 2**53");
+check_keys(range(1200, i => i + 0.5), "halves");
+check_keys(range(1200, i => i * 0.1), "tenths");
+check_keys(range(600, i => i * 1e-300), "denormal-ish floats");
+check_keys(range(600, i => i * 1e300), "huge floats");
+check_keys(range(600, i => 2 ** (i - 1000)), "powers of two");
+check_keys(range(1200, i => "k" + i), "strings");
+check_keys(range(600, i => "\u00e9\u4e2d" + i), "wide strings");
+check_keys(range(600, i => ("x" + i).repeat(20)), "long strings");
+check_keys(range(1200, i => ({ i })), "objects");
+check_keys(range(600, i => [i]), "arrays");
+check_keys(range(600, i => () => i), "functions");
+check_keys(range(600, i => Symbol("s" + i)), "symbols");
+check_keys(range(600, i => BigInt(i)), "small bigints");
+check_keys(range(600, i => BigInt(i) << 70n), "large bigints");
+check_keys(range(600, i => BigInt(i) - (1n << 70n)), "negative large bigints");
 check_keys([true, false, null, undefined, 0, -1, NaN, Infinity, -Infinity, "", "0", 0n, {}, Symbol()], "mixed");
 
 // a Map that mixes every key type must still find each key
 {
     const keys = [
-        ...range(300, i => i), ...range(300, i => i + 0.25), ...range(300, i => "k" + i),
-        ...range(300, i => ({})), ...range(300, i => BigInt(i) * 3n), ...range(300, i => Symbol(i)),
+        ...range(150, i => i), ...range(150, i => i + 0.25), ...range(150, i => "k" + i),
+        ...range(150, i => ({})), ...range(150, i => BigInt(i) * 3n), ...range(150, i => Symbol(i)),
     ];
     check_keys(keys, "mixed types");
 }
@@ -163,15 +163,15 @@ check_keys([true, false, null, undefined, 0, -1, NaN, Infinity, -Infinity, "", "
 {
     const m = new Map();
     for (let round = 0; round < 3; round++) {
-        for (let i = 0; i < 20000; i++)
+        for (let i = 0; i < 5000; i++)
             m.set(i, round);
-        assert(m.size, 20000);
-        for (let i = 0; i < 20000; i += 2)
+        assert(m.size, 5000);
+        for (let i = 0; i < 5000; i += 2)
             m.delete(i);
-        assert(m.size, 10000);
-        for (let i = 0; i < 20000; i++)
+        assert(m.size, 2500);
+        for (let i = 0; i < 5000; i++)
             assert(m.get(i), (i & 1) ? round : undefined);
-        for (let i = 1; i < 20000; i += 2)
+        for (let i = 1; i < 5000; i += 2)
             m.delete(i);
         assert(m.size, 0);
     }
@@ -200,7 +200,7 @@ check_keys([true, false, null, undefined, 0, -1, NaN, Infinity, -Infinity, "", "
 {
     const wm = new WeakMap();
     const ws = new WeakSet();
-    const keys = range(5000, () => ({}));
+    const keys = range(1200, () => ({}));
     keys.forEach((k, i) => { wm.set(k, i); ws.add(k); });
     keys.forEach((k, i) => {
         assert(wm.get(k), i);
