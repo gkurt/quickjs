@@ -351,6 +351,18 @@ function test_array_append()
     a = [1, , 3].map(x => x);
     assert(1 in a, false, "holes");
     assert(a.length, 3, "holes");
+    /* elements defined past the end of the result (holes before them)
+       take the generic path */
+    a = Array.prototype.concat.call({ length: 4, 1: "a", 3: "b",
+                                      [Symbol.isConcatSpreadable]: true },
+                                    { x: 1 }, [2, 3]);
+    assert(a.length, 7, "concat");
+    assert(0 in a, false, "concat");
+    assert(a[1] === "a" && a[3] === "b" && a[4].x === 1 && a[6] === 3, true, "concat");
+    a = [];
+    a[1] = "x";
+    a = a.concat([, "y"]);
+    assert(a.length === 4 && a[1] === "x" && a[3] === "y" && !(2 in a), true, "concat");
 
     /* the result array is not extensible or its length is not writable */
     class NonExtensible extends Array {

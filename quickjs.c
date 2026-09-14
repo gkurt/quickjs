@@ -11946,37 +11946,36 @@ int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
     return ret;
 }
 
-/* Append 'val' to the fast array 'this_obj' if the definition of the
-   element 'idx' with 'flags' amounts to that. Return true if done ('val'
-   is consumed, an exception may be pending), false if the generic
-   definition must be used ('val' is not consumed) */
-static force_inline bool js_define_fast_array_element(JSContext *ctx,
-                                                      JSValueConst this_obj,
-                                                      int64_t idx, JSValue val,
-                                                      int flags, int *pret)
+/* Return the fast array 'this_obj' if the definition of its element
+   'idx' with 'flags' amounts to appending the value to it with
+   add_fast_array_element(), NULL if the generic definition must be
+   used */
+static force_inline JSObject *js_get_fast_array_append(JSValueConst this_obj,
+                                                       int64_t idx, int flags)
 {
     JSObject *p;
 
     if (JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT)
-        return false;
+        return NULL;
     p = JS_VALUE_GET_OBJ(this_obj);
     if (p->class_id != JS_CLASS_ARRAY || !p->fast_array ||
         idx != p->u.array.count || !p->extensible ||
         (flags & JS_PROP_C_W_E) != JS_PROP_C_W_E)
-        return false;
-    *pret = add_fast_array_element(ctx, p, val, flags);
-    return true;
+        return NULL;
+    return p;
 }
 
 int JS_DefinePropertyValueValue(JSContext *ctx, JSValueConst this_obj,
                                 JSValue prop, JSValue val, int flags)
 {
     JSAtom atom;
+    JSObject *p;
     int ret;
-    if (JS_VALUE_GET_TAG(prop) == JS_TAG_INT &&
-        js_define_fast_array_element(ctx, this_obj, JS_VALUE_GET_INT(prop),
-                                     val, flags, &ret))
-        return ret;
+    if (JS_VALUE_GET_TAG(prop) == JS_TAG_INT) {
+        p = js_get_fast_array_append(this_obj, JS_VALUE_GET_INT(prop), flags);
+        if (p)
+            return add_fast_array_element(ctx, p, val, flags);
+    }
     atom = JS_ValueToAtom(ctx, prop);
     JS_FreeValue(ctx, prop);
     if (unlikely(atom == JS_ATOM_NULL)) {
@@ -12045,9 +12044,11 @@ static int JS_DefinePropertyValueInt64Const(JSContext *ctx, JSValueConst this_ob
                                             int64_t idx, JSValueConst val, int flags)
 {
     JSAtom atom;
+    JSObject *p;
     int ret;
-    if (js_define_fast_array_element(ctx, this_obj, idx, js_dup(val), flags, &ret))
-        return ret;
+    p = js_get_fast_array_append(this_obj, idx, flags);
+    if (p)
+        return add_fast_array_element(ctx, p, js_dup(val), flags);
     atom = JS_ValueToAtom(ctx, js_int64(idx));
     if (unlikely(atom == JS_ATOM_NULL))
         return -1;
