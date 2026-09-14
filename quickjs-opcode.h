@@ -151,7 +151,7 @@ DEF(  get_array_el2, 1, 2, 2, none) /* obj prop -> obj value */
 DEF(   put_array_el, 1, 3, 0, none)
 DEF(get_super_value, 1, 3, 1, none) /* this obj prop -> value */
 DEF(put_super_value, 1, 4, 0, none) /* this obj prop value -> */
-DEF(   define_field, 5, 2, 1, atom)
+DEF(   define_field, 7, 2, 1, atom_u16)
 DEF(       set_name, 5, 1, 1, atom)
 DEF(set_name_computed, 1, 2, 2, none)
 DEF(      set_proto, 1, 2, 1, none)

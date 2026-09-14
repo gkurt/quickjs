@@ -866,6 +866,10 @@ typedef struct JSInlineCache {
        i-th prototype up to the object holding the property. Each holds
        a reference. shapes[0] == NULL: empty */
     JSShape *shapes[JS_IC_MAX_DEPTH + 1];
+    /* entry of a property add (see js_ic_fill_add()): the shape of the
+       receiver once the property is added, holds a reference. NULL
+       otherwise */
+    JSShape *new_shape;
     uint32_t prop_idx; /* index in JSObject.prop of the holder */
     uint8_t depth; /* prototype level of the holder, JS_IC_DISABLED: never filled */
 } JSInlineCache;
@@ -7367,6 +7371,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                 if (ic->shapes[0]) {
                     for(k = 0; k <= ic->depth; k++)
                         mark_func(rt, &ic->shapes[k]->header);
+                    if (ic->new_shape)
+                        mark_func(rt, &ic->new_shape->header);
                 }
             }
             if (b->realm)
@@ -9214,6 +9220,10 @@ static void js_ic_free_shapes(JSRuntime *rt, JSInlineCache *ic)
     for(i = 0; i <= ic->depth; i++)
         js_free_shape(rt, ic->shapes[i]);
     ic->shapes[0] = NULL;
+    if (ic->new_shape) {
+        js_free_shape(rt, ic->new_shape);
+        ic->new_shape = NULL;
+    }
 }
 
 static void js_ic_free(JSRuntime *rt, JSFunctionBytecode *b)
@@ -9383,6 +9393,97 @@ static no_inline int js_ic_put(JSContext *ctx, JSInlineCache *ic, JSObject *p,
     set_value(ctx, &pr->u.value, val);
     js_ic_fill(ctx->rt, ic, p, 0, prs - get_shape_prop(p->shape));
     return 1;
+}
+
+/* The generic path just added the property 'atom' to 'p', changing its
+   shape from 'old_sh' to p->shape: remember the transition so that the
+   next object with the shape 'old_sh' gets the property without a
+   lookup. With 'check_chain', the add depends on the prototypes (a
+   setter or a read only property there would prevent it), so their
+   shapes are cached and none of them may have the property */
+static no_inline void js_ic_fill_add(JSContext *ctx, JSInlineCache *ic,
+                                     JSObject *p, JSShape *old_sh,
+                                     JSAtom atom, bool check_chain)
+{
+    JSRuntime *rt = ctx->rt;
+    JSShape *new_sh = p->shape;
+    JSShapeProperty *pr;
+    JSObject *objs[JS_IC_MAX_DEPTH + 1];
+    JSProperty *unused;
+    int i, depth;
+
+    if (ic->depth == JS_IC_DISABLED || !new_sh->is_hashed ||
+        !old_sh->is_hashed || new_sh->prop_count != old_sh->prop_count + 1 ||
+        new_sh->prop_count > JS_IC_MAX_PROPS || new_sh->proto != old_sh->proto ||
+        new_sh->deleted_prop_count != 0 || old_sh->deleted_prop_count != 0 ||
+        p->is_exotic || __JS_AtomIsTaggedInt(atom))
+        return;
+    /* the transition is from old_sh: both hashed with the same
+       prototype, the new shape has the properties of the old one plus
+       the added one (add_property() modifies the last property only) */
+    pr = &get_shape_prop(new_sh)[new_sh->prop_count - 1];
+    if (pr->atom != atom || pr->flags != JS_PROP_C_W_E)
+        return;
+    depth = 0;
+    if (check_chain) {
+        JSObject *p1 = new_sh->proto;
+        while (p1) {
+            if (++depth > JS_IC_MAX_DEPTH || p1->is_exotic ||
+                p1->shape->prop_count > JS_IC_MAX_PROPS ||
+                p1->shape->deleted_prop_count != 0 ||
+                find_own_property(&unused, p1, atom))
+                return;
+            objs[depth] = p1;
+            p1 = p1->shape->proto;
+        }
+    }
+    for(i = 1; i <= depth; i++) {
+        if (!objs[i]->shape->is_hashed)
+            js_shape_rehash(rt, objs[i]);
+        js_dup_shape(objs[i]->shape);
+    }
+    js_dup_shape(old_sh);
+    js_dup_shape(new_sh);
+    js_ic_free_shapes(rt, ic);
+    ic->shapes[0] = old_sh;
+    for(i = 1; i <= depth; i++)
+        ic->shapes[i] = objs[i]->shape;
+    ic->new_shape = new_sh;
+    ic->depth = depth;
+    ic->prop_idx = new_sh->prop_count - 1;
+}
+
+/* Add the property of the transition entry 'ic' to 'p', whose shape is
+   ic->shapes[0]. 'val' is consumed. Return 0 if done, 1 if the generic
+   path must be used, -1 on error (exception, 'val' not consumed) */
+static force_inline int js_ic_add(JSContext *ctx, JSInlineCache *ic,
+                                  JSObject *p, JSValue val)
+{
+    JSShape *sh = p->shape, *new_sh = ic->new_shape;
+    JSObject *p1 = p;
+    int i;
+
+    /* an exotic object may share the shape of the ordinary object which
+       filled the entry */
+    if (unlikely(!p->extensible || p->is_exotic))
+        return 1;
+    for(i = 1; i <= ic->depth; i++) {
+        p1 = p1->shape->proto;
+        if (p1->shape != ic->shapes[i])
+            return 1;
+    }
+    if (new_sh->prop_size != sh->prop_size) {
+        JSProperty *new_prop;
+        new_prop = js_realloc(ctx, p->prop,
+                              sizeof(p->prop[0]) * new_sh->prop_size);
+        if (unlikely(!new_prop))
+            return -1;
+        p->prop = new_prop;
+    }
+    p->shape = js_dup_shape(new_sh);
+    js_free_shape(ctx->rt, sh);
+    p->prop[ic->prop_idx].u.value = val;
+    return 0;
 }
 
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
@@ -19954,22 +20055,54 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                     p = JS_VALUE_GET_OBJ(obj);
                     if (likely(p->shape == ic->shapes[0])) {
-                        /* cached own writable data property */
-                        set_value(ctx, &p->prop[ic->prop_idx].u.value, sp[-1]);
+                        if (likely(!ic->new_shape)) {
+                            /* cached own writable data property */
+                            set_value(ctx, &p->prop[ic->prop_idx].u.value, sp[-1]);
+                        } else {
+                            /* cached property add */
+                            ret = js_ic_add(ctx, ic, p, sp[-1]);
+                            if (unlikely(ret)) {
+                                if (ret > 0)
+                                    goto put_field_slow_path;
+                                /* 'val' was not consumed */
+                                JS_FreeValue(ctx, sp[-1]);
+                                goto put_field_fail;
+                            }
+                        }
                     } else if (!js_ic_put(ctx, ic, p, atom, sp[-1])) {
                         goto put_field_slow_path;
                     }
                     JS_FreeValue(ctx, obj);
                     sp -= 2;
                 } else {
+                    JSShape *old_sh;
                 put_field_slow_path:
                     sf->cur_pc = pc;
+                    /* remember the shape to cache a property add. Not
+                       for a shape which is not hashed: it must stay
+                       unique to be modified in place */
+                    old_sh = NULL;
+                    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+                        p = JS_VALUE_GET_OBJ(obj);
+                        if (p->shape->is_hashed)
+                            old_sh = js_dup_shape(p->shape);
+                    }
                     ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
                                                   JS_PROP_THROW_STRICT);
+                    if (old_sh) {
+                        /* 'p' is kept alive by the stack */
+                        if (ret > 0 && p->shape != old_sh)
+                            js_ic_fill_add(ctx, ic, p, old_sh, atom, true);
+                        js_free_shape(ctx->rt, old_sh);
+                    }
+                    if (unlikely(ret < 0)) {
+                    put_field_fail:
+                        JS_FreeValue(ctx, obj);
+                        sp -= 2;
+                        goto exception;
+                    }
                     JS_FreeValue(ctx, obj);
                     sp -= 2;
-                    if (unlikely(ret < 0))
-                        goto exception;
                 }
             }
             BREAK;
@@ -20030,11 +20163,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 int ret;
                 JSAtom atom;
-                atom = get_u32(pc);
-                pc += 4;
+                JSInlineCache *ic;
+                JSObject *p;
+                JSShape *old_sh;
 
+                atom = get_u32(pc);
+                ic = &b->ic[get_u16(pc + 4)];
+                pc += 6;
+
+                /* the object comes from OP_object */
+                p = JS_VALUE_GET_OBJ(sp[-2]);
+                if (likely(p->shape == ic->shapes[0])) {
+                    /* cached property add */
+                    ret = js_ic_add(ctx, ic, p, sp[-1]);
+                    if (likely(ret == 0)) {
+                        sp--;
+                        BREAK;
+                    }
+                    if (ret < 0) {
+                        JS_FreeValue(ctx, sp[-1]);
+                        sp--;
+                        goto exception;
+                    }
+                }
+                old_sh = NULL;
+                if (p->shape->is_hashed)
+                    old_sh = js_dup_shape(p->shape);
                 ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
                                              JS_PROP_C_W_E | JS_PROP_THROW);
+                if (old_sh) {
+                    if (ret > 0 && p->shape != old_sh)
+                        js_ic_fill_add(ctx, ic, p, old_sh, atom, false);
+                    js_free_shape(ctx->rt, old_sh);
+                }
                 sp--;
                 if (unlikely(ret < 0))
                     goto exception;
@@ -27023,6 +27184,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
             emit_u16(s, s->cur_func->scope_level);
             emit_op(s, OP_define_field);
             emit_atom(s, name);
+            emit_u16(s, 0); /* inline cache slot */
         } else if (s->token.val == '(' || (s->ts && s->token.val == '<')) {
             bool is_getset = (prop_type == PROP_TYPE_GET ||
                               prop_type == PROP_TYPE_SET);
@@ -27078,6 +27240,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
                 set_object_name(s, name);
                 emit_op(s, OP_define_field);
                 emit_atom(s, name);
+                emit_u16(s, 0); /* inline cache slot */
             }
         }
         JS_FreeAtom(s->ctx, name);
@@ -27733,6 +27896,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                 set_object_name(s, name);
                 emit_op(s, OP_define_field);
                 emit_atom(s, name);
+                emit_u16(s, 0); /* inline cache slot */
             }
             s->cur_func = s->cur_func->parent;
             if (js_parse_expect_semi(s))
@@ -27976,6 +28140,7 @@ static __exception int js_parse_array_literal(JSParseState *s)
                 return -1;
             emit_op(s, OP_define_field);
             emit_u32(s, __JS_AtomFromUInt32(idx));
+            emit_u16(s, 0); /* inline cache slot */
             need_length = false;
         }
         idx++;
@@ -28587,6 +28752,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                             emit_op(s, OP_null); /* TOS: src excludeList null */
                             emit_op(s, OP_define_field); /* TOS: src excludeList */
                             emit_atom(s, prop_name);
+                            emit_u16(s, 0); /* inline cache slot */
                             emit_op(s, OP_swap); /* TOS: excludeList src */
                         }
                         /* get the named property from the source object */
@@ -28621,6 +28787,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                         emit_op(s, OP_null);
                         emit_op(s, OP_define_field);
                         emit_atom(s, prop_name);
+                        emit_u16(s, 0); /* inline cache slot */
                         emit_op(s, OP_swap);
                     }
                     /* source -- source source */
@@ -28707,6 +28874,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     emit_op(s, OP_null);
                     emit_op(s, OP_define_field);
                     emit_atom(s, prop_name);
+                    emit_u16(s, 0); /* inline cache slot */
                     emit_op(s, OP_swap);
                 }
                 if (!tok || tok == TOK_VAR) {
@@ -36793,6 +36961,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                 dbuf_put_u16(bc, var_idx);
                 dbuf_putc(bc, OP_define_field);
                 dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+                dbuf_put_u16(bc, 0); /* inline cache slot */
                 dbuf_putc(bc, OP_push_atom_value);
                 dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
             } else
@@ -37041,6 +37210,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                     dbuf_put_u16(bc, idx);
                     dbuf_putc(bc, OP_define_field);
                     dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+                    dbuf_put_u16(bc, 0); /* inline cache slot */
                     dbuf_putc(bc, OP_push_atom_value);
                     dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
                 } else
@@ -37854,6 +38024,7 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
             } else if (has_closure == 1) {
                 dbuf_putc(bc, OP_define_field);
                 dbuf_put_u32(bc, JS_DupAtom(ctx, hf->var_name));
+                dbuf_put_u16(bc, 0); /* inline cache slot */
                 dbuf_putc(bc, OP_drop);
             } else {
                 /* XXX: Check if variable is writable and enumerable */
@@ -39252,6 +39423,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             /* fall thru */
         case OP_get_field2:
         case OP_put_field:
+        case OP_define_field:
             /* allocate the inline cache slot */
             add_pc2line_info(s, bc_out.size, line_num, col_num);
             dbuf_putc(&bc_out, op);
@@ -42753,6 +42925,7 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
         case OP_get_field:
         case OP_get_field2:
         case OP_put_field:
+        case OP_define_field:
         case OP_get_loc_field:
             /* the inline caches are allocated once all the slots are known */
             ic_slot = get_u16(bc_buf + pos + 5);

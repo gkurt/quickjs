@@ -207,6 +207,282 @@ function test_put_field()
     }
 }
 
+/* A write site adding a property caches the shape transition: the
+   receiver gets the new shape and the value without a lookup. The
+   add depends on the prototype chain, which is checked by shape.
+   Deleting a property leaves a hole in the shape, which is never
+   cached: each part below uses its own prototype object */
+function test_property_add()
+{
+    const strict_add = (o, v) => { o.x = v; };
+    const sloppy_add = Function("o", "v", "o.x = v;");
+    const make = (proto, v) => { const o = Object.create(proto); strict_add(o, v); return o; };
+    let proto = {}, o;
+    for (let i = 0; i < 8; i++) {
+        o = make(proto, i);
+        assert(Object.hasOwn(o, "x"), true);
+        assert(o.x, i);
+        assert(JSON.stringify(Object.getOwnPropertyDescriptor(o, "x")),
+               '{"value":' + i + ',"writable":true,"enumerable":true,"configurable":true}');
+    }
+    /* the objects made at a cached site are independent */
+    const o1 = make(proto, 1), o2 = make(proto, 2);
+    o1.x = 10;
+    assert(o2.x, 2);
+    o1.y = 1;
+    assert(Object.hasOwn(o2, "y"), false);
+    assert(Object.keys(o2).join(), "x");
+
+    /* a setter appears on the prototype after the site is warm */
+    let set_value, set_count = 0;
+    Object.defineProperty(proto, "x",
+                          { set(v) { set_value = v; set_count++; }, configurable: true });
+    o = make(proto, 5);
+    assert(set_value, 5);
+    assert(set_count, 1);
+    assert(Object.hasOwn(o, "x"), false);
+    /* the setter defines the property itself: it must run every time */
+    Object.defineProperty(proto, "x", {
+        set(v) {
+            set_count++;
+            Object.defineProperty(this, "x", { value: v, writable: true,
+                                               enumerable: true, configurable: true });
+        },
+        configurable: true });
+    for (let i = 0; i < 8; i++) {
+        o = make(proto, i);
+        assert(o.x, i);
+    }
+    assert(set_count, 9);
+    /* read only data property on the prototype */
+    Object.defineProperty(proto, "x", { value: 42, writable: false, configurable: true });
+    assertThrows(TypeError, () => make(proto, 1));
+    o = Object.create(proto);
+    sloppy_add(o, 1);
+    assert(Object.hasOwn(o, "x"), false);
+    assert(o.x, 42);
+    /* writable data property on the prototype: shadowed by the add */
+    Object.defineProperty(proto, "x", { value: 42, writable: true, configurable: true });
+    for (let i = 0; i < 8; i++)
+        assert(make(proto, i).x, i);
+    delete proto.x;
+    for (let i = 0; i < 8; i++)
+        assert(make(proto, i).x, i);
+    /* the prototype of the prototype gets the setter */
+    proto = Object.create({});
+    for (let i = 0; i < 8; i++)
+        assert(make(proto, i).x, i);
+    Object.defineProperty(Object.getPrototypeOf(proto), "x",
+                          { set(v) { set_value = v; }, configurable: true });
+    o = make(proto, 77);
+    assert(set_value, 77);
+    assert(Object.hasOwn(o, "x"), false);
+
+    /* non extensible receiver with the cached shape */
+    proto = {};
+    for (let i = 0; i < 8; i++)
+        make(proto, i);
+    for (let i = 0; i < 8; i++) {
+        o = Object.preventExtensions(Object.create(proto));
+        assertThrows(TypeError, () => strict_add(o, 1));
+        sloppy_add(o, 1);
+        assert(Object.hasOwn(o, "x"), false);
+        o = Object.freeze(Object.create(proto));
+        sloppy_add(o, 1);
+        assert(Object.hasOwn(o, "x"), false);
+    }
+
+    /* the property storage grows during a cached add */
+    const build = () => {
+        const o = {};
+        o.p0 = 0; o.p1 = 1; o.p2 = 2; o.p3 = 3; o.p4 = 4; o.p5 = 5;
+        o.p6 = 6; o.p7 = 7; o.p8 = 8; o.p9 = 9; o.p10 = 10; o.p11 = 11;
+        o.p12 = 12; o.p13 = 13; o.p14 = 14; o.p15 = 15; o.p16 = 16;
+        return o;
+    };
+    for (let i = 0; i < 8; i++) {
+        o = build();
+        for (let j = 0; j <= 16; j++)
+            assert(o["p" + j], j);
+        assert(Object.keys(o).length, 17);
+    }
+
+    /* the setter adds another property */
+    proto = { set x(v) { this.y = v; } };
+    for (let i = 0; i < 8; i++) {
+        o = make(proto, 7);
+        assert(Object.hasOwn(o, "x"), false);
+        assert(o.y, 7);
+    }
+    /* __proto__ is a setter which changes the shape without adding */
+    const setproto = (o, p) => { o.__proto__ = p; };
+    for (let i = 0; i < 8; i++) {
+        o = {};
+        setproto(o, proto);
+        assert(Object.getPrototypeOf(o), proto);
+        assert(Object.hasOwn(o, "__proto__"), false);
+    }
+
+    /* prototype chain deeper than the cache: a setter far up the chain */
+    let deep_value;
+    const top = {};
+    const chain = [top];
+    for (let i = 0; i < 6; i++)
+        chain.push(Object.create(chain[i]));
+    const bottom = chain[6];
+    for (let i = 0; i < 8; i++)
+        assert(make(bottom, i).x, i);
+    Object.defineProperty(top, "x", { set(v) { deep_value = v; }, configurable: true });
+    o = make(bottom, 99);
+    assert(deep_value, 99);
+    assert(Object.hasOwn(o, "x"), false);
+    Object.defineProperty(chain[3], "x", { value: 0, writable: false, configurable: true });
+    assertThrows(TypeError, () => make(bottom, 1));
+
+    /* a Proxy in the prototype chain sees every add */
+    let trap_count = 0;
+    const px = new Proxy({}, { set(t, k, v, r) { trap_count++; return Reflect.set(t, k, v, r); } });
+    for (let i = 0; i < 8; i++) {
+        o = make(px, i);
+        assert(o.x, i);
+        assert(Object.hasOwn(o, "x"), true);
+    }
+    assert(trap_count, 8);
+    /* a Proxy shares the shape of the objects without prototype */
+    for (let i = 0; i < 8; i++)
+        assert(make(null, i).x, i);
+    const target = {};
+    const px2 = new Proxy(target, { set(t, k, v, r) { trap_count++; return Reflect.set(t, k, v); } });
+    strict_add(px2, 3);
+    assert(trap_count, 9);
+    assert(target.x, 3);
+    assert(Object.hasOwn(px2, "x"), true);
+    assert(Reflect.ownKeys(px2).join(), "x");
+
+    /* exotic receiver sharing the shape of the ordinary objects which
+       warmed the site */
+    for (let i = 0; i < 8; i++)
+        assert(make(Uint8Array.prototype, i).x, i);
+    const ta = new Uint8Array(4);
+    strict_add(ta, 5);
+    assert(ta.x, 5);
+    assert(Object.hasOwn(ta, "x"), true);
+    assert(ta.length, 4);
+    for (let i = 0; i < 8; i++)
+        assert(make(String.prototype, i).x, i);
+    const st = new String("ab");
+    strict_add(st, 6);
+    assert(st.x, 6);
+    assert(st.length, 2);
+    assert(Object.getOwnPropertyNames(st).join(), "0,1,length,x");
+
+    /* class instances: the prototype of 'this' differs in a subclass */
+    class A { constructor(v) { this.a = v; this.b = v + 1; } }
+    class B extends A { constructor(v) { super(v); this.c = v + 2; } }
+    for (let i = 0; i < 8; i++) {
+        const a = new A(i), b = new B(i);
+        assert(Object.keys(a).join(), "a,b");
+        assert(Object.keys(b).join(), "a,b,c");
+        assert(a.b, i + 1);
+        assert(b.c, i + 2);
+        assert(Object.getPrototypeOf(b), B.prototype);
+    }
+    let b_set;
+    Object.defineProperty(B.prototype, "b", { set(v) { b_set = v; }, configurable: true });
+    const b = new B(10);
+    assert(b_set, 11);
+    assert(Object.hasOwn(b, "b"), false);
+    assert(Object.keys(new A(10)).join(), "a,b");
+
+    /* the cached shapes survive a GC */
+    proto = {};
+    for (let i = 0; i < 8; i++)
+        make(proto, i);
+    std.gc();
+    for (let i = 0; i < 8; i++) {
+        o = make(proto, i);
+        assert(o.x, i);
+        assert(Object.keys(o).join(), "x");
+    }
+}
+
+/* Object literals define their properties through the same transition
+   cache, without consulting the prototype chain */
+function test_object_literal()
+{
+    const lit = (a, b) => ({ x: a, y: b });
+    for (let i = 0; i < 8; i++) {
+        const o = lit(i, -i);
+        assert(o.x, i);
+        assert(o.y, -i);
+        assert(Object.keys(o).join(), "x,y");
+    }
+    /* a setter on Object.prototype does not affect a literal */
+    let set_count = 0;
+    Object.defineProperty(Object.prototype, "x", { set(v) { set_count++; }, configurable: true });
+    Object.defineProperty(Object.prototype, "y", { value: 0, writable: false, configurable: true });
+    for (let i = 0; i < 8; i++) {
+        const o = lit(i, -i);
+        assert(Object.hasOwn(o, "x"), true);
+        assert(o.x, i);
+        assert(o.y, -i);
+    }
+    assert(set_count, 0);
+    delete Object.prototype.x;
+    delete Object.prototype.y;
+
+    /* duplicate keys: the last one wins, the order is kept */
+    const dup = (a, b, c) => ({ x: a, y: b, x: c });
+    for (let i = 0; i < 8; i++) {
+        const o = dup(1, 2, 3);
+        assert(o.x, 3);
+        assert(o.y, 2);
+        assert(Object.keys(o).join(), "x,y");
+    }
+
+    /* literals with the same keys and computed or spread parts */
+    const spread = (a, src) => ({ x: a, ...src, z: 1 });
+    for (let i = 0; i < 8; i++) {
+        const o = spread(i, { y: i });
+        assert(Object.keys(o).join(), "x,y,z");
+        assert(o.y, i);
+        const o2 = spread(i, { x: 100, w: 2 });
+        assert(Object.keys(o2).join(), "x,w,z");
+        assert(o2.x, 100);
+    }
+    const computed = (k, v) => ({ x: 1, [k]: v, y: 2 });
+    for (let i = 0; i < 8; i++) {
+        assert(Object.keys(computed("k" + i, i)).join(), "x,k" + i + ",y");
+        assert(Object.keys(computed("x", i)).join(), "x,y");
+        assert(computed("x", i).x, i);
+    }
+
+    /* the shape of an empty literal grows in many different ways */
+    const many = i => {
+        const o = {};
+        o["p" + (i % 4)] = i;
+        o.q = i;
+        return o;
+    };
+    for (let i = 0; i < 16; i++) {
+        const o = many(i);
+        assert(Object.keys(o).join(), "p" + (i % 4) + ",q");
+        assert(o.q, i);
+    }
+
+    /* literal in a function loaded from bytecode */
+    const src = ";(function f(a) { const o = { u: a, v: a + 1 }; o.w = a + 2; return o; })";
+    let obj = std.evalScript(src, { compile_only: true });
+    let buf = bjson.write(obj, bjson.WRITE_OBJ_BYTECODE);
+    obj = bjson.read(buf, 0, buf.byteLength, bjson.READ_OBJ_BYTECODE);
+    const f = std.evalScript(obj, { eval_function: true });
+    for (let i = 0; i < 8; i++) {
+        const o = f(i);
+        assert(Object.keys(o).join(), "u,v,w");
+        assert(o.u + o.v + o.w, 3 * i + 3);
+    }
+}
+
 function test_arrays()
 {
     const readpush = a => a.push;
@@ -610,6 +886,7 @@ test_prototype_chain();
 test_prototype_replacement();
 test_accessors();
 test_put_field();
+test_property_add();
 test_arrays();
 test_shape_aliasing();
 test_proxy();
@@ -620,3 +897,4 @@ test_class_instances();
 test_gc();
 test_bytecode_roundtrip();
 test_many_sites();
+test_object_literal();
