@@ -333,6 +333,61 @@ function test_array()
     assert(err && a.toString() === "1,2,3,4");
 }
 
+/* appending to the result arrays of the builtins */
+function test_array_append()
+{
+    var a, r;
+
+    a = [1, 2, 3].map(x => x * 2);
+    assert(a.join(), "2,4,6", "map");
+    r = Object.getOwnPropertyDescriptor(a, 1);
+    assert(r.writable && r.enumerable && r.configurable, true, "map");
+    a = [1, 2, 3, 4].filter(x => x & 1);
+    assert(a.join(), "1,3", "filter");
+    a = "a-b-c".split("-");
+    assert(a.join(), "a,b,c", "split");
+    a = Array.from({ length: 3 }, (_, i) => i);
+    assert(a.join(), "0,1,2", "from");
+    a = [1, , 3].map(x => x);
+    assert(1 in a, false, "holes");
+    assert(a.length, 3, "holes");
+
+    /* the result array is not extensible or its length is not writable */
+    class NonExtensible extends Array {
+        constructor() { super(); Object.preventExtensions(this); }
+    }
+    assertThrows(TypeError, () => NonExtensible.from([1]));
+    assertThrows(TypeError, () => NonExtensible.of(1));
+    assert(NonExtensible.from([]).length, 0);
+    class FixedLength extends Array {
+        constructor() { super(); Object.defineProperty(this, "length", { writable: false }); }
+    }
+    assertThrows(TypeError, () => FixedLength.from([1]));
+    assertThrows(TypeError, () => FixedLength.of(1));
+    class Sub extends Array {}
+    a = Sub.from([1, 2]);
+    assert(a instanceof Sub, true, "subclass");
+    assert(a.join(), "1,2", "subclass");
+    a = a.map(x => x + 1);
+    assert(a instanceof Sub, true, "subclass");
+    assert(a.join(), "2,3", "subclass");
+
+    /* the result array already has elements */
+    class Prefilled extends Array {
+        constructor() { super(); this[0] = "p"; }
+    }
+    a = Prefilled.of(1, 2);
+    assert(a.join(), "1,2", "prefilled");
+    class Big extends Array {
+        constructor() { super(); this.length = 10; }
+    }
+    a = Big.of(1, 2);
+    assert(a.length, 2, "big"); /* Array.of() sets the length */
+    a = a.map(x => x + 1);
+    assert(a.length, 10, "big"); /* map() does not */
+    assert(a[0] === 2 && a[1] === 3, true, "big");
+}
+
 function test_string()
 {
     var a;
@@ -1390,6 +1445,7 @@ test_function();
 test_function_properties();
 test_enum();
 test_array();
+test_array_append();
 test_string();
 test_rope();
 test_math();
