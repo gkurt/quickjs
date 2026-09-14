@@ -163,7 +163,7 @@ int qjs_init_argv(int argc, char **argv)
     }
 
     for (i = 0; i < include_count; i++) {
-        if (eval_file(reactor_ctx, include_list[i], 0))
+        if (eval_file(reactor_ctx, include_list[i], 0, 0))
             goto fail;
     }
 
@@ -172,7 +172,7 @@ int qjs_init_argv(int argc, char **argv)
                      module == 1 ? JS_EVAL_TYPE_MODULE : 0))
             goto fail;
     } else if (optind < argc) {
-        if (eval_file(reactor_ctx, argv[optind], module))
+        if (eval_file(reactor_ctx, argv[optind], module, 0))
             goto fail;
     }
 
