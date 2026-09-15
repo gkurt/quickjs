@@ -400,6 +400,121 @@ function test_array_append()
     assert(a[0] === 2 && a[1] === 3, true, "big");
 }
 
+function test_constructed_objects()
+{
+    var i, j, o, objs, n, keys;
+
+    /* the property array of an object built by a constructor gets the
+       size of the previous instance: objects of varying sizes, with
+       properties added, deleted and redefined, keep working */
+    function P(n) {
+        for (var i = 0; i < n; i++)
+            this["p" + i] = i;
+    }
+    objs = [];
+    for (i = 0; i < 40; i++) {
+        n = (i * 7) % 13;
+        o = new P(n);
+        assert(Object.keys(o).length, n, "P keys");
+        for (j = 0; j < n; j++)
+            assert(o["p" + j], j, "P value");
+        objs.push(o);
+    }
+    for (i = 0; i < 40; i++) {
+        o = objs[i];
+        n = (i * 7) % 13;
+        o.extra = i;
+        delete o.p0;
+        o.p0 = -1;
+        keys = Object.keys(o);
+        assert(keys.length, n ? n + 1 : 2, "P keys after delete");
+        assert(o.extra, i, "P extra");
+        assert(o.p0, -1, "P p0");
+    }
+
+    /* more properties than the size remembered (one byte) */
+    o = new P(300);
+    assert(Object.keys(o).length, 300, "P 300");
+    o = new P(3);
+    assert(Object.keys(o).join(), "p0,p1,p2", "P 3 after 300");
+    o = new P(0);
+    o.a = 1;
+    assert(JSON.stringify(o), '{"a":1}', "P 0");
+
+    /* derived classes: the object is created by the base constructor
+       for the derived new.target */
+    class Base { constructor() { this.b1 = 1; this.b2 = 2; } }
+    class Derived extends Base {
+        constructor(n) {
+            super();
+            for (var i = 0; i < n; i++)
+                this["d" + i] = i;
+        }
+    }
+    class Other extends Base { constructor() { super(); this.o = 1; } }
+    for (i = 0; i < 20; i++) {
+        o = new Derived(i % 6);
+        assert(Object.keys(o).length, 2 + (i % 6), "Derived keys");
+        assert(o.b1 + o.b2, 3, "Derived base");
+        o = new Base();
+        assert(Object.keys(o).join(), "b1,b2", "Base keys");
+        o = new Other();
+        assert(Object.keys(o).join(), "b1,b2,o", "Other keys");
+        assert(o instanceof Other && o instanceof Base, true, "Other proto");
+    }
+
+    /* a constructor returning another object, a new.target which is not
+       the constructor, bound and proxied constructors */
+    function Ret() { this.x = 1; return { y: 2 }; }
+    for (i = 0; i < 5; i++) {
+        o = new Ret();
+        assert(JSON.stringify(o), '{"y":2}', "Ret");
+        o = Reflect.construct(P, [4], Ret);
+        assert(Object.getPrototypeOf(o), Ret.prototype, "construct proto");
+        assert(Object.keys(o).length, 4, "construct keys");
+        o = new (P.bind(null, 5))();
+        assert(Object.keys(o).length, 5, "bound");
+        o = new (new Proxy(P, {}))(6);
+        assert(Object.keys(o).length, 6, "proxy");
+        o = Reflect.construct(P, [2], new Proxy(Derived, {}));
+        assert(Object.getPrototypeOf(o), Derived.prototype, "proxy new.target");
+    }
+
+    /* built-in constructors subclassed with extra properties */
+    class MyMap extends Map {
+        constructor() { super(); this.a = 1; this.b = 2; this.c = 3; }
+    }
+    for (i = 0; i < 5; i++) {
+        o = new MyMap();
+        o.set(1, 2);
+        assert(o.get(1), 2, "MyMap get");
+        assert(Object.keys(o).join(), "a,b,c", "MyMap keys");
+    }
+    class MyArray extends Array {
+        constructor() { super(); this.tag = "t"; }
+    }
+    for (i = 0; i < 5; i++) {
+        o = new MyArray();
+        o.push(1, 2, 3);
+        assert(o.length, 3, "MyArray length");
+        assert(o.tag, "t", "MyArray tag");
+        assert(Object.keys(o).join(), "0,1,2,tag", "MyArray keys");
+    }
+
+    /* the shape of the instances is shared and the order of the
+       properties preserved */
+    function Q() { this.a = 1; this.b = 2; this.c = 3; this.d = 4; this.e = 5; }
+    objs = [];
+    for (i = 0; i < 10; i++)
+        objs.push(new Q());
+    for (i = 0; i < 10; i++) {
+        assert(Object.keys(objs[i]).join(), "a,b,c,d,e", "Q keys");
+        objs[i].f = i;
+        assert(Object.keys(objs[i]).join(), "a,b,c,d,e,f", "Q keys f");
+    }
+    objs = null;
+}
+
 function test_string()
 {
     var a;
@@ -1503,6 +1618,7 @@ test_function_properties();
 test_enum();
 test_array();
 test_array_append();
+test_constructed_objects();
 test_string();
 test_one_char_string();
 test_rope();

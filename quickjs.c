@@ -907,6 +907,9 @@ typedef struct JSFunctionBytecode {
     uint8_t arguments_allowed : 1;
     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
     /* XXX: 5 bits available */
+    /* size of the property array of the last object built by 'new' on
+       this function, allocated in advance for the next one */
+    uint8_t ctor_prop_size;
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -1178,6 +1181,7 @@ struct JSObject {
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
     uint16_t class_id; /* see JS_CLASS_x */
+    uint32_t prop_size; /* allocated properties, at least shape->prop_size */
     /* byte offsets: 16/24 */
     JSShape *shape; /* prototype and property names + flag */
     JSProperty *prop; /* array of properties */
@@ -5949,12 +5953,13 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     new_size = max_int(count, sh->prop_size * 3 / 2);
     /* Reallocate prop array first to avoid crash or size inconsistency
        in case of memory allocation failure */
-    if (p) {
+    if (p && new_size > p->prop_size) {
         JSProperty *new_prop;
         new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
         if (unlikely(!new_prop))
             return -1;
         p->prop = new_prop;
+        p->prop_size = new_size;
     }
     new_hash_size = sh->prop_hash_mask + 1;
     while (new_hash_size < new_size)
@@ -6080,8 +6085,10 @@ static int compact_properties(JSContext *ctx, JSObject *p)
 
     /* reduce the size of the object properties */
     new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
-    if (new_prop)
+    if (new_prop) {
         p->prop = new_prop;
+        p->prop_size = new_size;
+    }
     return 0;
 }
 
@@ -6227,8 +6234,11 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
 
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
-static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
-                                     JSProperty *props)
+/* 'prop_size' is the number of properties to allocate, at least
+   sh->prop_size */
+static JSValue JS_NewObjectFromShape2(JSContext *ctx, JSShape *sh,
+                                      JSClassID class_id, JSProperty *props,
+                                      uint32_t prop_size)
 {
     JSObject *p;
     int i;
@@ -6250,7 +6260,8 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->first_weak_ref = NULL;
     p->u.opaque = NULL;
     p->shape = sh;
-    p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
+    p->prop_size = prop_size;
+    p->prop = js_malloc(ctx, sizeof(JSProperty) * prop_size);
     if (unlikely(!p->prop)) {
         js_free(ctx, p);
     fail:
@@ -6346,9 +6357,16 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     return JS_MKPTR(JS_TAG_OBJECT, p);
 }
 
-/* WARNING: proto must be an object or JS_NULL */
-JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
-                               JSClassID class_id)
+static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
+                                     JSProperty *props)
+{
+    return JS_NewObjectFromShape2(ctx, sh, class_id, props, sh->prop_size);
+}
+
+/* 'prop_size' is the number of properties to allocate in advance,
+   for an object which is expected to get them (see js_create_from_ctor()) */
+static JSValue js_new_object_proto_class(JSContext *ctx, JSValueConst proto_val,
+                                         JSClassID class_id, uint32_t prop_size)
 {
     JSShape *sh;
     JSObject *proto;
@@ -6362,7 +6380,15 @@ JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
         if (!sh)
             return JS_EXCEPTION;
     }
-    return JS_NewObjectFromShape(ctx, sh, class_id, NULL);
+    return JS_NewObjectFromShape2(ctx, sh, class_id, NULL,
+                                  max_uint32(prop_size, sh->prop_size));
+}
+
+/* WARNING: proto must be an object or JS_NULL */
+JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
+                               JSClassID class_id)
+{
+    return js_new_object_proto_class(ctx, proto_val, class_id, 0);
 }
 
 /* WARNING: the shape is not hashed. It is used for objects where
@@ -7772,7 +7798,7 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         s->obj_count++;
         if (p->prop) {
             s->memory_used_count++;
-            s->prop_size += sh->prop_size * sizeof(*p->prop);
+            s->prop_size += p->prop_size * sizeof(*p->prop);
             s->prop_count += sh->prop_count;
             prs = get_shape_prop(sh);
             for(i = 0; i < sh->prop_count; i++) {
@@ -9315,10 +9341,10 @@ static void js_shape_rehash(JSRuntime *rt, JSObject *p)
     }
     for(sh1 = rt->shape_hash[get_shape_hash(h, rt->shape_hash_bits)];
         sh1 != NULL; sh1 = sh1->shape_hash_next) {
-        /* p->prop has room for sh->prop_size properties: the adopted
+        /* p->prop has room for p->prop_size properties: the adopted
            shape must not need more */
         if (sh1->hash != h || sh1->proto != sh->proto ||
-            sh1->prop_count != n || sh1->prop_size > sh->prop_size)
+            sh1->prop_count != n || sh1->prop_size > p->prop_size)
             continue;
         pr1 = get_shape_prop(sh1);
         for(i = 0; i < n; i++) {
@@ -9648,13 +9674,14 @@ static force_inline int js_ic_add(JSContext *ctx, JSInlineCache *ic,
         if (p1->shape != ic->e[0].shapes[i])
             return 1;
     }
-    if (new_sh->prop_size != sh->prop_size) {
+    if (new_sh->prop_size > p->prop_size) {
         JSProperty *new_prop;
         new_prop = js_realloc(ctx, p->prop,
                               sizeof(p->prop[0]) * new_sh->prop_size);
         if (unlikely(!new_prop))
             return -1;
         p->prop = new_prop;
+        p->prop_size = new_sh->prop_size;
     }
     p->shape = js_dup_shape(new_sh);
     js_free_shape(ctx->rt, sh);
@@ -10725,13 +10752,14 @@ static JSProperty *add_property(JSContext *ctx,
         if (new_sh) {
             /* matching shape found: use it */
             /*  the property array may need to be resized */
-            if (new_sh->prop_size != sh->prop_size) {
+            if (new_sh->prop_size > p->prop_size) {
                 JSProperty *new_prop;
                 new_prop = js_realloc(ctx, p->prop, sizeof(p->prop[0]) *
                                       new_sh->prop_size);
                 if (!new_prop)
                     return NULL;
                 p->prop = new_prop;
+                p->prop_size = new_sh->prop_size;
             }
             p->shape = js_dup_shape(new_sh);
             js_free_shape(ctx->rt, sh);
@@ -21783,6 +21811,26 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     return realm;
 }
 
+/* size of the property array of the last object built with 'new' on
+   the constructor 'ctor' (see JS_CallConstructorInternal()), 0 if
+   unknown */
+static uint32_t js_ctor_prop_size(JSValueConst ctor)
+{
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(ctor) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(ctor);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    return p->u.func.function_bytecode->ctor_prop_size;
+}
+
+/* create the object of a 'new' expression, or of a built-in
+   constructor, with the prototype of 'ctor' (the new.target). Its
+   property array gets the size of the last object built with 'ctor'
+   at once, instead of growing with each property the constructor
+   adds */
 static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
                                    int class_id)
 {
@@ -21803,7 +21851,8 @@ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
             proto = js_dup(realm->class_proto[class_id]);
         }
     }
-    obj = JS_NewObjectProtoClass(ctx, proto, class_id);
+    obj = js_new_object_proto_class(ctx, proto, class_id,
+                                    js_ctor_prop_size(ctor));
     JS_FreeValue(ctx, proto);
     return obj;
 }
@@ -21817,6 +21866,7 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
 {
     JSObject *p;
     JSFunctionBytecode *b;
+    JSValue ret;
 
     if (js_poll_interrupts(ctx))
         return JS_EXCEPTION;
@@ -21839,9 +21889,9 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
 
     b = p->u.func.function_bytecode;
     if (b->is_derived_class_constructor) {
-        return JS_CallInternal(ctx, func_obj, JS_UNDEFINED, new_target, argc, argv, flags);
+        ret = JS_CallInternal(ctx, func_obj, JS_UNDEFINED, new_target, argc, argv, flags);
     } else {
-        JSValue obj, ret;
+        JSValue obj;
         /* legacy constructor behavior */
         obj = js_create_from_ctor(ctx, new_target, JS_CLASS_OBJECT);
         if (JS_IsException(obj))
@@ -21850,12 +21900,22 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
         if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT ||
             JS_IsException(ret)) {
             JS_FreeValue(ctx, obj);
-            return ret;
         } else {
             JS_FreeValue(ctx, ret);
-            return obj;
+            ret = obj;
         }
     }
+    /* remember the size of the property array of the object for the
+       next 'new' on this constructor (see js_create_from_ctor()). The
+       property array of the object of a derived class is allocated by
+       the base constructor from the new.target, hence the check */
+    if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_TAG(new_target) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(new_target) == p) {
+        b->ctor_prop_size = min_uint32(JS_VALUE_GET_OBJ(ret)->shape->prop_size,
+                                       UINT8_MAX);
+    }
+    return ret;
 }
 
 JSValue JS_CallConstructor2(JSContext *ctx, JSValueConst func_obj,
