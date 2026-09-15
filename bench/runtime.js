@@ -5,8 +5,14 @@
 //   --json FILE     also write the results to FILE as JSON (see compare.js)
 //   --rounds N      rounds per benchmark, the best one counts (default 5)
 //   --min-ms N      minimum duration of one round in milliseconds (default 100)
+//   --iterations N  do not time anything: warm up and run each selected
+//                   benchmark once with exactly N iterations (N may be 0),
+//                   for use under an instruction counter (see instructions.js)
+//   --warmup N      iterations of the warm up before measuring (default 1000)
 //   --list          print the benchmark names and exit
-//   filter          only run benchmarks whose name contains one of the filters
+//   filter          only run benchmarks whose name contains one of the
+//                   filters, whose group is a filter, or whose group/name is
+//                   a filter (exact match)
 //
 // Every benchmark is a function that performs `n` iterations of one
 // operation. The iteration count is calibrated so that a round takes at
@@ -390,7 +396,7 @@ bench("regexp", "replace_global", n => {
 // ---------------------------------------------------------------------------
 
 function parse_args(args) {
-    const opts = { json: null, rounds: 5, min_ms: 100, list: false, filters: [] };
+    const opts = { json: null, rounds: 5, min_ms: 100, iterations: null, warmup: 1000, list: false, filters: [] };
     for (let i = 0; i < args.length; i++) {
         const a = args[i];
         if (a === "--json")
@@ -399,10 +405,14 @@ function parse_args(args) {
             opts.rounds = +args[++i];
         else if (a === "--min-ms")
             opts.min_ms = +args[++i];
+        else if (a === "--iterations")
+            opts.iterations = +args[++i];
+        else if (a === "--warmup")
+            opts.warmup = +args[++i];
         else if (a === "--list")
             opts.list = true;
         else if (a === "--help" || a === "-h") {
-            print("usage: qjs bench/runtime.js [--json FILE] [--rounds N] [--min-ms N] [--list] [filter ...]");
+            print("usage: qjs bench/runtime.js [--json FILE] [--rounds N] [--min-ms N] [--iterations N] [--warmup N] [--list] [filter ...]");
             std.exit(0);
         } else if (a.startsWith("-")) {
             print("unknown option: " + a);
@@ -412,6 +422,11 @@ function parse_args(args) {
     }
     if (!(opts.rounds >= 1) || !(opts.min_ms > 0)) {
         print("invalid --rounds or --min-ms");
+        std.exit(1);
+    }
+    if ((opts.iterations !== null && !(opts.iterations >= 0 && Number.isInteger(opts.iterations))) ||
+        !(opts.warmup >= 0 && Number.isInteger(opts.warmup))) {
+        print("invalid --iterations or --warmup");
         std.exit(1);
     }
     return opts;
@@ -437,7 +452,7 @@ function calibrate(fn, min_ms) {
 }
 
 function run(b, opts) {
-    b.fn(1000); // warm up: shapes, inline caches, allocator
+    b.fn(opts.warmup); // warm up: shapes, inline caches, allocator
     const n = calibrate(b.fn, opts.min_ms);
     let best = Infinity;
     for (let r = 0; r < opts.rounds; r++)
@@ -457,7 +472,7 @@ function main() {
     const opts = parse_args(scriptArgs.slice(1));
     let selected = benchmarks;
     if (opts.filters.length > 0)
-        selected = benchmarks.filter(b => opts.filters.some(f => b.name.includes(f) || b.group === f));
+        selected = benchmarks.filter(b => opts.filters.some(f => f === b.group + "/" + b.name || b.name.includes(f) || b.group === f));
     if (opts.list) {
         for (const b of selected)
             print(b.group.padEnd(12), b.name);
@@ -466,6 +481,18 @@ function main() {
     if (selected.length === 0) {
         print("no benchmark matches the filter");
         return 1;
+    }
+
+    if (opts.iterations !== null) {
+        // Fixed amount of work, nothing timed: the caller counts the
+        // instructions of the whole process and subtracts those of a run
+        // with 0 iterations, which does the same setup and warm up.
+        for (const b of selected) {
+            b.fn(opts.warmup);
+            if (opts.iterations > 0)
+                b.fn(opts.iterations);
+        }
+        return 0;
     }
 
     const results = {};
