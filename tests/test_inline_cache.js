@@ -796,6 +796,122 @@ function test_two_shapes()
     }
 }
 
+function test_primitive_receiver()
+{
+    /* a method call on a string, a number... looks the property up
+       through the prototype of the primitive and caches it there */
+    const code = s => s.charCodeAt(0);
+    assert(warm(() => code("a")), 97);
+    const orig = String.prototype.charCodeAt;
+    String.prototype.charCodeAt = function(i) { return -orig.call(this, i); };
+    assert(code("a"), -97);
+    String.prototype.charCodeAt = orig;
+    assert(code("b"), 98);
+    delete String.prototype.charCodeAt;
+    assertThrows(TypeError, () => code("a"));
+    String.prototype.charCodeAt = orig;
+    assert(code("c"), 99);
+
+    /* string kinds: a rope from a concatenation, a slice, a wide string */
+    let rope = "";
+    for (let i = 0; i < 200; i++)
+        rope += "xy";
+    assert(code(rope), 120);
+    assert(code(rope.slice(1, 100)), 121);
+    assert(code("\u{1F600}z"), 0xd83d);
+    assert(code(String(12)), 49);
+
+    /* the property is found further up the chain, then shadowed */
+    const own = s => s.hasOwnProperty("length");
+    assert(warm(() => own("abc")), true);
+    String.prototype.hasOwnProperty = () => "shadow";
+    assert(own("abc"), "shadow");
+    delete String.prototype.hasOwnProperty;
+    assert(own("abc"), true);
+    Object.prototype.extra = function() { return this + "!"; };
+    const extra = s => s.extra();
+    assert(warm(() => extra("hi")), "hi!");
+    delete Object.prototype.extra;
+    assertThrows(TypeError, () => extra("hi"));
+
+    /* an accessor on the prototype is not cached */
+    Object.defineProperty(String.prototype, "acc", {
+        get() { return () => this.length; }, configurable: true });
+    const acc = s => s.acc();
+    for (let i = 0; i < 8; i++)
+        assert(acc("four"), 4);
+    delete String.prototype.acc;
+    assertThrows(TypeError, () => acc("four"));
+
+    /* the own properties of the string are never read through the
+       prototype, even with a shadowing method on it */
+    const len = s => s.length();
+    const idx = s => s[0]();
+    for (let i = 0; i < 4; i++) {
+        assertThrows(TypeError, () => len("abc"));
+        assertThrows(TypeError, () => idx("abc"));
+    }
+    String.prototype[0] = () => "proto0";
+    assertThrows(TypeError, () => idx("abc"));
+    assert(idx(""), "proto0");
+    delete String.prototype[0];
+    assertThrows(TypeError, () => idx(""));
+
+    /* numbers, booleans, symbols and bigints */
+    const fixed = n => n.toFixed(1);
+    const orig_fixed = Number.prototype.toFixed;
+    assert(warm(() => fixed(1.25)), "1.3");
+    assert(fixed(2), "2.0");
+    Number.prototype.toFixed = function() { return "n" + this; };
+    assert(fixed(3), "n3");
+    delete Number.prototype.toFixed;
+    assertThrows(TypeError, () => fixed(3));
+    Number.prototype.toFixed = orig_fixed;
+    assert(fixed(4), "4.0");
+    const str = v => v.toString();
+    assert(warm(() => str(true)), "true");
+    assert(str(false), "false");
+    assert(str(10n), "10");
+    assert(str(Symbol("s")), "Symbol(s)");
+    assert(str(1.5), "1.5");
+    assert(str("s"), "s");
+    assert(str({}), "[object Object]");
+    const orig_bool = Boolean.prototype.toString;
+    Boolean.prototype.toString = () => "bool";
+    assert(str(true), "bool");
+    delete Boolean.prototype.toString;
+    assert(str(true), "[object Boolean]");
+    Boolean.prototype.toString = orig_bool;
+    assert(str(true), "true");
+
+    /* the same site sees objects and primitives */
+    const mixed = v => v.valueOf();
+    const o = { valueOf() { return "o"; } };
+    for (let i = 0; i < 8; i++) {
+        assert(mixed(o), "o");
+        assert(mixed(5), 5);
+        assert(mixed("s"), "s");
+    }
+    o.valueOf = () => "o2";
+    assert(mixed(o), "o2");
+    assert(mixed(5), 5);
+
+    /* null and undefined receivers */
+    assertThrows(TypeError, () => str(null));
+    assertThrows(TypeError, () => str(undefined));
+    assertThrows(TypeError, () => code(null));
+
+    /* the prototype chain of a primitive can be changed */
+    const string_proto_proto = Object.getPrototypeOf(String.prototype);
+    Object.setPrototypeOf(String.prototype, { hasOwnProperty() { return "other"; } });
+    assert(own("abc"), "other");
+    Object.setPrototypeOf(String.prototype, null);
+    assertThrows(TypeError, () => own("abc"));
+    Object.setPrototypeOf(String.prototype, string_proto_proto);
+    assert(own("abc"), true);
+    assert(code("d"), 100);
+}
+
 function test_local_receiver()
 {
     /* reads of a local variable's property fuse into one instruction:
@@ -1025,6 +1141,7 @@ test_shape_aliasing();
 test_proxy();
 test_polymorphic();
 test_two_shapes();
+test_primitive_receiver();
 test_local_receiver();
 test_dictionary_mode();
 test_class_instances();

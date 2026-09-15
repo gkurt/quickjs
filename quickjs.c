@@ -9427,15 +9427,31 @@ static force_inline JSObject *js_ic_holder(const JSICEntry *e, JSObject *p)
     return p;
 }
 
+/* same for the prototype 'p' of a primitive value, whose exotic
+   behavior does not apply to the properties looked up through it */
+static force_inline JSObject *js_ic_holder_proto(const JSICEntry *e, JSObject *p)
+{
+    int i;
+
+    if (p->shape != e->shapes[0])
+        return NULL;
+    for(i = 1; i <= e->depth; i++) {
+        p = p->shape->proto;
+        if (p->shape != e->shapes[i])
+            return NULL;
+    }
+    return p;
+}
+
 /* Read the property 'atom' of the object 'p' on a cache miss and
-   refill the cache. Return the value (JS_UNDEFINED when the property
-   does not exist), or JS_UNINITIALIZED, which is never the value of a
-   property, if the generic JS_GetPropertyInternal() must be used
-   (accessor, exotic object...). The value is returned rather than
-   stored through a pointer so that the interpreter keeps it in
-   registers */
-static no_inline JSValue js_ic_get(JSContext *ctx, JSInlineCache *ic,
-                                   JSObject *p, JSAtom atom)
+   refill the cache if 'fill' is set. Return the value (JS_UNDEFINED
+   when the property does not exist), or JS_UNINITIALIZED, which is
+   never the value of a property, if the generic
+   JS_GetPropertyInternal() must be used (accessor, exotic object...).
+   The value is returned rather than stored through a pointer so that
+   the interpreter keeps it in registers */
+static inline JSValue js_ic_get1(JSContext *ctx, JSInlineCache *ic,
+                                 JSObject *p, JSAtom atom, bool fill)
 {
     JSObject *p1 = p;
     JSShapeProperty *prs;
@@ -9447,13 +9463,16 @@ static no_inline JSValue js_ic_get(JSContext *ctx, JSInlineCache *ic,
         if (prs) {
             if (unlikely(prs->flags & JS_PROP_TMASK))
                 return JS_UNINITIALIZED;
-            if (js_ic_receiver_ok(p))
+            if (fill)
                 js_ic_fill(ctx->rt, ic, p, depth, prs - get_shape_prop(p1->shape));
             return js_dup(pr->u.value);
         }
         if (unlikely(p1->is_exotic)) {
-            /* only the integer indexed properties of arrays are exotic */
-            if (p1->class_id != JS_CLASS_ARRAY || __JS_AtomIsTaggedInt(atom))
+            /* only the integer indexed properties of arrays and
+               strings are exotic */
+            if ((p1->class_id != JS_CLASS_ARRAY &&
+                 p1->class_id != JS_CLASS_STRING) ||
+                __JS_AtomIsTaggedInt(atom))
                 return JS_UNINITIALIZED;
         }
         p1 = p1->shape->proto;
@@ -9461,6 +9480,74 @@ static no_inline JSValue js_ic_get(JSContext *ctx, JSInlineCache *ic,
             return JS_UNDEFINED;
         depth++;
     }
+}
+
+/* js_ic_get1() for an object: the entry is filled if the receiver can
+   be cached */
+static no_inline JSValue js_ic_get(JSContext *ctx, JSInlineCache *ic,
+                                   JSObject *p, JSAtom atom)
+{
+    return js_ic_get1(ctx, ic, p, atom, js_ic_receiver_ok(p));
+}
+
+static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
+                                      JSAtom prop, JSValueConst this_obj,
+                                      bool throw_ref_error);
+
+/* Read the property 'atom' of a primitive value (OP_get_field2 on a
+   string, a number...) with the inline cache of the site, through the
+   prototype of the primitive. The generic JS_GetPropertyInternal() is
+   used when the cache does not apply: the receiver is null or
+   undefined, the property is a character or the length of a string,
+   an accessor... The function does the whole job so that the handler
+   keeps nothing alive across the call. */
+static no_inline JSValue js_ic_get_primitive(JSContext *ctx, JSInlineCache *ic,
+                                             JSValueConst val, JSAtom atom)
+{
+    JSObject *proto, *p;
+    JSValue ret;
+    int i;
+
+    switch(JS_VALUE_GET_NORM_TAG(val)) {
+    case JS_TAG_STRING:
+    case JS_TAG_STRING_ROPE:
+        /* own properties of the string itself */
+        if (atom == JS_ATOM_length || __JS_AtomIsTaggedInt(atom))
+            goto generic;
+        proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_STRING]);
+        break;
+    case JS_TAG_INT:
+    case JS_TAG_FLOAT64:
+        proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_NUMBER]);
+        break;
+    case JS_TAG_BOOL:
+        proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_BOOLEAN]);
+        break;
+    case JS_TAG_SYMBOL:
+        proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_SYMBOL]);
+        break;
+    case JS_TAG_SHORT_BIG_INT:
+    case JS_TAG_BIG_INT:
+        proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_BIG_INT]);
+        break;
+    default:
+        goto generic;
+    }
+    /* no prototype in a context without the intrinsic objects */
+    if (unlikely(!proto))
+        goto generic;
+    for(i = 0; i < JS_IC_WAYS; i++) {
+        p = js_ic_holder_proto(&ic->e[i], proto);
+        if (p)
+            return js_dup(p->prop[ic->e[i].prop_idx].u.value);
+    }
+    /* the prototype is exotic for strings, which does not matter for
+       the properties which reach it: cache it as the receiver */
+    ret = js_ic_get1(ctx, ic, proto, atom, true);
+    if (!JS_IsUninitialized(ret))
+        return ret;
+ generic:
+    return JS_GetPropertyInternal(ctx, val, atom, val, false);
 }
 
 /* Write the own writable data property 'atom' of 'p' on a cache miss
@@ -18821,6 +18908,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             break;
                         }
                     }
+                } else if (JS_VALUE_GET_TAG(obj) == JS_TAG_STRING) {
+                    /* stored apart from the object path so that the
+                       compiler does not merge the two values */
+                    uint32_t len = JS_VALUE_GET_STRING(obj)->len;
+                    JS_FreeValue(ctx, obj);
+                    sp[-1] = js_int32(len);
+                    BREAK;
                 } else {
                 get_length_slow_path:
                     sf->cur_pc = pc;
@@ -20177,13 +20271,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         val = js_dup(p->prop[ic->e[1].prop_idx].u.value);
                     } else {
                         val = js_ic_get(ctx, ic, JS_VALUE_GET_OBJ(obj), atom);
-                        if (JS_IsUninitialized(val))
-                            goto get_field2_slow_path;
+                        if (JS_IsUninitialized(val)) {
+                            sf->cur_pc = pc;
+                            val = JS_GetPropertyInternal(ctx, obj, atom, obj, false);
+                            if (unlikely(JS_IsException(val)))
+                                goto exception;
+                        }
                     }
                 } else {
-                get_field2_slow_path:
+                    /* method of a string, a number...: cached through
+                       the prototype of the primitive */
                     sf->cur_pc = pc;
-                    val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], false);
+                    val = js_ic_get_primitive(ctx, ic, sp[-1], atom);
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                 }
