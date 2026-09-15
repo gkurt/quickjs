@@ -1944,6 +1944,17 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
                      &rt->arena_state.free_arena_list[block_size_idx]);
         ar->n_used_blocks--;
         if (unlikely(ar->n_used_blocks == 0)) {
+            struct list_head *head =
+                &rt->arena_state.free_arena_list[block_size_idx];
+            /* Keep the arena while it is the only one of its size class
+               with a free block: the next allocation would otherwise
+               create a new arena again, and a loop that allocates one
+               object and frees the previous one pays for a new arena on
+               every iteration when it happens to start on an arena
+               boundary (twice the instructions of the loop). At most one
+               empty arena per size class is kept this way. */
+            if (head->next == &ar->free_link && head->prev == &ar->free_link)
+                return;
             list_del(&ar->link);
             list_del(&ar->free_link);
             rt->mf.js_free(rt->malloc_state.opaque, ar);
