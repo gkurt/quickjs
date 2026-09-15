@@ -480,6 +480,36 @@ function test_constructed_objects()
         assert(Object.getPrototypeOf(o), Derived.prototype, "proxy new.target");
     }
 
+    /* the prototype of the constructor is read from its property
+       slot: reassignments, non object values, a prototype not yet
+       created, a function without one */
+    function G() { this.g = 1; }
+    var p1 = { tag: 1 }, p2 = { tag: 2 };
+    for (i = 0; i < 4; i++) {
+        function F() { this.f = i; }
+        o = new F();
+        assert(Object.getPrototypeOf(o), F.prototype, "F proto");
+        assert(Object.getPrototypeOf(new F()), F.prototype, "F proto again");
+        F.prototype = p1;
+        assert(Object.getPrototypeOf(new F()).tag, 1, "F proto p1");
+        F.prototype = p2;
+        assert(Object.getPrototypeOf(new F()).tag, 2, "F proto p2");
+        F.prototype = 42;
+        assert(Object.getPrototypeOf(new F()), Object.prototype, "F proto number");
+        F.prototype = null;
+        assert(Object.getPrototypeOf(new F()), Object.prototype, "F proto null");
+        Object.defineProperty(F, "prototype", { value: p1 });
+        assert(Object.getPrototypeOf(new F()).tag, 1, "F proto defined");
+        assert(Object.getPrototypeOf(new G()), G.prototype, "G proto");
+        G.prototype = i & 1 ? p1 : p2;
+        assert(Object.getPrototypeOf(new G()).tag, i & 1 ? 1 : 2, "G proto swapped");
+        o = Reflect.construct(G, [], (function() {}).bind());
+        assert(Object.getPrototypeOf(o), Object.prototype, "bound new.target");
+        var M = function() { this.m = 1; };
+        assert(Object.getPrototypeOf(Reflect.construct(G, [], M)), M.prototype,
+               "new.target with a lazy prototype");
+    }
+
     /* built-in constructors subclassed with extra properties */
     class MyMap extends Map {
         constructor() { super(); this.a = 1; this.b = 2; this.c = 3; }

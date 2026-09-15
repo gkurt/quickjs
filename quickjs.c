@@ -21811,35 +21811,43 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     return realm;
 }
 
-/* size of the property array of the last object built with 'new' on
-   the constructor 'ctor' (see JS_CallConstructorInternal()), 0 if
-   unknown */
-static uint32_t js_ctor_prop_size(JSValueConst ctor)
-{
-    JSObject *p;
-
-    if (JS_VALUE_GET_TAG(ctor) != JS_TAG_OBJECT)
-        return 0;
-    p = JS_VALUE_GET_OBJ(ctor);
-    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
-        return 0;
-    return p->u.func.function_bytecode->ctor_prop_size;
-}
-
 /* create the object of a 'new' expression, or of a built-in
    constructor, with the prototype of 'ctor' (the new.target). Its
    property array gets the size of the last object built with 'ctor'
-   at once, instead of growing with each property the constructor
-   adds */
+   (see JS_CallConstructorInternal()) at once, instead of growing with
+   each property the constructor adds */
 static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
                                    int class_id)
 {
     JSValue proto, obj;
     JSContext *realm;
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    uint32_t prop_size;
 
+    prop_size = 0;
     if (JS_IsUndefined(ctor)) {
         proto = js_dup(ctx->class_proto[class_id]);
     } else {
+        if (JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT) {
+            p = JS_VALUE_GET_OBJ(ctor);
+            if (p->class_id == JS_CLASS_BYTECODE_FUNCTION)
+                prop_size = p->u.func.function_bytecode->ctor_prop_size;
+            /* 'prototype' is usually an own data property of the
+               constructor (of a function once its prototype object
+               exists, of a class, of a built-in constructor): read it
+               from its slot rather than through the generic lookup.
+               The constructor keeps the prototype alive */
+            if (likely(!p->is_exotic)) {
+                prs = find_own_property(&pr, p, JS_ATOM_prototype);
+                if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL &&
+                    JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT) {
+                    return js_new_object_proto_class(ctx, pr->u.value,
+                                                     class_id, prop_size);
+                }
+            }
+        }
         proto = JS_GetProperty(ctx, ctor, JS_ATOM_prototype);
         if (JS_IsException(proto))
             return proto;
@@ -21851,8 +21859,7 @@ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
             proto = js_dup(realm->class_proto[class_id]);
         }
     }
-    obj = js_new_object_proto_class(ctx, proto, class_id,
-                                    js_ctor_prop_size(ctor));
+    obj = js_new_object_proto_class(ctx, proto, class_id, prop_size);
     JS_FreeValue(ctx, proto);
     return obj;
 }
@@ -21865,7 +21872,7 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           int flags)
 {
     JSObject *p;
-    JSFunctionBytecode *b;
+    JSFunctionBytecode *b, *hint;
     JSValue ret;
 
     if (js_poll_interrupts(ctx))
@@ -21888,8 +21895,23 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
     }
 
     b = p->u.func.function_bytecode;
+    /* the size of the property array of the object is remembered for
+       the next 'new' on this constructor (see js_create_from_ctor())
+       when the function is the new.target: the object of a derived
+       class is created by the base constructor from the new.target and
+       reaches its final size in the frame of the derived class. Only
+       'hint' is kept alive across the call */
+    if (JS_VALUE_GET_TAG(new_target) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(new_target) == p)
+        hint = b;
+    else
+        hint = NULL;
     if (b->is_derived_class_constructor) {
         ret = JS_CallInternal(ctx, func_obj, JS_UNDEFINED, new_target, argc, argv, flags);
+        if (hint && JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT) {
+            hint->ctor_prop_size =
+                min_uint32(JS_VALUE_GET_OBJ(ret)->shape->prop_size, UINT8_MAX);
+        }
     } else {
         JSValue obj;
         /* legacy constructor behavior */
@@ -21903,17 +21925,11 @@ static JSValue JS_CallConstructorInternal(JSContext *ctx,
         } else {
             JS_FreeValue(ctx, ret);
             ret = obj;
+            if (hint) {
+                hint->ctor_prop_size =
+                    min_uint32(JS_VALUE_GET_OBJ(obj)->shape->prop_size, UINT8_MAX);
+            }
         }
-    }
-    /* remember the size of the property array of the object for the
-       next 'new' on this constructor (see js_create_from_ctor()). The
-       property array of the object of a derived class is allocated by
-       the base constructor from the new.target, hence the check */
-    if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT &&
-        JS_VALUE_GET_TAG(new_target) == JS_TAG_OBJECT &&
-        JS_VALUE_GET_OBJ(new_target) == p) {
-        b->ctor_prop_size = min_uint32(JS_VALUE_GET_OBJ(ret)->shape->prop_size,
-                                       UINT8_MAX);
     }
     return ret;
 }
