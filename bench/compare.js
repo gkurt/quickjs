@@ -211,6 +211,7 @@ function main() {
             rows.push({ name, group: b.group, status: "removed", base: b });
     }
     const counts = instr.count > 0;
+    const times = time.count > 0 || !counts; // hide the time columns when only counts were given
 
     // regressions first, then improvements, then the rest; the instruction
     // count decides when available since it is deterministic, the time
@@ -229,20 +230,23 @@ function main() {
     });
 
     const marker = { slower: "🔴", faster: "🟢", same: "" };
-    const summary = time.summary() + (counts ? "; " + instr.summary() : "");
+    const summary = [times ? time.summary() : null, counts ? instr.summary() : null].filter(x => x).join("; ");
 
     if (opts.markdown) {
         const runs = s => plural(s.runs, "run");
         print(`**Runtime benchmarks:** ${summary}`);
         print("");
-        print(`Times are nanoseconds per operation, best of ${runs(base)} (base) and ${runs(head)} (head)` +
-              (counts ? "; instructions are per operation, counted with cachegrind, and do not depend on the load of the runner" : "") +
-              "; lower is better.");
+        print([times ? `Times are nanoseconds per operation, best of ${runs(base)} (base) and ${runs(head)} (head)` : null,
+               counts ? "instructions are per operation, counted with cachegrind, and do not depend on the load of the runner" : null]
+              .filter(x => x).join("; ") + "; lower is better.");
         print("");
         const cell = (m, fmt) => m ? `${fmt(m.base)} | ${fmt(m.head)} | ${format_change(m.change)} ${marker[m.status]}` : " | | ";
-        if (counts) {
+        if (times && counts) {
             print("| Benchmark | Base ns | Head ns | Time | Base instr | Head instr | Instructions |");
             print("|---|---:|---:|---:|---:|---:|---:|");
+        } else if (counts) {
+            print("| Benchmark | Base instr | Head instr | Change |");
+            print("|---|---:|---:|---:|");
         } else {
             print("| Benchmark | Base | Head | Change |");
             print("|---|---:|---:|---:|");
@@ -256,14 +260,20 @@ function main() {
                 const i = v.instructions_per_op === null ? "" : format_count(v.instructions_per_op);
                 const side = v => r.status === "new" ? ` | ${v}` : `${v} | `;
                 const status = r.status + (r.status === "new" ? " 🆕" : " ⚪");
-                print(`| ${name} | ${side(t)} | ${status} |` + (counts ? ` ${side(i)} | |` : ""));
+                if (times && counts)
+                    print(`| ${name} | ${side(t)} | ${status} | ${side(i)} | |`);
+                else
+                    print(`| ${name} | ${side(counts ? i : t)} | ${status} |`);
                 continue;
             }
-            print(`| ${name} | ${cell(r.time, format_ns)} |` + (counts ? ` ${cell(r.instr, format_count)} |` : ""));
+            if (times && counts)
+                print(`| ${name} | ${cell(r.time, format_ns)} | ${cell(r.instr, format_count)} |`);
+            else
+                print(`| ${name} | ${cell(counts ? r.instr : r.time, counts ? format_count : format_ns)} |`);
         }
     } else {
         const flag = m => !m || m.status === "same" ? "" : m.status === "slower" ? "  <-- " + m.status : "  " + m.status;
-        print("benchmark".padEnd(38), "base".padStart(9), "head".padStart(9), "time".padStart(9),
+        print("benchmark".padEnd(38), times ? "base".padStart(9) + "head".padStart(10) + "time".padStart(10) : "",
               counts ? "base".padStart(11) + "head".padStart(10) + "instr".padStart(9) : "");
         for (const r of rows) {
             const name = (r.group + "/" + r.name).padEnd(38);
@@ -272,8 +282,9 @@ function main() {
                 continue;
             }
             let line = name;
-            line += r.time ? format_ns(r.time.base).padStart(9) + format_ns(r.time.head).padStart(9) + format_change(r.time.change).padStart(9)
-                           : "-".padStart(9) + "-".padStart(9) + "".padStart(9);
+            if (times)
+                line += r.time ? format_ns(r.time.base).padStart(9) + format_ns(r.time.head).padStart(9) + format_change(r.time.change).padStart(9)
+                               : "-".padStart(9) + "-".padStart(9) + "".padStart(9);
             if (counts)
                 line += r.instr ? format_count(r.instr.base).padStart(11) + format_count(r.instr.head).padStart(10) + format_change(r.instr.change).padStart(9)
                                 : "-".padStart(11) + "-".padStart(10) + "".padStart(9);
