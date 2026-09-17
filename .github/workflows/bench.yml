@@ -9,8 +9,12 @@ name: bench
 # summary. On pushes to the default branch the results are kept as a workflow
 # artifact so a history is available.
 #
-# Hosted runners are noisy: treat single-digit changes as noise and look for
-# consistent shifts across related benchmarks. Re-run the job when in doubt.
+# Hosted runners are noisy: treat single-digit changes of the times as noise
+# and look for consistent shifts across related benchmarks. The instructions
+# per operation, counted with cachegrind (bench/instructions.js), do not
+# depend on the load of the runner: a change there is a change of the code
+# the benchmark executes, and an unchanged count with a changed time is noise
+# or a code placement effect.
 
 on:
   pull_request:
@@ -54,6 +58,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: install valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind
+
       - name: build head
         run: |
           make BUILD_DIR=build-head BUILD_TYPE=Release
@@ -88,10 +97,27 @@ jobs:
             done
           fi
 
+      # Deterministic, so once per side is enough, and about 20 ms of native
+      # work per benchmark resolves changes of 0.01%. The head runs the
+      # iteration counts calibrated on the base so that both do the same work.
+      - name: count instructions
+        run: |
+          jobs="--jobs $(nproc)"
+          if [ -f base.sha ]; then
+            echo "::group::base"
+            build-head/qjs bench/instructions.js $jobs --min-ms 20 --json results/base-instructions.json ../base/build/qjs
+            echo "::endgroup::"
+            echo "::group::head"
+            build-head/qjs bench/instructions.js $jobs --iterations-from results/base-instructions.json --json results/head-instructions.json build-head/qjs
+            echo "::endgroup::"
+          else
+            build-head/qjs bench/instructions.js $jobs --min-ms 20 --json results/head-instructions.json build-head/qjs
+          fi
+
       - name: compare
         if: github.event_name == 'pull_request'
         run: |
-          base_files=$(ls results/base-*.json | paste -sd,)
+          base_files=$(ls results/base-*.json | paste -sd,)  # timings and instruction counts
           head_files=$(ls results/head-*.json | paste -sd,)
           {
             echo "<!-- runtime-bench -->"
