@@ -54,6 +54,7 @@ FMT(atom_u16)
 FMT(atom_label_u8)
 FMT(atom_label_u16)
 FMT(label_u16)
+FMT(atom_u16_loc8)
 #undef FMT
 #endif /* FMT */
 
@@ -137,9 +138,10 @@ DEF(check_define_var, 6, 0, 0, atom_u8)
 DEF(    define_func, 6, 1, 0, atom_u8)
 
 // order matters, see IC counterparts
-DEF(      get_field, 5, 1, 1, atom)
-DEF(     get_field2, 5, 1, 2, atom)
-DEF(      put_field, 5, 2, 0, atom)
+/* atom, then the inline cache slot allocated in resolve_labels() */
+DEF(      get_field, 7, 1, 1, atom_u16)
+DEF(     get_field2, 7, 1, 2, atom_u16)
+DEF(      put_field, 7, 2, 0, atom_u16)
 
 DEF( get_private_field, 1, 2, 1, none) /* obj prop -> value */
 DEF( put_private_field, 1, 3, 0, none) /* obj value prop -> */
@@ -149,7 +151,7 @@ DEF(  get_array_el2, 1, 2, 2, none) /* obj prop -> obj value */
 DEF(   put_array_el, 1, 3, 0, none)
 DEF(get_super_value, 1, 3, 1, none) /* this obj prop -> value */
 DEF(put_super_value, 1, 4, 0, none) /* this obj prop value -> */
-DEF(   define_field, 5, 2, 1, atom)
+DEF(   define_field, 7, 2, 1, atom_u16)
 DEF(       set_name, 5, 1, 1, atom)
 DEF(set_name_computed, 1, 2, 2, none)
 DEF(      set_proto, 1, 2, 1, none)
@@ -290,7 +292,7 @@ def(scope_get_private_field, 7, 1, 1, atom_u16) /* obj -> value, emitted in phas
 def(scope_get_private_field2, 7, 1, 2, atom_u16) /* obj -> obj value, emitted in phase 1, removed in phase 2 */
 def(scope_put_private_field, 7, 2, 0, atom_u16) /* obj value ->, emitted in phase 1, removed in phase 2 */
 def(scope_in_private_field, 7, 1, 1, atom_u16) /* obj -> res emitted in phase 1, removed in phase 2 */
-def(get_field_opt_chain, 5, 1, 1, atom) /* emitted in phase 1, removed in phase 2 */
+def(get_field_opt_chain, 7, 1, 1, atom_u16) /* emitted in phase 1, removed in phase 2 */
 def(get_array_el_opt_chain, 1, 2, 1, none) /* emitted in phase 1, removed in phase 2 */
 def( set_class_name, 5, 1, 1, u32) /* emitted in phase 1, removed in phase 2 */
 
@@ -356,6 +358,7 @@ DEF(   set_var_ref2, 1, 1, 1, none_var_ref)
 DEF(   set_var_ref3, 1, 1, 1, none_var_ref)
 
 DEF(     get_length, 1, 1, 1, none)
+DEF(  get_loc_field, 8, 0, 1, atom_u16_loc8) /* get_loc(n) get_field(atom) */
 
 DEF(      if_false8, 2, 1, 0, label8)
 DEF(       if_true8, 2, 1, 0, label8) /* must come after if_false8 */

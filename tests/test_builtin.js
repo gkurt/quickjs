@@ -158,6 +158,68 @@ function test_function()
     assert(r.x, 1);
 }
 
+/* the properties of the function objects created by closures */
+function test_function_properties()
+{
+    function f(a, b, c) {}
+    var g = () => 1;
+    async function h(a) {}
+    class C { m(a, b) {} static s() {} get x() { return 1; } }
+    var o = { meth() {}, ["k" + 1]: function() {}, arrow: (a) => a };
+    var d;
+
+    for (const fn of [f, g, h, C, C.prototype.m, C.s, o.meth, o.k1, o.arrow]) {
+        d = Object.getOwnPropertyDescriptor(fn, "length");
+        assert(d.writable, false, "length");
+        assert(d.enumerable, false, "length");
+        assert(d.configurable, true, "length");
+        d = Object.getOwnPropertyDescriptor(fn, "name");
+        assert(d.writable, false, "name");
+        assert(d.enumerable, false, "name");
+        assert(d.configurable, true, "name");
+    }
+    assert(Object.getOwnPropertyNames(f).join(), "length,name,prototype");
+    assert(Object.getOwnPropertyNames(g).join(), "length,name");
+    assert(Object.getOwnPropertyNames(h).join(), "length,name");
+    assert(Object.getOwnPropertyNames(C.prototype.m).join(), "length,name");
+    assert(Object.getOwnPropertyNames(o.k1).join(), "length,name,prototype");
+    assert(f.length, 3);
+    assert(f.name, "f");
+    assert(o.meth.name, "meth");
+    assert(o.k1.name, "k1");
+    assert(o.arrow.length, 1);
+    assert(Object.getOwnPropertyDescriptor(C.prototype, "x").get.name, "get x");
+    assert(Object.getPrototypeOf(h) !== Function.prototype);
+    assert(Object.getPrototypeOf(g), Function.prototype);
+
+    /* the prototype object is created lazily and is per function */
+    d = Object.getOwnPropertyDescriptor(f, "prototype");
+    assert(d.writable, true, "prototype");
+    assert(d.enumerable, false, "prototype");
+    assert(d.configurable, false, "prototype");
+    assert(f.prototype.constructor, f);
+    assert(f.prototype !== o.k1.prototype);
+    assert(Object.getOwnPropertyDescriptor(f.prototype, "constructor").enumerable, false);
+    assert(new f() instanceof f, true);
+    assertThrows(TypeError, () => new g());
+    assertThrows(TypeError, () => new C.prototype.m());
+
+    /* the properties can be modified independently of other functions */
+    Object.defineProperty(f, "length", { value: 7 });
+    assert(f.length, 7);
+    assert(o.k1.length, 0);
+    assert(delete f.name, true);
+    assert(f.name, "");
+    assert(o.k1.name, "k1");
+    assert(Object.getOwnPropertyNames(f).join(), "length,prototype");
+    f.prototype = 5;
+    assert(f.prototype, 5);
+    assert(typeof o.k1.prototype, "object");
+    o.k1.extra = 1;
+    assert(Object.getOwnPropertyNames(o.k1).join(), "length,name,prototype,extra");
+    assert(Object.getOwnPropertyNames(function() {}).join(), "length,name,prototype");
+}
+
 function test()
 {
     var r, a, b, c, err;
@@ -269,6 +331,73 @@ function test_array()
         err = true;
     }
     assert(err && a.toString() === "1,2,3,4");
+}
+
+/* appending to the result arrays of the builtins */
+function test_array_append()
+{
+    var a, r;
+
+    a = [1, 2, 3].map(x => x * 2);
+    assert(a.join(), "2,4,6", "map");
+    r = Object.getOwnPropertyDescriptor(a, 1);
+    assert(r.writable && r.enumerable && r.configurable, true, "map");
+    a = [1, 2, 3, 4].filter(x => x & 1);
+    assert(a.join(), "1,3", "filter");
+    a = "a-b-c".split("-");
+    assert(a.join(), "a,b,c", "split");
+    a = Array.from({ length: 3 }, (_, i) => i);
+    assert(a.join(), "0,1,2", "from");
+    a = [1, , 3].map(x => x);
+    assert(1 in a, false, "holes");
+    assert(a.length, 3, "holes");
+    /* elements defined past the end of the result (holes before them)
+       take the generic path */
+    a = Array.prototype.concat.call({ length: 4, 1: "a", 3: "b",
+                                      [Symbol.isConcatSpreadable]: true },
+                                    { x: 1 }, [2, 3]);
+    assert(a.length, 7, "concat");
+    assert(0 in a, false, "concat");
+    assert(a[1] === "a" && a[3] === "b" && a[4].x === 1 && a[6] === 3, true, "concat");
+    a = [];
+    a[1] = "x";
+    a = a.concat([, "y"]);
+    assert(a.length === 4 && a[1] === "x" && a[3] === "y" && !(2 in a), true, "concat");
+
+    /* the result array is not extensible or its length is not writable */
+    class NonExtensible extends Array {
+        constructor() { super(); Object.preventExtensions(this); }
+    }
+    assertThrows(TypeError, () => NonExtensible.from([1]));
+    assertThrows(TypeError, () => NonExtensible.of(1));
+    assert(NonExtensible.from([]).length, 0);
+    class FixedLength extends Array {
+        constructor() { super(); Object.defineProperty(this, "length", { writable: false }); }
+    }
+    assertThrows(TypeError, () => FixedLength.from([1]));
+    assertThrows(TypeError, () => FixedLength.of(1));
+    class Sub extends Array {}
+    a = Sub.from([1, 2]);
+    assert(a instanceof Sub, true, "subclass");
+    assert(a.join(), "1,2", "subclass");
+    a = a.map(x => x + 1);
+    assert(a instanceof Sub, true, "subclass");
+    assert(a.join(), "2,3", "subclass");
+
+    /* the result array already has elements */
+    class Prefilled extends Array {
+        constructor() { super(); this[0] = "p"; }
+    }
+    a = Prefilled.of(1, 2);
+    assert(a.join(), "1,2", "prefilled");
+    class Big extends Array {
+        constructor() { super(); this.length = 10; }
+    }
+    a = Big.of(1, 2);
+    assert(a.length, 2, "big"); /* Array.of() sets the length */
+    a = a.map(x => x + 1);
+    assert(a.length, 10, "big"); /* map() does not */
+    assert(a[0] === 2 && a[1] === 3, true, "big");
 }
 
 function test_string()
@@ -383,6 +512,51 @@ function test_string()
            /*JS_STRING_KIND_NORMAL*/0);
     assert(qjs.getStringKind("xyzzy".repeat(512).slice(1)),
            /*JS_STRING_KIND_SLICE*/1);
+}
+
+/* one character strings are shared */
+function test_one_char_string()
+{
+    var s, c, i, o;
+
+    s = "abé€";
+    for (i = 0; i < s.length; i++) {
+        c = s[i];
+        assert(c, s.charAt(i));
+        assert(c, s.slice(i, i + 1));
+        assert(c, s.substring(i, i + 1));
+        assert(c, String.fromCharCode(s.charCodeAt(i)));
+        assert(c.length, 1);
+        /* concatenation must not modify the shared string */
+        assert(c + "x", c.concat("x"));
+        assert(s[i], c);
+        assert((c + c).length, 2);
+        assert(c.repeat(2)[1], c);
+        assert(c.padEnd(3, "-"), c + "--");
+        assert(c, c.slice(0, 1));
+    }
+    assert(s[4], undefined);
+    assert(s[-1], undefined);
+    assert(s[1.5], undefined);
+    assert(s["1"], "b");
+    c = "a"; c += "b";
+    assert("ab".charAt(0), "a");
+    assert("ab"[0], "a");
+
+    /* one character strings as property keys */
+    o = {};
+    for (i = 0; i < s.length; i++)
+        o[s[i]] = i;
+    assert(Object.keys(o).join(), "a,b,é,€");
+    assert(o["b"], 1);
+    assert(o[s.charAt(2)], 2);
+    assert(o["0123"[1]], undefined);
+    o["0123"[1]] = "one";
+    assert(o[1], "one");
+    assert("abc".split("").join("+"), "a+b+c");
+    assert([..."abc"].length, 3);
+    assert(Array.from("ab").join(), "a,b");
+    assert("a" === "ba"[1], true);
 }
 
 function rope_concat(n, dir)
@@ -1325,9 +1499,12 @@ function test_cur_pc()
 
 test();
 test_function();
+test_function_properties();
 test_enum();
 test_array();
+test_array_append();
 test_string();
+test_one_char_string();
 test_rope();
 test_math();
 test_number();
