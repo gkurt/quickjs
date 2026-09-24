@@ -10613,6 +10613,57 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
     }
 }
 
+/* Store the number 'val' at the index 'idx' < p->u.array.count of the
+   typed array 'p' when no conversion that could call user code is needed.
+   Return false if the generic JS_SetPropertyValue() must be used */
+static force_inline bool js_typed_array_put_fast(JSObject *p, uint32_t idx,
+                                                 JSValueConst val)
+{
+    uint32_t tag = JS_VALUE_GET_TAG(val);
+    int32_t v;
+    double d;
+
+    if (tag == JS_TAG_INT) {
+        v = JS_VALUE_GET_INT(val);
+        d = v;
+    } else if (JS_TAG_IS_FLOAT64(tag)) {
+        v = 0; /* the integer arrays take the generic path */
+        d = JS_VALUE_GET_FLOAT64(val);
+    } else {
+        return false;
+    }
+    if (typed_array_is_immutable(p))
+        return false;
+    switch(p->class_id) {
+    case JS_CLASS_INT8_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:
+        if (tag != JS_TAG_INT)
+            return false;
+        p->u.array.u.uint8_ptr[idx] = v;
+        return true;
+    case JS_CLASS_INT16_ARRAY:
+    case JS_CLASS_UINT16_ARRAY:
+        if (tag != JS_TAG_INT)
+            return false;
+        p->u.array.u.uint16_ptr[idx] = v;
+        return true;
+    case JS_CLASS_INT32_ARRAY:
+    case JS_CLASS_UINT32_ARRAY:
+        if (tag != JS_TAG_INT)
+            return false;
+        p->u.array.u.uint32_ptr[idx] = v;
+        return true;
+    case JS_CLASS_FLOAT32_ARRAY:
+        p->u.array.u.float_ptr[idx] = d;
+        return true;
+    case JS_CLASS_FLOAT64_ARRAY:
+        p->u.array.u.double_ptr[idx] = d;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                                    JSValue prop)
 {
@@ -10903,6 +10954,16 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
             uint32_t idx;
             if (JS_AtomIsArrayIndex(ctx, &idx, atom) &&
                 idx < p->u.array.count) {
+                if (p->class_id == JS_CLASS_ARRAY &&
+                    idx == p->u.array.count - 1) {
+                    /* the last element: the array stays dense with a
+                       length greater than its element count, as after
+                       an increase of 'length' (pop() and splice() delete
+                       from the end) */
+                    p->u.array.count = idx;
+                    JS_FreeValue(ctx, p->u.array.u.values[idx]);
+                    return true;
+                }
                 if (p->class_id == JS_CLASS_ARRAY ||
                     p->class_id == JS_CLASS_ARGUMENTS ||
                     p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
@@ -20792,6 +20853,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 }
                             }
                         }
+                        if (p->class_id >= JS_CLASS_INT8_ARRAY &&
+                            p->class_id <= JS_CLASS_FLOAT64_ARRAY &&
+                            idx < p->u.array.count &&
+                            js_typed_array_put_fast(p, idx, val)) {
+                            /* 'val' is a number: nothing to release */
+                            JS_FreeValue(ctx, sp[-3]);
+                            sp -= 3;
+                            BREAK;
+                        }
                     }
                 }
                 sf->cur_pc = pc;
@@ -20936,6 +21006,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_add_loc):
             {
                 JSValue *pv;
+                double d1, d2;
                 int idx;
                 idx = *pc;
                 pc += 1;
@@ -20949,6 +21020,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         *pv = __JS_NewFloat64((double)r);
                     else
                         *pv = js_int32(r);
+                    sp--;
+                } else if ((JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(*pv)) ||
+                            JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(sp[-1]))) &&
+                           js_arith_to_float64(*pv, &d1) &&
+                           js_arith_to_float64(sp[-1], &d2)) {
+                    /* number accumulator: neither operand holds a
+                       reference, so the local is overwritten in place */
+                    JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
+                    *pv = js_float64(d1 + d2);
+                    JS_X87_FPCW_RESTORE(fpcw);
                     sp--;
                 } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
                     JSValue op1;
@@ -21450,8 +21531,62 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, pc[-1]));
             OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, pc[-1]));
             OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, pc[-1]));
-            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1));
+            /* loose equality: the numbers as OP_CMP, and inline the
+               comparisons which involve an object and cannot call user
+               code: two objects (identity) and an object with null or
+               undefined, as in 'x == null' */
+#define OP_EQ(opcode, is_neq)                                           \
+            CASE(opcode):                                               \
+                {                                                       \
+                JSValue op1, op2;                                       \
+                uint32_t tag1, tag2;                                    \
+                double d1, d2;                                          \
+                bool res;                                               \
+                op1 = sp[-2];                                           \
+                op2 = sp[-1];                                           \
+                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
+                    res = JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2); \
+                } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {          \
+                    res = JS_VALUE_GET_FLOAT64(op1) == JS_VALUE_GET_FLOAT64(op2); \
+                } else if ((JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) || \
+                            JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) && \
+                           js_arith_to_float64(op1, &d1) &&             \
+                           js_arith_to_float64(op2, &d2)) {             \
+                    res = d1 == d2;                                     \
+                } else {                                                \
+                    tag1 = JS_VALUE_GET_TAG(op1);                       \
+                    tag2 = JS_VALUE_GET_TAG(op2);                       \
+                    if (tag1 == JS_TAG_OBJECT && tag2 == JS_TAG_OBJECT) { \
+                        res = JS_VALUE_GET_OBJ(op1) == JS_VALUE_GET_OBJ(op2); \
+                    } else if ((tag1 == JS_TAG_NULL || tag1 == JS_TAG_UNDEFINED) && \
+                               (tag2 == JS_TAG_NULL || tag2 == JS_TAG_UNDEFINED)) { \
+                        res = true;                                     \
+                    } else if ((tag1 == JS_TAG_NULL || tag1 == JS_TAG_UNDEFINED) && \
+                               tag2 == JS_TAG_OBJECT) {                 \
+                        res = JS_IsHTMLDDA(ctx, op2);                   \
+                    } else if ((tag2 == JS_TAG_NULL || tag2 == JS_TAG_UNDEFINED) && \
+                               tag1 == JS_TAG_OBJECT) {                 \
+                        res = JS_IsHTMLDDA(ctx, op1);                   \
+                    } else {                                            \
+                        sf->cur_pc = pc;                                \
+                        if (js_eq_slow(ctx, sp, is_neq))                \
+                            goto exception;                             \
+                        sp--;                                           \
+                        BREAK;                                          \
+                    }                                                   \
+                    sp[-2] = js_bool(res ^ is_neq);                     \
+                    sp--;                                               \
+                    JS_FreeValue(ctx, op1);                             \
+                    JS_FreeValue(ctx, op2);                             \
+                    BREAK;                                              \
+                }                                                       \
+                sp[-2] = js_bool(res ^ is_neq);                         \
+                sp--;                                                   \
+                }                                                       \
+            BREAK
+            OP_EQ(OP_eq, 0);
+            OP_EQ(OP_neq, 1);
+#undef OP_EQ
             OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
             OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
 
@@ -47858,6 +47993,65 @@ static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* Replace the 'del_count' elements at 'start' of the fast array 'obj' of
+   length 'len' with the 'item_count' values of 'items', moving the
+   following elements in one block instead of one generic property access
+   each. Return 1 if done, 0 if 'obj' is not an array this applies to, -1
+   on exception. The conditions are those of the fast path of push(): no
+   setter of the prototype can see the elements added past the end. */
+static int js_array_splice_fast(JSContext *ctx, JSValueConst obj,
+                                int64_t len, int64_t start, int64_t del_count,
+                                JSValueConst *items, uint32_t item_count)
+{
+    JSValue tmp_buf[16], *tmp, *values;
+    JSObject *p;
+    int64_t new_len, i;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (!(p->class_id == JS_CLASS_ARRAY &&
+          p->fast_array &&
+          p->extensible &&
+          p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
+          ctx->std_array_prototype &&
+          JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT &&
+          (get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE) &&
+          p->u.array.count == len &&
+          JS_VALUE_GET_INT(p->prop[0].u.value) == len))
+        return 0;
+    new_len = len + item_count - del_count;
+    if (new_len > INT32_MAX)
+        return 0;
+    if (new_len > p->u.array.u1.size) {
+        if (expand_fast_array(ctx, p, new_len))
+            return -1;
+    }
+    /* the removed values are released once the array is consistent */
+    tmp = tmp_buf;
+    if (del_count > countof(tmp_buf)) {
+        tmp = js_malloc(ctx, sizeof(tmp[0]) * del_count);
+        if (!tmp)
+            return -1;
+    }
+    /* 'values' is NULL in an empty array */
+    values = p->u.array.u.values;
+    if (del_count > 0)
+        memcpy(tmp, values + start, sizeof(tmp[0]) * del_count);
+    if (len - start - del_count > 0)
+        memmove(values + start + item_count, values + start + del_count,
+                sizeof(values[0]) * (len - start - del_count));
+    for(i = 0; i < item_count; i++)
+        values[start + i] = js_dup(items[i]);
+    p->u.array.count = new_len;
+    p->prop[0].u.value = js_int32(new_len);
+    for(i = 0; i < del_count; i++)
+        JS_FreeValue(ctx, tmp[i]);
+    if (tmp != tmp_buf)
+        js_free(ctx, tmp);
+    return 1;
+}
+
 static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int unshift)
 {
@@ -47905,6 +48099,13 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
     }
     from = len;
     if (unshift && argc > 0) {
+        int ret = js_array_splice_fast(ctx, obj, len, 0, 0, argv, argc);
+        if (ret < 0)
+            goto exception;
+        if (ret > 0) {
+            JS_FreeValue(ctx, obj);
+            return js_int64(newLen);
+        }
         if (JS_CopySubArray(ctx, obj, argc, 0, len, -1))
             goto exception;
         from = 0;
@@ -48119,6 +48320,12 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
         goto exception;
 
     if (splice) {
+        int ret = js_array_splice_fast(ctx, obj, len, start, del_count,
+                                       argv + 2, item_count);
+        if (ret < 0)
+            goto exception;
+        if (ret > 0)
+            goto done;
         new_len = len + item_count - del_count;
         if (item_count != del_count) {
             if (JS_CopySubArray(ctx, obj, start + item_count,
@@ -48138,6 +48345,7 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
         if (JS_SetProperty(ctx, obj, JS_ATOM_length, js_int64(new_len)) < 0)
             goto exception;
     }
+ done:
     JS_FreeValue(ctx, obj);
     return arr;
 
