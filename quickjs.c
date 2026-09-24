@@ -10903,6 +10903,16 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
             uint32_t idx;
             if (JS_AtomIsArrayIndex(ctx, &idx, atom) &&
                 idx < p->u.array.count) {
+                if (p->class_id == JS_CLASS_ARRAY &&
+                    idx == p->u.array.count - 1) {
+                    /* the last element: the array stays dense with a
+                       length greater than its element count, as after
+                       an increase of 'length' (pop() and splice() delete
+                       from the end) */
+                    p->u.array.count = idx;
+                    JS_FreeValue(ctx, p->u.array.u.values[idx]);
+                    return true;
+                }
                 if (p->class_id == JS_CLASS_ARRAY ||
                     p->class_id == JS_CLASS_ARGUMENTS ||
                     p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
@@ -47858,6 +47868,65 @@ static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* Replace the 'del_count' elements at 'start' of the fast array 'obj' of
+   length 'len' with the 'item_count' values of 'items', moving the
+   following elements in one block instead of one generic property access
+   each. Return 1 if done, 0 if 'obj' is not an array this applies to, -1
+   on exception. The conditions are those of the fast path of push(): no
+   setter of the prototype can see the elements added past the end. */
+static int js_array_splice_fast(JSContext *ctx, JSValueConst obj,
+                                int64_t len, int64_t start, int64_t del_count,
+                                JSValueConst *items, uint32_t item_count)
+{
+    JSValue tmp_buf[16], *tmp, *values;
+    JSObject *p;
+    int64_t new_len, i;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (!(p->class_id == JS_CLASS_ARRAY &&
+          p->fast_array &&
+          p->extensible &&
+          p->shape->proto == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) &&
+          ctx->std_array_prototype &&
+          JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT &&
+          (get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE) &&
+          p->u.array.count == len &&
+          JS_VALUE_GET_INT(p->prop[0].u.value) == len))
+        return 0;
+    new_len = len + item_count - del_count;
+    if (new_len > INT32_MAX)
+        return 0;
+    if (new_len > p->u.array.u1.size) {
+        if (expand_fast_array(ctx, p, new_len))
+            return -1;
+    }
+    /* the removed values are released once the array is consistent */
+    tmp = tmp_buf;
+    if (del_count > countof(tmp_buf)) {
+        tmp = js_malloc(ctx, sizeof(tmp[0]) * del_count);
+        if (!tmp)
+            return -1;
+    }
+    /* 'values' is NULL in an empty array */
+    values = p->u.array.u.values;
+    if (del_count > 0)
+        memcpy(tmp, values + start, sizeof(tmp[0]) * del_count);
+    if (len - start - del_count > 0)
+        memmove(values + start + item_count, values + start + del_count,
+                sizeof(values[0]) * (len - start - del_count));
+    for(i = 0; i < item_count; i++)
+        values[start + i] = js_dup(items[i]);
+    p->u.array.count = new_len;
+    p->prop[0].u.value = js_int32(new_len);
+    for(i = 0; i < del_count; i++)
+        JS_FreeValue(ctx, tmp[i]);
+    if (tmp != tmp_buf)
+        js_free(ctx, tmp);
+    return 1;
+}
+
 static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int unshift)
 {
@@ -47905,6 +47974,13 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
     }
     from = len;
     if (unshift && argc > 0) {
+        int ret = js_array_splice_fast(ctx, obj, len, 0, 0, argv, argc);
+        if (ret < 0)
+            goto exception;
+        if (ret > 0) {
+            JS_FreeValue(ctx, obj);
+            return js_int64(newLen);
+        }
         if (JS_CopySubArray(ctx, obj, argc, 0, len, -1))
             goto exception;
         from = 0;
@@ -48119,6 +48195,12 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
         goto exception;
 
     if (splice) {
+        int ret = js_array_splice_fast(ctx, obj, len, start, del_count,
+                                       argv + 2, item_count);
+        if (ret < 0)
+            goto exception;
+        if (ret > 0)
+            goto done;
         new_len = len + item_count - del_count;
         if (item_count != del_count) {
             if (JS_CopySubArray(ctx, obj, start + item_count,
@@ -48138,6 +48220,7 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
         if (JS_SetProperty(ctx, obj, JS_ATOM_length, js_int64(new_len)) < 0)
             goto exception;
     }
+ done:
     JS_FreeValue(ctx, obj);
     return arr;
 
