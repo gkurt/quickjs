@@ -28,6 +28,7 @@
 #include <string.h>
 #include <assert.h>
 #include <ctype.h>
+#include <float.h>
 // #include <sys/time.h>
 #include <math.h>
 // #include <setjmp.h>
@@ -1417,6 +1418,99 @@ double js_atod(const char *str, const char **pnext, int radix, int flags,
     }
     if (radix == 0)
         radix = 10;
+
+#if !defined(FLT_EVAL_METHOD) || FLT_EVAL_METHOD == 0
+    /* Fast path for the common short numbers. A significand of at most
+       53 bits scaled by a power of ten of at most 10^22, both exact in a
+       double, gives the correctly rounded result with a single IEEE
+       multiplication or division (Clinger). Integers in other radices are
+       exact up to 2^53. Anything else (separators, long significands,
+       large exponents, radix suffixes...) takes the general path, which
+       also reports the syntax errors. */
+    {
+        static const double pow10_tab[23] = {
+            1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+            1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+        };
+        const char *q = p;
+        uint64_t mant = 0;
+        int c, n_sig = 0, n_frac = 0, e10 = 0;
+        bool has_digit = false, has_dot = false;
+        double d;
+
+        if (radix == 10) {
+            for(;;) {
+                c = *q;
+                if (c >= '0' && c <= '9') {
+                    if (mant != 0 || c != '0') {
+                        if (++n_sig > 19)
+                            goto slow_path;
+                        mant = mant * 10 + (c - '0');
+                    }
+                    n_frac += has_dot;
+                    has_digit = true;
+                    q++;
+                } else if (c == '.' && !has_dot && !(flags & JS_ATOD_INT_ONLY)) {
+                    has_dot = true;
+                    q++;
+                } else {
+                    break;
+                }
+            }
+            if (!has_digit || c == sep)
+                goto slow_path;
+            if ((c == 'e' || c == 'E') && !(flags & JS_ATOD_INT_ONLY)) {
+                bool e_neg = false;
+                int n_exp = 0;
+                q++;
+                if (*q == '+') {
+                    q++;
+                } else if (*q == '-') {
+                    e_neg = true;
+                    q++;
+                }
+                while (*q >= '0' && *q <= '9') {
+                    if (++n_exp > 4)
+                        goto slow_path;
+                    e10 = e10 * 10 + (*q++ - '0');
+                }
+                if (n_exp == 0 || *q == sep)
+                    goto slow_path;
+                if (e_neg)
+                    e10 = -e10;
+            }
+            e10 -= n_frac;
+            if (mant > ((uint64_t)1 << 53))
+                goto slow_path;
+            d = (double)mant;
+            if (mant == 0) {
+                /* any exponent */
+            } else if (e10 >= 0 && e10 <= 22) {
+                d *= pow10_tab[e10];
+            } else if (e10 < 0 && e10 >= -22) {
+                d /= pow10_tab[-e10];
+            } else {
+                goto slow_path;
+            }
+        } else {
+            while ((c = to_digit((uint8_t)*q)) < radix) {
+                if (mant > ((((uint64_t)1 << 53) - c) / radix))
+                    goto slow_path;
+                mant = mant * radix + c;
+                q++;
+            }
+            c = *q;
+            if (q == p || c == sep || c == '.' || c == '@' ||
+                c == 'p' || c == 'P')
+                goto slow_path;
+            d = (double)mant;
+        }
+        p = q;
+        dval = is_neg ? -d : d;
+        goto done1;
+    }
+ slow_path:
+#endif
 
     cur_limb = 0;
     expn_offset = 0;
