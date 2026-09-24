@@ -10613,6 +10613,57 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
     }
 }
 
+/* Store the number 'val' at the index 'idx' < p->u.array.count of the
+   typed array 'p' when no conversion that could call user code is needed.
+   Return false if the generic JS_SetPropertyValue() must be used */
+static force_inline bool js_typed_array_put_fast(JSObject *p, uint32_t idx,
+                                                 JSValueConst val)
+{
+    uint32_t tag = JS_VALUE_GET_TAG(val);
+    int32_t v;
+    double d;
+
+    if (tag == JS_TAG_INT) {
+        v = JS_VALUE_GET_INT(val);
+        d = v;
+    } else if (JS_TAG_IS_FLOAT64(tag)) {
+        v = 0; /* the integer arrays take the generic path */
+        d = JS_VALUE_GET_FLOAT64(val);
+    } else {
+        return false;
+    }
+    if (typed_array_is_immutable(p))
+        return false;
+    switch(p->class_id) {
+    case JS_CLASS_INT8_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:
+        if (tag != JS_TAG_INT)
+            return false;
+        p->u.array.u.uint8_ptr[idx] = v;
+        return true;
+    case JS_CLASS_INT16_ARRAY:
+    case JS_CLASS_UINT16_ARRAY:
+        if (tag != JS_TAG_INT)
+            return false;
+        p->u.array.u.uint16_ptr[idx] = v;
+        return true;
+    case JS_CLASS_INT32_ARRAY:
+    case JS_CLASS_UINT32_ARRAY:
+        if (tag != JS_TAG_INT)
+            return false;
+        p->u.array.u.uint32_ptr[idx] = v;
+        return true;
+    case JS_CLASS_FLOAT32_ARRAY:
+        p->u.array.u.float_ptr[idx] = d;
+        return true;
+    case JS_CLASS_FLOAT64_ARRAY:
+        p->u.array.u.double_ptr[idx] = d;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
                                    JSValue prop)
 {
@@ -20802,6 +20853,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 }
                             }
                         }
+                        if (p->class_id >= JS_CLASS_INT8_ARRAY &&
+                            p->class_id <= JS_CLASS_FLOAT64_ARRAY &&
+                            idx < p->u.array.count &&
+                            js_typed_array_put_fast(p, idx, val)) {
+                            /* 'val' is a number: nothing to release */
+                            JS_FreeValue(ctx, sp[-3]);
+                            sp -= 3;
+                            BREAK;
+                        }
                     }
                 }
                 sf->cur_pc = pc;
@@ -20946,6 +21006,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_add_loc):
             {
                 JSValue *pv;
+                double d1, d2;
                 int idx;
                 idx = *pc;
                 pc += 1;
@@ -20959,6 +21020,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         *pv = __JS_NewFloat64((double)r);
                     else
                         *pv = js_int32(r);
+                    sp--;
+                } else if ((JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(*pv)) ||
+                            JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(sp[-1]))) &&
+                           js_arith_to_float64(*pv, &d1) &&
+                           js_arith_to_float64(sp[-1], &d2)) {
+                    /* number accumulator: neither operand holds a
+                       reference, so the local is overwritten in place */
+                    JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
+                    *pv = js_float64(d1 + d2);
+                    JS_X87_FPCW_RESTORE(fpcw);
                     sp--;
                 } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
                     JSValue op1;
@@ -21460,8 +21531,62 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, pc[-1]));
             OP_CMP(OP_gt, >, js_relational_slow(ctx, sp, pc[-1]));
             OP_CMP(OP_gte, >=, js_relational_slow(ctx, sp, pc[-1]));
-            OP_CMP(OP_eq, ==, js_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_neq, !=, js_eq_slow(ctx, sp, 1));
+            /* loose equality: the numbers as OP_CMP, and inline the
+               comparisons which involve an object and cannot call user
+               code: two objects (identity) and an object with null or
+               undefined, as in 'x == null' */
+#define OP_EQ(opcode, is_neq)                                           \
+            CASE(opcode):                                               \
+                {                                                       \
+                JSValue op1, op2;                                       \
+                uint32_t tag1, tag2;                                    \
+                double d1, d2;                                          \
+                bool res;                                               \
+                op1 = sp[-2];                                           \
+                op2 = sp[-1];                                           \
+                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
+                    res = JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2); \
+                } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {          \
+                    res = JS_VALUE_GET_FLOAT64(op1) == JS_VALUE_GET_FLOAT64(op2); \
+                } else if ((JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) || \
+                            JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) && \
+                           js_arith_to_float64(op1, &d1) &&             \
+                           js_arith_to_float64(op2, &d2)) {             \
+                    res = d1 == d2;                                     \
+                } else {                                                \
+                    tag1 = JS_VALUE_GET_TAG(op1);                       \
+                    tag2 = JS_VALUE_GET_TAG(op2);                       \
+                    if (tag1 == JS_TAG_OBJECT && tag2 == JS_TAG_OBJECT) { \
+                        res = JS_VALUE_GET_OBJ(op1) == JS_VALUE_GET_OBJ(op2); \
+                    } else if ((tag1 == JS_TAG_NULL || tag1 == JS_TAG_UNDEFINED) && \
+                               (tag2 == JS_TAG_NULL || tag2 == JS_TAG_UNDEFINED)) { \
+                        res = true;                                     \
+                    } else if ((tag1 == JS_TAG_NULL || tag1 == JS_TAG_UNDEFINED) && \
+                               tag2 == JS_TAG_OBJECT) {                 \
+                        res = JS_IsHTMLDDA(ctx, op2);                   \
+                    } else if ((tag2 == JS_TAG_NULL || tag2 == JS_TAG_UNDEFINED) && \
+                               tag1 == JS_TAG_OBJECT) {                 \
+                        res = JS_IsHTMLDDA(ctx, op1);                   \
+                    } else {                                            \
+                        sf->cur_pc = pc;                                \
+                        if (js_eq_slow(ctx, sp, is_neq))                \
+                            goto exception;                             \
+                        sp--;                                           \
+                        BREAK;                                          \
+                    }                                                   \
+                    sp[-2] = js_bool(res ^ is_neq);                     \
+                    sp--;                                               \
+                    JS_FreeValue(ctx, op1);                             \
+                    JS_FreeValue(ctx, op2);                             \
+                    BREAK;                                              \
+                }                                                       \
+                sp[-2] = js_bool(res ^ is_neq);                         \
+                sp--;                                                   \
+                }                                                       \
+            BREAK
+            OP_EQ(OP_eq, 0);
+            OP_EQ(OP_neq, 1);
+#undef OP_EQ
             OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
             OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
 
