@@ -23313,6 +23313,7 @@ typedef struct JSFunctionDef {
     DynBuf byte_code;
     int last_opcode_pos; /* -1 if no last opcode */
     int ic_count; /* inline cache slots allocated by resolve_labels() */
+    bool has_loc_check; /* OP_get_loc_check or OP_put_loc_check emitted */
 
     LabelSlot *label_slots;
     int label_size; /* allocated size for label_slots[] */
@@ -37498,9 +37499,10 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                     get_op = OP_get_arg;
                     var_idx -= ARGUMENT_VAR_OFFSET;
                 } else {
-                    if (s->vars[var_idx].is_lexical)
+                    if (s->vars[var_idx].is_lexical) {
                         get_op = OP_get_loc_check;
-                    else
+                        s->has_loc_check = true;
+                    } else
                         get_op = OP_get_loc;
                 }
                 pos_next = optimize_scope_make_ref(ctx, s, bc, bc_buf, ls,
@@ -37551,6 +37553,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                                 dbuf_putc(bc, OP_put_loc);
                         } else {
                             dbuf_putc(bc, OP_put_loc_check);
+                            s->has_loc_check = true;
                         }
                     } else {
                         dbuf_putc(bc, OP_put_loc);
@@ -37558,6 +37561,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                 } else {
                     if (s->vars[var_idx].is_lexical) {
                         dbuf_putc(bc, OP_get_loc_check);
+                        s->has_loc_check = true;
                     } else {
                         dbuf_putc(bc, OP_get_loc);
                     }
@@ -39335,9 +39339,11 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
     int nvars = s->var_count;
     int nwords, pos, op, len, idx, label, iter, i;
     uint64_t *label_state, *cur, *st;
+    int *label_iter;
     bool changed, reachable, rewrite;
 
-    if (nvars <= 0)
+    /* nothing to rewrite */
+    if (nvars <= 0 || !s->has_loc_check)
         return 0;
     nwords = (nvars + 63) >> 6;
     label_state = js_malloc(ctx, sizeof(uint64_t) * nwords * (s->label_count + 1));
@@ -39345,6 +39351,16 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
         return -1;
     cur = label_state + (size_t)nwords * s->label_count;
     memset(label_state, 0xff, sizeof(uint64_t) * nwords * s->label_count);
+    /* iteration in which each label was last passed: another iteration
+       is needed only if the state of a label already passed shrinks
+       (backward jump); the forward jumps are seen in the same pass */
+    label_iter = js_malloc(ctx, sizeof(int) * (s->label_count + 1));
+    if (!label_iter) {
+        js_free(ctx, label_state);
+        return -1;
+    }
+    for (i = 0; i < s->label_count; i++)
+        label_iter[i] = -1;
 
     rewrite = false;
     for (iter = 0;; iter++) {
@@ -39380,8 +39396,9 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
                 assert(label >= 0 && label < s->label_count);
                 st = label_state + (size_t)label * nwords;
                 if (reachable)
-                    changed |= tdz_state_meet(st, cur, nwords);
+                    tdz_state_meet(st, cur, nwords);
                 memcpy(cur, st, sizeof(uint64_t) * nwords);
+                label_iter[label] = iter;
                 reachable = true;
                 break;
             case OP_set_loc_uninitialized:
@@ -39414,15 +39431,18 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
                 for (i = 0; i < nwords; i++) {
                     if (st[i]) {
                         st[i] = 0;
-                        changed = true;
+                        if (label_iter[label] == iter)
+                            changed = true;
                     }
                 }
                 break;
             case OP_goto:
                 label = get_u32(bc_buf + pos + 1);
                 assert(label >= 0 && label < s->label_count);
-                if (reachable)
-                    changed |= tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords);
+                if (reachable &&
+                    tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords) &&
+                    label_iter[label] == iter)
+                    changed = true;
                 reachable = false;
                 break;
             case OP_return:
@@ -39451,7 +39471,9 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
                 }
                 if (label >= 0 && reachable) {
                     assert(label < s->label_count);
-                    changed |= tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords);
+                    if (tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords) &&
+                        label_iter[label] == iter)
+                        changed = true;
                 }
                 break;
             }
@@ -39466,6 +39488,7 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
             break;
         }
     }
+    js_free(ctx, label_iter);
     js_free(ctx, label_state);
     return 0;
 }
