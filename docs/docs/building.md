@@ -47,6 +47,20 @@ Download quickjs-amalgam.zip from [Releases](https://github.com/quickjs-ng/quick
 To enable the std, os and bjson modules, compile quickjs-amalgam.c with
 `-DQJS_BUILD_LIBC`.
 
+## TypeScript support
+
+TypeScript type erasure (`JS_EVAL_FLAG_TYPESCRIPT`) is built in by default. Builds that
+don't need it can leave it out to save some code size:
+
+```bash
+make QJS_DISABLE_TYPESCRIPT=ON            # CMake: -DQJS_DISABLE_TYPESCRIPT=ON
+meson setup build -Dtypescript=false      # meson
+```
+
+For other build systems, compile `quickjs.c` with `-DQJS_DISABLE_TYPESCRIPT`. Code
+evaluated with `JS_EVAL_FLAG_TYPESCRIPT`, and so `.ts` files run by `qjs`, is then rejected
+with a `SyntaxError`.
+
 ## Debug builds
 
 ```bash

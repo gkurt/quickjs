@@ -1,3 +1,6 @@
+/*---
+features: [typescript]
+---*/
 // TypeScript type erasure test. Only "erasable" syntax is used, i.e. the
 // subset accepted by Node's --experimental-strip-types and tsc's
 // erasableSyntaxOnly: everything here must run after the types are removed.

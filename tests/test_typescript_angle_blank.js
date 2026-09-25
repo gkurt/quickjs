@@ -1,3 +1,6 @@
+/*---
+features: [typescript]
+---*/
 // Angle-bracket type assertions (`<T>expr`) and type-only namespaces. They
 // are valid TypeScript but Node's type stripping rejects them, so they are
 // kept out of test_typescript.ts, which is also run under Node. The bytecode of this

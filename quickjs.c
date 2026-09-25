@@ -23984,6 +23984,18 @@ typedef struct JSParseState {
     int ts_trial;
 } JSParseState;
 
+/* false when the type erasure is compiled out (QJS_DISABLE_TYPESCRIPT):
+   the TypeScript paths of the parser and the ts_*() helpers are then
+   dead code */
+static inline bool ts_enabled(const JSParseState *s)
+{
+#ifdef QJS_DISABLE_TYPESCRIPT
+    return false;
+#else
+    return s->ts;
+#endif
+}
+
 typedef struct JSOpCode {
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_*
     const char *name;
@@ -26498,7 +26510,7 @@ static int __exception js_parse_property_name(JSParseState *s,
                 s->token.val == '}' || s->token.val == '(' ||
                 s->token.val == '=' || s->token.val == ';' ||
                 /* TypeScript: get?: T, get!: T, get<T>() are plain members */
-                (s->ts && (s->token.val == '?' || s->token.val == '!' ||
+                (ts_enabled(s) && (s->token.val == '?' || s->token.val == '!' ||
                            s->token.val == '<'))) {
                 is_non_reserved_ident = true;
                 goto ident_found;
@@ -26518,7 +26530,7 @@ static int __exception js_parse_property_name(JSParseState *s,
                 s->token.val == '}' || s->token.val == '(' ||
                 s->token.val == '=' || s->token.val == ';' ||
                 /* TypeScript: get?: T, get!: T, get<T>() are plain members */
-                (s->ts && (s->token.val == '?' || s->token.val == '!' ||
+                (ts_enabled(s) && (s->token.val == '?' || s->token.val == '!' ||
                            s->token.val == '<'))) {
                 is_non_reserved_ident = true;
                 goto ident_found;
@@ -26548,7 +26560,7 @@ static int __exception js_parse_property_name(JSParseState *s,
             if (!(s->token.val == ':' ||
                   (s->token.val == '(' && allow_method) ||
                   /* TypeScript generic method: name<T>(...) */
-                  (s->ts && s->token.val == '<' && allow_method))) {
+                  (ts_enabled(s) && s->token.val == '<' && allow_method))) {
                 prop_type = PROP_TYPE_VAR;
             }
         }
@@ -26585,7 +26597,7 @@ static int __exception js_parse_property_name(JSParseState *s,
     if (prop_type != PROP_TYPE_IDENT && prop_type != PROP_TYPE_VAR &&
         s->token.val != '(' &&
         /* TypeScript generic method: async name<T>(...), *name<T>(...) */
-        !(s->ts && s->token.val == '<')) {
+        !(ts_enabled(s) && s->token.val == '<')) {
         JS_FreeAtom(s->ctx, name);
     invalid_prop:
         js_parse_error(s, "invalid property name");
@@ -27454,7 +27466,7 @@ static int js_parse_is_arrow_params(JSParseState *s, bool allow_ret_type)
     tok = js_parse_skip_parens_token(s, NULL, true);
     if (tok == TOK_ARROW)
         return 1;
-    if (!s->ts)
+    if (!ts_enabled(s))
         return 0;
     if (tok == '\n') {
         /* the return type annotation may start on the next line:
@@ -28281,7 +28293,7 @@ static __exception int js_parse_object_literal(JSParseState *s)
             emit_op(s, OP_define_field);
             emit_atom(s, name);
             emit_u16(s, 0); /* inline cache slot */
-        } else if (s->token.val == '(' || (s->ts && s->token.val == '<')) {
+        } else if (s->token.val == '(' || (ts_enabled(s) && s->token.val == '<')) {
             bool is_getset = (prop_type == PROP_TYPE_GET ||
                               prop_type == PROP_TYPE_SET);
             JSParseFunctionEnum func_type;
@@ -28583,7 +28595,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
         js_parse_error(s, "class statement requires a name");
         goto fail;
     }
-    if (s->ts && s->token.val == '<') {
+    if (ts_enabled(s) && s->token.val == '<') {
         /* type parameters */
         if (ts_skip_type_params(s))
             goto fail;
@@ -28604,7 +28616,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             goto fail;
         if (js_parse_left_hand_side_expr(s))
             goto fail;
-        if (s->ts && s->token.val == '<') {
+        if (ts_enabled(s) && s->token.val == '<') {
             /* extends Base<T> */
             if (ts_skip_type_args(s))
                 goto fail;
@@ -28612,7 +28624,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
     } else {
         emit_op(s, OP_undefined);
     }
-    if (s->ts && ts_token_is(s, JS_ATOM_implements)) {
+    if (ts_enabled(s) && ts_token_is(s, JS_ATOM_implements)) {
         do {
             if (next_token(s))
                 goto fail;
@@ -28668,7 +28680,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             continue;
         }
         ts_mods = 0;
-        if (s->ts) {
+        if (ts_enabled(s)) {
             if (ts_parse_class_modifiers(s, &ts_mods))
                 goto fail;
         }
@@ -28677,7 +28689,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             int next = peek_token(s, true);
             if (!(next == ';' || next == '}' || next == '(' || next == '=' ||
                   /* TypeScript: static?: T, static!: T, static: T, static<T>() */
-                  (s->ts && (next == '?' || next == '!' || next == ':' ||
+                  (ts_enabled(s) && (next == '?' || next == '!' || next == ':' ||
                              next == '<'))))
                 is_static = true;
         }
@@ -28732,7 +28744,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                 prop_type = PROP_TYPE_IDENT;
             }
         }
-        if (s->ts && prop_type < 0) {
+        if (ts_enabled(s) && prop_type < 0) {
             /* modifiers after 'static' */
             if (ts_parse_class_modifiers(s, &ts_mods))
                 goto fail;
@@ -28787,7 +28799,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
         }
         is_private = prop_type & PROP_TYPE_PRIVATE;
         prop_type &= ~PROP_TYPE_PRIVATE;
-        if (s->ts) {
+        if (ts_enabled(s)) {
             /* optional member marker and definite assignment assertion */
             if (s->token.val == '?' || s->token.val == '!') {
                 if (next_token(s))
@@ -28898,7 +28910,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                 emit_u8(s, OP_DEFINE_METHOD_GETTER + is_set);
             }
         } else if (prop_type == PROP_TYPE_IDENT && s->token.val != '(' &&
-                   !(s->ts && s->token.val == '<')) {
+                   !(ts_enabled(s) && s->token.val == '<')) {
             ClassFieldsDef *cf = &class_fields[is_static];
             JSAtom field_var_name = JS_ATOM_NULL;
 
@@ -28968,7 +28980,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                 emit_u16(s, s->cur_func->scope_level);
             }
 
-            if (s->ts) {
+            if (ts_enabled(s)) {
                 /* field type annotation */
                 if (ts_skip_type_annotation(s))
                     goto fail;
@@ -29022,7 +29034,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
             if (is_private) {
                 class_fields[is_static].need_brand = true;
             }
-            if (s->ts && s->token.val == '<') {
+            if (ts_enabled(s) && s->token.val == '<') {
                 /* method type parameters: the function starts at the
                    '(' as in the equivalent JavaScript source */
                 if (ts_skip_type_params(s))
@@ -29740,7 +29752,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
     JSAtom prop_name, var_name;
     int opcode, scope, tok1, skip_bits;
     bool has_initializer;
-    bool ts_annotation = s->ts_annotation_allowed;
+    bool ts_annotation = ts_enabled(s) && s->ts_annotation_allowed;
 
     /* only the outermost pattern may carry a type annotation */
     s->ts_annotation_allowed = false;
@@ -30831,12 +30843,12 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             }
             if (next_token(s))
                 return -1;
-        } else if (s->ts && s->token.val == '!' && !s->got_lf) {
+        } else if (ts_enabled(s) && s->token.val == '!' && !s->got_lf) {
             /* non-null assertion: erased */
             if (next_token(s))
                 return -1;
             ts_erased(s);
-        } else if (s->ts && s->token.val == '<') {
+        } else if (ts_enabled(s) && s->token.val == '<') {
             /* type arguments: f<T>(x), new C<T>(), f<T>`...` */
             int ret = ts_try_type_args(s);
             if (ret < 0)
@@ -31072,7 +31084,7 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
         parse_flags = 0;
         break;
     case '<':
-        if (s->ts && !s->jsx) {
+        if (ts_enabled(s) && !s->jsx) {
             /* angle bracket type assertion: <T>x, erased */
             if (next_token(s))
                 return -1;
@@ -31170,7 +31182,7 @@ static __exception int js_parse_expr_binary_rest(JSParseState *s, int level,
 
     for(;;) {
         op = s->token.val;
-        if (level == 4 && s->ts && !s->got_lf &&
+        if (level == 4 && ts_enabled(s) && !s->got_lf &&
             (ts_token_is(s, JS_ATOM_as) || ts_token_is(s, JS_ATOM_satisfies))) {
             /* `x as T`, `x satisfies T`: erased. As in TypeScript the
                assertion applies to the whole left operand and the
@@ -31573,7 +31585,7 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
                                       JS_FUNC_NORMAL, JS_ATOM_NULL,
                                       s->token.ptr, s->token.line_num,
                                       s->token.col_num);
-    } else if (s->ts && !s->jsx && s->token.val == '<' &&
+    } else if (ts_enabled(s) && !s->jsx && s->token.val == '<' &&
                (ret = ts_is_generic_arrow(s)) != 0) {
         /* generic arrow function: <T>(x: T) => x. The function starts
            at the '(' as in the equivalent JavaScript source */
@@ -31601,7 +31613,7 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
         js_parse_get_pos(s, &pos);
         if (next_token(s))
             return -1;
-        if (s->ts && !s->jsx && s->token.val == '<') {
+        if (ts_enabled(s) && !s->jsx && s->token.val == '<') {
             /* async <T>(x: T) => x */
             ret = ts_is_generic_arrow(s);
             if (ret < 0)
@@ -32088,7 +32100,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                     goto var_error;
             }
 
-            if (s->ts) {
+            if (ts_enabled(s)) {
                 /* definite assignment assertion and type annotation */
                 if (s->token.val == '!' && !s->got_lf) {
                     if (next_token(s))
@@ -32181,18 +32193,18 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
             JS_FreeAtom(ctx, name);
         } else {
             int skip_bits, tok1;
-            if (s->ts && s->token.val == TOK_ENUM) {
+            if (ts_enabled(s) && s->token.val == TOK_ENUM) {
                 return js_parse_error(s, "TypeScript enums are not supported (not erasable syntax)");
             }
             if ((s->token.val == '[' || s->token.val == '{')
             &&  ((tok1 = js_parse_skip_parens_token(s, &skip_bits, false)) == '=' ||
-                 (s->ts && tok1 == ':'))) {
+                 (ts_enabled(s) && tok1 == ':'))) {
                 /* using declarations do not allow binding patterns */
                 if (tok == TOK_USING) {
                     return js_parse_error(s, "binding patterns are not allowed in using declarations");
                 }
                 emit_op(s, OP_undefined);
-                s->ts_annotation_allowed = s->ts;
+                s->ts_annotation_allowed = ts_enabled(s);
                 if (js_parse_destructuring_element(s, tok, false, true, skip_bits & SKIP_HAS_ELLIPSIS, true, export_flag) < 0)
                     return -1;
             } else {
@@ -32669,7 +32681,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         }
     }
 
-    if (s->ts) {
+    if (ts_enabled(s)) {
         /* type aliases, interfaces, ambient declarations, abstract classes */
         int ret = ts_parse_declaration(s, JS_PARSE_EXPORT_NONE);
         if (ret < 0)
@@ -33287,7 +33299,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                     if (!(s->token.val == TOK_IDENT && !s->token.u.ident.is_reserved)) {
                         if (s->token.val == '[' || s->token.val == '{') {
                             /* XXX: TOK_LET is not completely correct */
-                            s->ts_annotation_allowed = s->ts;
+                            s->ts_annotation_allowed = ts_enabled(s);
                             if (js_parse_destructuring_element(s, TOK_LET, false, true, -1, true, false) < 0)
                                 goto fail;
                         } else {
@@ -33297,7 +33309,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                     } else {
                         name = JS_DupAtom(ctx, s->token.u.ident.atom);
                         if (next_token(s)
-                        ||  (s->ts && ts_skip_type_annotation(s))
+                        ||  (ts_enabled(s) && ts_skip_type_annotation(s))
                         ||  js_define_var(s, name, TOK_CATCH) < 0) {
                             JS_FreeAtom(ctx, name);
                             goto fail;
@@ -33484,7 +33496,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 goto fail;
             }
         parse_func_var:
-            if (s->ts) {
+            if (ts_enabled(s)) {
                 /* overload signature: erased */
                 int ret = ts_skip_function_overload(s);
                 if (ret < 0)
@@ -36601,7 +36613,7 @@ static __exception int js_parse_export(JSParseState *s)
     if (next_token(s))
         return -1;
 
-    if (s->ts) {
+    if (ts_enabled(s)) {
         int ret = ts_parse_export_declaration(s);
         if (ret < 0)
             return -1;
@@ -36633,7 +36645,7 @@ static __exception int js_parse_export(JSParseState *s)
         first_export = m->export_entries_count;
         bool has_string_binding = false;
         while (s->token.val != '}') {
-            if (s->ts && ts_token_is(s, JS_ATOM_type)) {
+            if (ts_enabled(s) && ts_token_is(s, JS_ATOM_type)) {
                 /* export { type A, B }: type-only specifiers are erased */
                 int ret = ts_skip_type_specifier(s);
                 if (ret < 0)
@@ -36848,7 +36860,7 @@ static __exception int js_parse_import(JSParseState *s)
         return -1;
 
     first_import = m->import_entries_count;
-    if (s->ts && ts_token_is(s, JS_ATOM_type)) {
+    if (ts_enabled(s) && ts_token_is(s, JS_ATOM_type)) {
         /* import type ...: erased */
         int ret = ts_skip_type_only_import(s);
         if (ret < 0)
@@ -36888,7 +36900,7 @@ static __exception int js_parse_import(JSParseState *s)
             import_name = JS_ATOM_default;
             if (next_token(s))
                 goto fail;
-            if (s->ts && s->token.val == '=') {
+            if (ts_enabled(s) && s->token.val == '=') {
                 js_parse_error(s, "TypeScript import aliases (import x = ...) are not supported (not erasable syntax)");
                 goto fail;
             }
@@ -36926,7 +36938,7 @@ static __exception int js_parse_import(JSParseState *s)
                 return -1;
 
             while (s->token.val != '}') {
-                if (s->ts && ts_token_is(s, JS_ATOM_type)) {
+                if (ts_enabled(s) && ts_token_is(s, JS_ATOM_type)) {
                     /* import { type A, B }: type-only specifiers are erased */
                     int ret = ts_skip_type_specifier(s);
                     if (ret < 0)
@@ -37000,7 +37012,7 @@ static __exception int js_parse_source_element(JSParseState *s)
     if (s->token.val == TOK_FUNCTION ||
         (token_is_pseudo_keyword(s, JS_ATOM_async) &&
          peek_token(s, true) == TOK_FUNCTION)) {
-        if (s->ts) {
+        if (ts_enabled(s)) {
             /* overload signature: erased */
             int ret = ts_skip_function_overload(s);
             if (ret < 0)
@@ -41955,7 +41967,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             goto fail;
         fd->defined_arg_count = 1;
     } else if (func_type != JS_PARSE_FUNC_CLASS_STATIC_INIT) {
-        if (s->ts && s->token.val == '<') {
+        if (ts_enabled(s) && s->token.val == '<') {
             /* type parameters */
             if (ts_skip_type_params(s))
                 goto fail;
@@ -41985,7 +41997,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
             bool rest = false;
             int idx, has_initializer;
 
-            if (s->ts) {
+            if (ts_enabled(s)) {
                 /* `this: T` pseudo parameter: erased */
                 if (s->token.val == TOK_THIS) {
                     if (next_token(s))
@@ -42028,7 +42040,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     emit_op(s, OP_get_arg);
                     emit_u16(s, idx);
                 }
-                s->ts_annotation_allowed = s->ts;
+                s->ts_annotation_allowed = ts_enabled(s);
                 has_initializer = js_parse_destructuring_element(s, fd->has_parameter_expressions ? TOK_LET : TOK_VAR, true, true, -1, true, false);
                 if (has_initializer < 0)
                     goto fail;
@@ -42058,7 +42070,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                     goto fail;
                 if (next_token(s))
                     goto fail;
-                if (s->ts) {
+                if (ts_enabled(s)) {
                     /* optional parameter marker and type annotation */
                     if (s->token.val == '?') {
                         if (next_token(s))
@@ -42179,7 +42191,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     if (next_token(s))
         goto fail;
 
-    if (s->ts && func_type != JS_PARSE_FUNC_CLASS_STATIC_INIT) {
+    if (ts_enabled(s) && func_type != JS_PARSE_FUNC_CLASS_STATIC_INIT) {
         /* return type annotation */
         if (ts_skip_type_annotation(s))
             goto fail;
@@ -42667,6 +42679,11 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (s->jsx) {
         js_parse_error(s, "JSX is not supported yet");
         err = -1;
+#ifdef QJS_DISABLE_TYPESCRIPT
+    } else if (s->ts) {
+        js_parse_error(s, "TypeScript is not supported in this build");
+        err = -1;
+#endif
     } else {
         err = js_parse_program(s);
     }

@@ -158,6 +158,7 @@ if qjs_libc
 endif
 
 qjs_parser = get_option('parser')
+qjs_typescript = get_option('typescript')
 
 qjs_c_args = ['-D_GNU_SOURCE']
 
@@ -167,6 +168,10 @@ endif
 
 if not qjs_parser
   qjs_c_args += ['-DQJS_DISABLE_PARSER']
+endif
+
+if not qjs_typescript
+  qjs_c_args += ['-DQJS_DISABLE_TYPESCRIPT']
 endif
 
 qjs_lib = library(

@@ -55,6 +55,7 @@ jobs:
           - { os: ubuntu-latest, configType: Release, runTest262: true }
           - { os: ubuntu-latest, configType: examples }
           - { os: ubuntu-latest, configType: shared }
+          - { os: ubuntu-latest, configType: no-typescript }
           - { os: ubuntu-latest, configType: asan+ubsan, runTest262: true }
           - { os: ubuntu-latest, configType: msan }
           - { os: ubuntu-latest, configType: tcc }
@@ -110,6 +111,8 @@ jobs:
             echo "QJS_BUILD_EXAMPLES=ON" >> $GITHUB_ENV;
           elif [ "${{ matrix.config.configType }}" = "shared" ]; then
             echo "BUILD_SHARED_LIBS=ON" >> $GITHUB_ENV;
+          elif [ "${{ matrix.config.configType }}" = "no-typescript" ]; then
+            echo "QJS_DISABLE_TYPESCRIPT=ON" >> $GITHUB_ENV;
           elif [ "${{ matrix.config.configType }}" = "asan+ubsan" ]; then
             echo "BUILD_TYPE=RelWithDebInfo" >> $GITHUB_ENV;
             echo "QJS_ENABLE_ASAN=ON" >> $GITHUB_ENV;
@@ -126,6 +129,7 @@ jobs:
             BUILD_TYPE=$BUILD_TYPE \
             QJS_BUILD_EXAMPLES=$QJS_BUILD_EXAMPLES \
             BUILD_SHARED_LIBS=$BUILD_SHARED_LIBS \
+            QJS_DISABLE_TYPESCRIPT=$QJS_DISABLE_TYPESCRIPT \
             QJS_ENABLE_ASAN=$QJS_ENABLE_ASAN \
             QJS_ENABLE_UBSAN=$QJS_ENABLE_UBSAN \
             QJS_ENABLE_MSAN=$QJS_ENABLE_MSAN
