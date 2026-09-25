@@ -51778,6 +51778,19 @@ static int string_cmp(JSString *p1, JSString *p2, int x1, int x2, int len)
     return 0;
 }
 
+/* true if the 'len' characters of 'p1' at 'x1' are those of 'p2' at 'x2' */
+static bool string_equal_range(JSString *p1, int x1, JSString *p2, int x2,
+                               int len)
+{
+    if (p1->is_wide_char == p2->is_wide_char) {
+        if (p1->is_wide_char)
+            return !memcmp(str16(p1) + x1, str16(p2) + x2, len * 2);
+        else
+            return !memcmp(str8(p1) + x1, str8(p2) + x2, len);
+    }
+    return !string_cmp(p1, p2, x1, x2, len);
+}
+
 static int string_indexof_char(JSString *p, int c, int from)
 {
     /* assuming 0 <= from <= p->len */
@@ -51788,11 +51801,10 @@ static int string_indexof_char(JSString *p, int c, int from)
                 return i;
         }
     } else {
-        if ((c & ~0xff) == 0) {
-            for (i = from; i < len; i++) {
-                if (str8(p)[i] == (uint8_t)c)
-                    return i;
-            }
+        if ((c & ~0xff) == 0 && from < len) {
+            const uint8_t *q = memchr(str8(p) + from, c, len - from);
+            if (q)
+                return q - str8(p);
         }
     }
     return -1;
@@ -51808,7 +51820,7 @@ static int string_indexof(JSString *p1, JSString *p2, int from)
         j = string_indexof_char(p1, c, i);
         if (j < 0 || j + len2 > len1)
             break;
-        if (!string_cmp(p1, p2, j + 1, 1, len2 - 1))
+        if (string_equal_range(p1, j + 1, p2, 1, len2 - 1))
             return j;
     }
     return -1;
@@ -51947,13 +51959,22 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
     }
     ret = -1;
     if (len >= v_len && inc * (stop - start) >= 0) {
-        for (i = start;; i += inc) {
-            if (!string_cmp(p, p1, i, 0, v_len)) {
-                ret = i;
-                break;
+        if (inc > 0) {
+            /* skip to the occurrences of the first character */
+            ret = string_indexof(p, p1, start);
+        } else if (v_len == 0) {
+            ret = start;
+        } else {
+            int c = string_get(p1, 0);
+            for (i = start;; i += inc) {
+                if (string_get(p, i) == c &&
+                    string_equal_range(p, i + 1, p1, 1, v_len - 1)) {
+                    ret = i;
+                    break;
+                }
+                if (i == stop)
+                    break;
             }
-            if (i == stop)
-                break;
         }
     }
     JS_FreeValue(ctx, str);

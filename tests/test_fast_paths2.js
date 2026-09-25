@@ -3,7 +3,8 @@
 // cache, arrays made fast again when they become dense, comparisons
 // fused with the conditional jump which follows them, 'x | 0', the
 // elements of typed arrays read inline, Function.prototype.apply() on
-// arrays and arguments objects, regexps starting with a character, ...
+// arrays and arguments objects, regexps starting with a character, the
+// string searches, ...
 import * as std from "qjs:std";
 import { assert, assertThrows } from "./assert.js";
 
@@ -493,4 +494,46 @@ function test_regexp_first_char()
 }
 
 test_apply();
+function test_string_search()
+{
+    // reference implementations, character by character
+    const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
+    const toint = x => { x = Number(x); return x !== x ? 0 : Math.trunc(x); };
+    const ref_index = (s, p, pos) => {
+        const start = clamp(toint(pos), 0, s.length);
+        for (let i = start; i + p.length <= s.length; i++) {
+            if (s.substring(i, i + p.length) === p)
+                return i;
+        }
+        return -1;
+    };
+    const ref_last = (s, p, pos) => {
+        let n = Number(pos);
+        const start = clamp(n !== n ? Infinity : toint(n), 0, s.length);
+        for (let i = Math.min(start, s.length - p.length); i >= 0; i--) {
+            if (s.substring(i, i + p.length) === p)
+                return i;
+        }
+        return -1;
+    };
+    const s8 = "abcabcabd" + "x".repeat(50) + "needle";
+    const s16 = "\u03b1\u03b2\u03b3\u03b1\u03b2\u03b3\u03b1\u03b2\u03b4" + "x".repeat(50) + "needle\u20ac";
+    const pats = ["", "a", "abd", "abc", "needle", "x", "needle\u20ac", "\u20ac",
+                  "\u03b1\u03b2\u03b4", "q", s8, s8 + "a", "ab", "\u0101", "e"];
+    for (const s of [s8, s16, "", "a", "\u0101b"]) {
+        for (const p of pats) {
+            for (const pos of [undefined, -5, 0, 1, 3, 7, 60, 1e9, NaN, 2.5]) {
+                assert(s.indexOf(p, pos), ref_index(s, p, pos));
+                assert(s.lastIndexOf(p, pos), ref_last(s, p, pos));
+                assert(s.includes(p, pos), ref_index(s, p, pos) >= 0);
+            }
+        }
+    }
+    assert("aXbXc".split("X").join("|"), "a|b|c");
+    assert("a-b-a".replaceAll("a", "!"), "!-b-!");
+    assert("xyz".indexOf("z", 3), -1);
+    assert("xyz".lastIndexOf("", 1), 1);
+}
+
 test_regexp_first_char();
+test_string_search();
