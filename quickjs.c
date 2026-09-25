@@ -21621,8 +21621,80 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             OP_EQ(OP_eq, 0);
             OP_EQ(OP_neq, 1);
 #undef OP_EQ
-            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
+            /* strict equality: the numbers as OP_CMP. The values of
+               the other types which are not strings are equal if they
+               have the same tag and payload, and two strings are equal
+               if they are the same string or, when they are two
+               distinct atoms, different. Values of different types
+               among those are never equal. */
+#define JS_SEQ_TAG_MASK ((1 << (JS_TAG_OBJECT - JS_TAG_FIRST)) |        \
+                         (1 << (JS_TAG_SYMBOL - JS_TAG_FIRST)) |        \
+                         (1 << (JS_TAG_STRING - JS_TAG_FIRST)) |        \
+                         (1 << (JS_TAG_NULL - JS_TAG_FIRST)) |          \
+                         (1 << (JS_TAG_UNDEFINED - JS_TAG_FIRST)) |     \
+                         (1 << (JS_TAG_BOOL - JS_TAG_FIRST)))
+#define JS_SEQ_TAG_OK(tag) ((unsigned)((tag) - JS_TAG_FIRST) < 32 &&    \
+                            ((JS_SEQ_TAG_MASK >> ((tag) - JS_TAG_FIRST)) & 1))
+#define OP_SEQ(opcode, is_neq)                                          \
+            CASE(opcode):                                               \
+                {                                                       \
+                JSValue op1, op2;                                       \
+                uint32_t tag1, tag2;                                    \
+                double d1, d2;                                          \
+                bool res;                                               \
+                op1 = sp[-2];                                           \
+                op2 = sp[-1];                                           \
+                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
+                    res = JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2); \
+                } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {          \
+                    res = JS_VALUE_GET_FLOAT64(op1) == JS_VALUE_GET_FLOAT64(op2); \
+                } else if ((JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) || \
+                            JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) && \
+                           js_arith_to_float64(op1, &d1) &&             \
+                           js_arith_to_float64(op2, &d2)) {             \
+                    res = d1 == d2;                                     \
+                } else {                                                \
+                    tag1 = JS_VALUE_GET_NORM_TAG(op1);                  \
+                    tag2 = JS_VALUE_GET_NORM_TAG(op2);                  \
+                    if (!JS_SEQ_TAG_OK(tag1) || !JS_SEQ_TAG_OK(tag2))   \
+                        goto opcode ## _slow;                           \
+                    if (tag1 != tag2) {                                 \
+                        res = false;                                    \
+                    } else if (tag1 == JS_TAG_STRING) {                 \
+                        JSString *p1 = JS_VALUE_GET_STRING(op1);        \
+                        JSString *p2 = JS_VALUE_GET_STRING(op2);        \
+                        if (p1 == p2) {                                 \
+                            res = true;                                 \
+                        } else if (p1->atom_type == JS_ATOM_TYPE_STRING && \
+                                   p2->atom_type == JS_ATOM_TYPE_STRING) { \
+                            res = false;                                \
+                        } else {                                        \
+                            goto opcode ## _slow;                       \
+                        }                                               \
+                    } else if (tag1 == JS_TAG_BOOL) {                   \
+                        res = JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2); \
+                    } else if (tag1 == JS_TAG_OBJECT || tag1 == JS_TAG_SYMBOL) { \
+                        res = JS_VALUE_GET_PTR(op1) == JS_VALUE_GET_PTR(op2); \
+                    } else {                                            \
+                        res = true; /* null or undefined */             \
+                    }                                                   \
+                    sp[-2] = js_bool(res ^ is_neq);                     \
+                    sp--;                                               \
+                    JS_FreeValue(ctx, op1);                             \
+                    JS_FreeValue(ctx, op2);                             \
+                    BREAK;                                              \
+                opcode ## _slow:                                        \
+                    js_strict_eq_slow(ctx, sp, is_neq);                 \
+                    sp--;                                               \
+                    BREAK;                                              \
+                }                                                       \
+                sp[-2] = js_bool(res ^ is_neq);                         \
+                sp--;                                                   \
+                }                                                       \
+            BREAK
+            OP_SEQ(OP_strict_eq, 0);
+            OP_SEQ(OP_strict_neq, 1);
+#undef OP_SEQ
 
         CASE(OP_in):
             sf->cur_pc = pc;
