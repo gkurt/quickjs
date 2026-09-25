@@ -1,6 +1,7 @@
 // Fast paths of the interpreter and the runtime which must keep the
 // generic semantics: the computed property store, the global variable
-// cache, arrays made fast again when they become dense, ...
+// cache, arrays made fast again when they become dense, comparisons
+// fused with the conditional jump which follows them, ...
 import * as std from "qjs:std";
 import { assert, assertThrows } from "./assert.js";
 
@@ -290,6 +291,50 @@ function test_array_dense_again()
     assert(a.sort().slice(0, 3).join(), "s0,s1,s10");
 }
 
+function test_compare_branch()
+{
+    const values = [0, -0, 1, -1, 2.5, NaN, Infinity, -Infinity, 1e300,
+                    "1", "a", "", null, undefined, true, false, {}, [],
+                    [1], 10n, Symbol.iterator];
+    const ops = ["<", "<=", ">", ">=", "==", "!=", "===", "!=="];
+    for (const op of ops) {
+        // the comparison as a value and as the condition of a jump,
+        // taken and not taken, in both polarities
+        const value = Function("a", "b", "return a " + op + " b;");
+        const cond = Function("a", "b", "if (a " + op + " b) return 1; else return 0;");
+        const not = Function("a", "b", "if (!(a " + op + " b)) return 0; return 1;");
+        const loop = Function("a", "b", "var n = 0; while (a " + op + " b && n < 3) n++; return n;");
+        for (const a of values) {
+            for (const b of values) {
+                let v;
+                try {
+                    v = value(a, b);
+                } catch (e) {
+                    assertThrows(TypeError, () => cond(a, b));
+                    continue;
+                }
+                assert(cond(a, b), v ? 1 : 0);
+                assert(not(a, b), v ? 1 : 0);
+                assert(loop(a, b), v ? 3 : 0);
+            }
+        }
+    }
+    // a loop counting down with a comparison jumping backward
+    let n = 0, i = 10;
+    do { n++; } while (--i > 0);
+    assert(n, 10);
+    // the objects compared are released
+    const o = {};
+    let hits = 0;
+    for (let k = 0; k < 100; k++) {
+        if ({} == o) hits++;
+        if (o === o) hits++;
+        if ("a" + k === "a" + k) hits++;
+    }
+    assert(hits, 200);
+}
+
 test_computed_store_order();
 test_global_var_cache();
 test_array_dense_again();
+test_compare_branch();

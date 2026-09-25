@@ -21778,6 +21778,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
+/* Push the result 'res' of a comparison whose operands were popped.
+   When the next opcode is a conditional jump, as in most comparisons,
+   it is executed as well without pushing the boolean and dispatching
+   it. */
+#define CMP_RESULT_POPPED(res)                                          \
+            do {                                                        \
+                if (*pc == OP_if_false8 || *pc == OP_if_true8) {        \
+                    if ((res) ^ (*pc == OP_if_false8)) {                \
+                        int32_t diff_ = (int8_t)pc[1] - 1;              \
+                        pc += 2 + diff_;                                \
+                        if (diff_ < 0 && unlikely(js_poll_interrupts(ctx))) \
+                            goto exception;                             \
+                    } else {                                            \
+                        pc += 2;                                        \
+                    }                                                   \
+                } else {                                                \
+                    *sp++ = js_bool(res);                               \
+                }                                                       \
+            } while (0)
+/* the same for the two operands on the stack, which need no release */
+#define CMP_RESULT(res)                                                 \
+            do {                                                        \
+                sp -= 2;                                                \
+                CMP_RESULT_POPPED(res);                                 \
+            } while (0)
+
 /* Comparisons: ints are the common case. Doubles, and an int against a
    double, are compared directly as well: for numbers the C comparison
    has the JS semantics (NaN compares false, +0 equals -0), for every
@@ -21791,17 +21817,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 op1 = sp[-2];                             \
                 op2 = sp[-1];                                   \
                 if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
-                    sp[-2] = js_bool(JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
-                    sp--;                                               \
+                    CMP_RESULT(JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
                 } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {          \
-                    sp[-2] = js_bool(JS_VALUE_GET_FLOAT64(op1) binary_op JS_VALUE_GET_FLOAT64(op2)); \
-                    sp--;                                               \
+                    CMP_RESULT(JS_VALUE_GET_FLOAT64(op1) binary_op JS_VALUE_GET_FLOAT64(op2)); \
                 } else if ((JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) ||  \
                             JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) && \
                            js_arith_to_float64(op1, &d1) &&             \
                            js_arith_to_float64(op2, &d2)) {             \
-                    sp[-2] = js_bool(d1 binary_op d2);                  \
-                    sp--;                                               \
+                    CMP_RESULT(d1 binary_op d2);                        \
                 } else {                                                \
                     sf->cur_pc = pc;                                    \
                     if (slow_call)                                      \
@@ -21858,14 +21881,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp--;                                           \
                         BREAK;                                          \
                     }                                                   \
-                    sp[-2] = js_bool(res ^ is_neq);                     \
-                    sp--;                                               \
+                    sp -= 2;                                            \
                     JS_FreeValue(ctx, op1);                             \
                     JS_FreeValue(ctx, op2);                             \
+                    CMP_RESULT_POPPED(res ^ is_neq);                    \
                     BREAK;                                              \
                 }                                                       \
-                sp[-2] = js_bool(res ^ is_neq);                         \
-                sp--;                                                   \
+                CMP_RESULT(res ^ is_neq);                               \
                 }                                                       \
             BREAK
             OP_EQ(OP_eq, 0);
@@ -21928,23 +21950,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     } else {                                            \
                         res = true; /* null or undefined */             \
                     }                                                   \
-                    sp[-2] = js_bool(res ^ is_neq);                     \
-                    sp--;                                               \
+                    sp -= 2;                                            \
                     JS_FreeValue(ctx, op1);                             \
                     JS_FreeValue(ctx, op2);                             \
+                    CMP_RESULT_POPPED(res ^ is_neq);                    \
                     BREAK;                                              \
                 opcode ## _slow:                                        \
                     js_strict_eq_slow(ctx, sp, is_neq);                 \
                     sp--;                                               \
                     BREAK;                                              \
                 }                                                       \
-                sp[-2] = js_bool(res ^ is_neq);                         \
-                sp--;                                                   \
+                CMP_RESULT(res ^ is_neq);                               \
                 }                                                       \
             BREAK
             OP_SEQ(OP_strict_eq, 0);
             OP_SEQ(OP_strict_neq, 1);
 #undef OP_SEQ
+#undef CMP_RESULT
+#undef CMP_RESULT_POPPED
 
         CASE(OP_in):
             sf->cur_pc = pc;
