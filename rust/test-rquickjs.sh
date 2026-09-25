@@ -20,6 +20,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 WORK=${WORK:-$here/build}
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$here/rquickjs-sys/Cargo.toml" | head -n 1)
 upstream=$WORK/rquickjs-$version
+# the path cargo reads in their Cargo.toml: Git Bash on Windows hands out
+# /d/a/... paths, which cargo would read as D:\d\a\...
+sys_path=$here/rquickjs-sys
+if command -v cygpath >/dev/null 2>&1; then
+    sys_path=$(cygpath -m "$sys_path")
+fi
 
 if [ ! -d "$upstream/.git" ]; then
     rm -rf "$upstream"
@@ -33,10 +39,10 @@ git checkout -q -- Cargo.toml
 # from the members and point the dependency at this repository's crate
 sed -i.bak \
     -e '/^members = \[/,/^\]/{/^  "sys",$/d;}' \
-    -e "s|^rquickjs-sys = { version = \"$version\", path = \"sys\"|rquickjs-sys = { version = \"$version\", path = \"$here/rquickjs-sys\"|" \
+    -e "s|^rquickjs-sys = { version = \"$version\", path = \"sys\"|rquickjs-sys = { version = \"$version\", path = \"$sys_path\"|" \
     Cargo.toml
 rm -f Cargo.toml.bak
-grep -q "path = \"$here/rquickjs-sys\"" Cargo.toml || {
+grep -q "path = \"$sys_path\"" Cargo.toml || {
     echo "could not point the rquickjs workspace at rust/rquickjs-sys" >&2
     exit 1
 }
