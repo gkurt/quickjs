@@ -10723,6 +10723,43 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
     }
 }
 
+/* Read the element 'idx' < p->u.array.count of the typed array 'p' of
+   numbers. The bigint arrays, which
+   allocate their values, are left to js_get_fast_array_element() */
+static force_inline bool js_typed_array_get_fast(JSObject *p, uint32_t idx,
+                                                 JSValue *pval)
+{
+    switch(p->class_id) {
+    case JS_CLASS_INT8_ARRAY:
+        *pval = js_int32(p->u.array.u.int8_ptr[idx]);
+        return true;
+    case JS_CLASS_UINT8C_ARRAY:
+    case JS_CLASS_UINT8_ARRAY:
+        *pval = js_int32(p->u.array.u.uint8_ptr[idx]);
+        return true;
+    case JS_CLASS_INT16_ARRAY:
+        *pval = js_int32(p->u.array.u.int16_ptr[idx]);
+        return true;
+    case JS_CLASS_UINT16_ARRAY:
+        *pval = js_int32(p->u.array.u.uint16_ptr[idx]);
+        return true;
+    case JS_CLASS_INT32_ARRAY:
+        *pval = js_int32(p->u.array.u.int32_ptr[idx]);
+        return true;
+    case JS_CLASS_UINT32_ARRAY:
+        *pval = js_uint32(p->u.array.u.uint32_ptr[idx]);
+        return true;
+    case JS_CLASS_FLOAT32_ARRAY:
+        *pval = js_float64(p->u.array.u.float_ptr[idx]);
+        return true;
+    case JS_CLASS_FLOAT64_ARRAY:
+        *pval = js_float64(p->u.array.u.double_ptr[idx]);
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* Store the number 'val' at the index 'idx' < p->u.array.count of the
    typed array 'p' when no conversion that could call user code is needed.
    Return false if the generic JS_SetPropertyValue() must be used */
@@ -21051,6 +21088,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp--;
                         BREAK;
                     }
+                    /* the typed arrays of numbers inline: their
+                       elements need no release */
+                    if (p->fast_array && idx < p->u.array.count &&
+                        js_typed_array_get_fast(p, idx, &val)) {
+                        JS_FreeValue(ctx, sp[-2]);
+                        sp[-2] = val;
+                        sp--;
+                        BREAK;
+                    }
                     if (js_get_fast_array_element(ctx, p, idx, &val)) {
                         JS_FreeValue(ctx, sp[-2]);
                         sp[-2] = val;
@@ -21080,6 +21126,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
                         sp[-1] = js_dup(p->u.array.u.values[idx]);
+                        BREAK;
+                    }
+                    if (p->fast_array && idx < p->u.array.count &&
+                        js_typed_array_get_fast(p, idx, &val)) {
+                        sp[-1] = val;
                         BREAK;
                     }
                     if (js_get_fast_array_element(ctx, p, idx, &val)) {

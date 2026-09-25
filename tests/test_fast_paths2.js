@@ -1,7 +1,8 @@
 // Fast paths of the interpreter and the runtime which must keep the
 // generic semantics: the computed property store, the global variable
 // cache, arrays made fast again when they become dense, comparisons
-// fused with the conditional jump which follows them, 'x | 0', ...
+// fused with the conditional jump which follows them, 'x | 0', the
+// elements of typed arrays read inline, ...
 import * as std from "qjs:std";
 import { assert, assertThrows } from "./assert.js";
 
@@ -374,4 +375,41 @@ function test_or_zero()
 }
 
 test_compare_branch();
+function test_typed_array_read()
+{
+    const types = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array,
+                   Uint16Array, Int32Array, Uint32Array, Float32Array,
+                   Float64Array, BigInt64Array, BigUint64Array];
+    const src = [0, 1, -1, 127, 128, 255, 256, 65535, 2 ** 31, -(2 ** 31), 1.5, -2.5];
+    for (const T of types) {
+        const big = T === BigInt64Array || T === BigUint64Array;
+        const a = new T(src.length);
+        for (let i = 0; i < src.length; i++)
+            a[i] = big ? BigInt(Math.trunc(src[i])) : src[i];
+        const read = (t, i) => t[i];
+        let out = [];
+        for (let i = 0; i < src.length; i++)
+            out.push(read(a, i));
+        assert(out.join(), Array.from(a).join());
+        assert(read(a, src.length), undefined);
+        assert(read(a, -1), undefined);
+        assert(read(a, 1.5), undefined);
+        // detached buffer: no element
+        const b = new T(new ArrayBuffer(8 * T.BYTES_PER_ELEMENT));
+        assert(read(b, 0), big ? 0n : 0);
+        b.buffer.transfer();
+        assert(read(b, 0), undefined);
+    }
+    // a resizable buffer shrinking under the view
+    const rab = new ArrayBuffer(16, { maxByteLength: 32 });
+    const u8 = new Uint8Array(rab);
+    u8[15] = 7;
+    const read = (t, i) => t[i];
+    assert(read(u8, 15), 7);
+    rab.resize(8);
+    assert(read(u8, 15), undefined);
+    assert(u8.length, 8);
+}
+
 test_or_zero();
+test_typed_array_read();
