@@ -4,7 +4,7 @@
 // fused with the conditional jump which follows them, 'x | 0', the
 // elements of typed arrays read inline, Function.prototype.apply() on
 // arrays and arguments objects, regexps starting with a character, the
-// string searches, ...
+// string searches, the appends to a local string, ...
 import * as std from "qjs:std";
 import { assert, assertThrows } from "./assert.js";
 
@@ -536,4 +536,52 @@ function test_string_search()
 }
 
 test_regexp_first_char();
+function test_string_append()
+{
+    let s = "";
+    const kept = [];
+    for (let i = 0; i < 300; i++) {
+        s += "ab";
+        if (i % 50 == 0)
+            kept.push(s);       // shared: the next append must copy
+    }
+    assert(s.length, 600);
+    assert(kept.map(x => x.length).join(), "2,102,202,302,402,502");
+    assert(kept[1], "ab".repeat(51));
+    // 8 bit then 16 bit characters, numbers and objects
+    let w = "x";
+    for (let i = 0; i < 100; i++)
+        w += i % 10 == 0 ? "\u20ac" : i;
+    assert(w.length, 1 + 10 + 9 + 81 * 2);
+    assert(w.slice(0, 4), "x\u20ac12");
+    let o = "";
+    o += { toString() { return "obj"; } };
+    o += null;
+    o += undefined;
+    o += 1.5;
+    assert(o, "objnullundefined1.5");
+    // a string used as a key, then appended to
+    let k = "key";
+    const obj = {};
+    obj[k] = 1;
+    k += "2";
+    obj[k] = 2;
+    assert(Object.keys(obj).join(), "key,key2");
+    assert(obj.key, 1);
+    // a slice of a long string, then appended to
+    const long = "y".repeat(2000);
+    let sl = long.substring(1, 1500);
+    sl += "z";
+    assert(sl.length, 1500);
+    assert(long.length, 2000);
+    assert(long.indexOf("z"), -1);
+    // long strings go to ropes
+    let r = "";
+    for (let i = 0; i < 5000; i++)
+        r += "0123456789";
+    assert(r.length, 50000);
+    assert(r.slice(49990), "0123456789");
+}
+
 test_string_search();
+test_string_append();

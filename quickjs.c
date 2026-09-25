@@ -5581,6 +5581,59 @@ static JSValue JS_ConcatString1(JSContext *ctx, JSString *p1, JSString *p2)
     return JS_MKPTR(JS_TAG_STRING, p);
 }
 
+/* Append 'p2' to 'p1' in the free space of its allocation if 'p1' may
+   be modified: owned by the caller only, a plain string (not an atom,
+   not the slice of another string) of the same width. Return true if
+   done. */
+static bool js_string_append_in_place(JSContext *ctx, JSString *p1,
+                                      JSString *p2)
+{
+    if (JS_REF_COUNT(p1) != 1 || p1->is_wide_char != p2->is_wide_char ||
+        p1->kind != JS_STRING_KIND_NORMAL || p1->atom_type != 0 ||
+        js_malloc_usable_size(ctx, p1) < sizeof(*p1) +
+        ((p1->len + p2->len) << p2->is_wide_char) + 1 - p1->is_wide_char)
+        return false;
+    if (p1->is_wide_char) {
+        memcpy(str16(p1) + p1->len, str16(p2), p2->len << 1);
+        p1->len += p2->len;
+    } else {
+        memcpy(str8(p1) + p1->len, str8(p2), p2->len);
+        p1->len += p2->len;
+        str8(p1)[p1->len] = '\0';
+    }
+    return true;
+}
+
+/* 'p1' + 'p2' in a new string with room for 50% more characters, for
+   'p1' being a string built by appending to it: the next appends can
+   be done in place */
+static JSValue js_string_append_grow(JSContext *ctx, JSString *p1,
+                                     JSString *p2)
+{
+    JSString *p;
+    uint32_t len, size;
+    int is_wide_char;
+
+    len = p1->len + p2->len;
+    if (len > JS_STRING_LEN_MAX)
+        return JS_ThrowRangeError(ctx, "invalid string length");
+    size = min_uint32(len + len / 2 + 16, JS_STRING_LEN_MAX);
+    is_wide_char = p1->is_wide_char | p2->is_wide_char;
+    p = js_alloc_string(ctx, size, is_wide_char);
+    if (!p)
+        return JS_EXCEPTION;
+    p->len = len;
+    if (!is_wide_char) {
+        memcpy(str8(p), str8(p1), p1->len);
+        memcpy(str8(p) + p1->len, str8(p2), p2->len);
+        str8(p)[len] = '\0';
+    } else {
+        copy_str16(str16(p), p1, 0, p1->len);
+        copy_str16(str16(p) + p1->len, p2, 0, p2->len);
+    }
+    return JS_MKPTR(JS_TAG_STRING, p);
+}
+
 /* flat string concatenation - op1 and op2 must be JS_TAG_STRING */
 static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
 {
@@ -5594,17 +5647,8 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
     if (p2->len == 0) {
         goto ret_op1;
     }
-    if (JS_REF_COUNT(p1) == 1 && p1->is_wide_char == p2->is_wide_char
-    &&  js_malloc_usable_size(ctx, p1) >= sizeof(*p1) + ((p1->len + p2->len) << p2->is_wide_char) + 1 - p1->is_wide_char) {
-        /* Concatenate in place in available space at the end of p1 */
-        if (p1->is_wide_char) {
-            memcpy(str16(p1) + p1->len, str16(p2), p2->len << 1);
-            p1->len += p2->len;
-        } else {
-            memcpy(str8(p1) + p1->len, str8(p2), p2->len);
-            p1->len += p2->len;
-            str8(p1)[p1->len] = '\0';
-        }
+    /* Concatenate in place in available space at the end of p1 */
+    if (js_string_append_in_place(ctx, p1, p2)) {
     ret_op1:
         JS_FreeValue(ctx, op2);
         return op1;
@@ -21414,6 +21458,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
                     if (JS_IsException(op1))
                         goto exception;
+                    if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING &&
+                        JS_VALUE_GET_STRING(op1)->len <= JS_STRING_ROPE_SHORT_LEN &&
+                        JS_VALUE_GET_STRING(*pv)->len <= JS_STRING_ROPE_SHORT2_LEN) {
+                        /* 's += x' on a local string which only the
+                           local references: append in place, or into
+                           a string with room for the next appends */
+                        JSString *p1 = JS_VALUE_GET_STRING(*pv);
+                        JSString *p2 = JS_VALUE_GET_STRING(op1);
+                        if (js_string_append_in_place(ctx, p1, p2)) {
+                            JS_FreeValue(ctx, op1);
+                            BREAK;
+                        }
+                        if (JS_REF_COUNT(p1) == 1 && p2->len != 0 &&
+                            p1->kind == JS_STRING_KIND_NORMAL &&
+                            p2->kind == JS_STRING_KIND_NORMAL) {
+                            JSValue ret = js_string_append_grow(ctx, p1, p2);
+                            JS_FreeValue(ctx, op1);
+                            if (JS_IsException(ret))
+                                goto exception;
+                            set_value(ctx, pv, ret);
+                            BREAK;
+                        }
+                    }
                     op1 = JS_ConcatString(ctx, js_dup(*pv), op1);
                     if (JS_IsException(op1))
                         goto exception;
