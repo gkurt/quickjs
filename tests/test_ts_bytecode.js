@@ -1,3 +1,6 @@
+/*---
+features: [typescript]
+---*/
 // Bytecode oracle for TypeScript type erasure.
 //
 // For each NAME below, NAME.ts is compiled as TypeScript and

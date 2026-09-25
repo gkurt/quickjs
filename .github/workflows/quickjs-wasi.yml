@@ -1,0 +1,119 @@
+name: quickjs-wasi
+
+# Builds quickjs-wasi (https://github.com/vercel-labs/quickjs-wasi), the WASM
+# embedding used for the browser, Node.js and Bun, against this fork instead
+# of the quickjs-ng release it pins, and runs its test suite. It catches engine
+# changes that break the embedding: the C interface layer (c/interface.c), the
+# extensions, snapshots, bytecode, limits and interrupts.
+#
+# The engine is built with -O2 rather than the -Oz quickjs-wasi defaults to:
+# about 1.2x faster for about 90 KB more gzipped. The build without TypeScript
+# checks that QJS_DISABLE_TYPESCRIPT keeps the embedding working.
+#
+# quickjs-wasi is pinned so that a change on its side does not turn this red;
+# bump QUICKJS_WASI_SHA (and WASI_SDK_VERSION if its Makefile requires a newer
+# one) to follow it.
+
+on:
+  pull_request:
+    paths:
+      - '**.c'
+      - '**.h'
+      - '.github/workflows/quickjs-wasi.yml'
+  push:
+    branches:
+      - next
+    paths:
+      - '**.c'
+      - '**.h'
+      - '.github/workflows/quickjs-wasi.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quickjs-wasi-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QUICKJS_WASI_REPOSITORY: vercel-labs/quickjs-wasi
+  # v3.6.2
+  QUICKJS_WASI_SHA: 5a7a0eeda87c99542f8cf3095b6d61ecfa755977
+  WASI_SDK_VERSION: '32'
+  OPT: -O2
+
+jobs:
+  quickjs-wasi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: quickjs-wasi (${{ matrix.typescript && 'typescript' || 'no typescript' }})
+    strategy:
+      fail-fast: false
+      matrix:
+        typescript: [true, false]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: quickjs
+
+      # its quickjs-ng submodule is not needed: the engine comes from this
+      # repository (the extensions' dependencies are vendored)
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.QUICKJS_WASI_REPOSITORY }}
+          ref: ${{ env.QUICKJS_WASI_SHA }}
+          path: quickjs-wasi
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: install wasi-sdk
+        run: |
+          mkdir -p "$RUNNER_TEMP/wasi-sdk"
+          curl -fsSL "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$WASI_SDK_VERSION/wasi-sdk-$WASI_SDK_VERSION.0-x86_64-linux.tar.gz" |
+            tar xz -C "$RUNNER_TEMP/wasi-sdk" --strip-components=1
+          echo "WASI_SDK=$RUNNER_TEMP/wasi-sdk" >> "$GITHUB_ENV"
+
+      - name: install dependencies
+        working-directory: quickjs-wasi
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: build
+        working-directory: quickjs-wasi
+        run: |
+          # the Makefile has no hook for extra defines, so they ride on CC
+          cc="$WASI_SDK/bin/clang"
+          if [ "${{ matrix.typescript }}" = "false" ]; then
+            cc="$cc -DQJS_DISABLE_TYPESCRIPT"
+          fi
+          make -j "$(nproc)" WASI_SDK="$WASI_SDK" QJS_DIR="$GITHUB_WORKSPACE/quickjs" OPT="$OPT" CC="$cc"
+          pnpm run build:ts
+
+      - name: test
+        working-directory: quickjs-wasi
+        run: |
+          pnpm exec vitest run
+
+      - name: sizes
+        working-directory: quickjs-wasi
+        run: |
+          {
+            echo "### quickjs-wasi ($OPT, typescript: ${{ matrix.typescript }})"
+            echo
+            echo "| file | bytes | gzip -9 |"
+            echo "|---|---:|---:|"
+            for f in quickjs.wasm extensions/*/*.so; do
+              echo "| $f | $(wc -c < "$f") | $(gzip -9c "$f" | wc -c) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: quickjs-wasi-${{ matrix.typescript && 'typescript' || 'no-typescript' }}
+          path: |
+            quickjs-wasi/quickjs.wasm
+            quickjs-wasi/extensions/*/*.so
