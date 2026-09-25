@@ -10565,6 +10565,16 @@ static JSAtom JS_ValueToAtomInternal(JSContext *ctx, JSValueConst val,
     } else if (tag == JS_TAG_SYMBOL) {
         JSAtomStruct *p = JS_VALUE_GET_PTR(val);
         atom = JS_DupAtom(ctx, js_get_atom_index(ctx->rt, p));
+    } else if (tag == JS_TAG_STRING &&
+               JS_VALUE_GET_STRING(val)->atom_type == JS_ATOM_TYPE_STRING &&
+               !(JS_VALUE_GET_STRING(val)->len != 0 &&
+                 is_digit(string_get(JS_VALUE_GET_STRING(val), 0)))) {
+        /* the string is an atom (a property name from a literal, for-in,
+           Object.keys()...): find its index without hashing it again.
+           The strings which may be integer indexes are left to the
+           generic path */
+        JSAtomStruct *p = JS_VALUE_GET_STRING(val);
+        atom = JS_DupAtom(ctx, js_get_atom_index(ctx->rt, p));
     } else {
         JSValue str;
         str = JS_ToPropertyKeyInternal(ctx, val, flags);
