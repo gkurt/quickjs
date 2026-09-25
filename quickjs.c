@@ -9006,7 +9006,18 @@ static int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
     /* Only explicitly boxed values are instances of constructors */
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
         return false;
-    obj_proto = JS_GetProperty(ctx, obj, JS_ATOM_prototype);
+    /* 'prototype' is usually an own data property of the function:
+       read it from its slot rather than through the generic lookup */
+    obj_proto = JS_UNINITIALIZED;
+    if (likely(!p->is_exotic)) {
+        JSShapeProperty *prs;
+        JSProperty *pr;
+        prs = find_own_property(&pr, (JSObject *)p, JS_ATOM_prototype);
+        if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)
+            obj_proto = js_dup(pr->u.value);
+    }
+    if (JS_IsUninitialized(obj_proto))
+        obj_proto = JS_GetProperty(ctx, obj, JS_ATOM_prototype);
     if (JS_VALUE_GET_TAG(obj_proto) != JS_TAG_OBJECT) {
         if (!JS_IsException(obj_proto))
             JS_ThrowTypeError(ctx, "operand 'prototype' property is not an object");
@@ -9067,6 +9078,29 @@ int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj)
 
     if (!JS_IsObject(obj))
         goto fail;
+    /* fast path: Function.prototype[Symbol.hasInstance] is not writable
+       nor configurable, so if no object before Function.prototype in
+       the prototype chain of 'obj' has the property, the method is the
+       builtin one, which does OrdinaryHasInstance() */
+    if (JS_VALUE_GET_TAG(ctx->function_proto) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(obj);
+        JSObject *fproto = JS_VALUE_GET_OBJ(ctx->function_proto);
+        JSProperty *pr;
+        int depth;
+        for (depth = 0; depth < 8; depth++) {
+            if (p == fproto) {
+                if (!JS_IsFunction(ctx, obj))
+                    break;
+                return JS_OrdinaryIsInstanceOf(ctx, val, obj);
+            }
+            if (p->is_exotic ||
+                find_own_property(&pr, p, JS_ATOM_Symbol_hasInstance))
+                break;
+            p = p->shape->proto;
+            if (!p)
+                break;
+        }
+    }
     method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_hasInstance);
     if (JS_IsException(method))
         return -1;
