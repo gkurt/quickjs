@@ -22059,6 +22059,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        CASE(OP_to_int32):
+            /* 'x | 0' */
+            if (unlikely(JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_INT)) {
+                int32_t v;
+                sf->cur_pc = pc;
+                if (JS_ToInt32Free(ctx, &v, sp[-1])) {
+                    sp[-1] = JS_UNDEFINED;
+                    goto exception;
+                }
+                sp[-1] = js_int32(v);
+            }
+            BREAK;
+
         CASE(OP_to_propkey_cond):
             /* obj key -> obj key: the key of 'obj[key] = val' is
                converted before val unless obj is null or undefined */
@@ -40334,8 +40347,18 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_push_i32:
             /* a literal key is already a property key */
             skip_to_propkey_cond(&cc, bc_buf, &pos_next);
-            /* transform i32(val) neg -> i32(-val) */
             val = get_i32(bc_buf + pos + 1);
+            /* transform i32(0) or -> to_int32, the 'x | 0' of asm.js
+               style code */
+            if (val == 0 && code_match(&cc, pos_next, OP_or, -1)) {
+                if (cc.line_num >= 0) line_num = cc.line_num;
+                if (cc.col_num >= 0) col_num = cc.col_num;
+                add_pc2line_info(s, bc_out.size, line_num, col_num);
+                dbuf_putc(&bc_out, OP_to_int32);
+                pos_next = cc.pos;
+                break;
+            }
+            /* transform i32(val) neg -> i32(-val) */
             if ((val != INT32_MIN && val != 0)
             &&  code_match(&cc, pos_next, OP_neg, -1)) {
                 if (cc.line_num >= 0) line_num = cc.line_num;
@@ -42805,7 +42828,7 @@ typedef enum BCTagEnum {
     BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 29
+#define BC_VERSION 30
 
 typedef struct BCWriterState {
     JSContext *ctx;

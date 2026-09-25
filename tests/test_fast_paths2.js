@@ -1,7 +1,7 @@
 // Fast paths of the interpreter and the runtime which must keep the
 // generic semantics: the computed property store, the global variable
 // cache, arrays made fast again when they become dense, comparisons
-// fused with the conditional jump which follows them, ...
+// fused with the conditional jump which follows them, 'x | 0', ...
 import * as std from "qjs:std";
 import { assert, assertThrows } from "./assert.js";
 
@@ -344,4 +344,34 @@ function test_compare_branch()
 test_computed_store_order();
 test_global_var_cache();
 test_array_dense_again();
+function test_or_zero()
+{
+    const or0 = x => x | 0;
+    const ref = x => x | (x === x ? 0 : 0) ;
+    const values = [0, -0, 1, -1, 1.5, -1.5, 2147483647, 2147483648,
+                    -2147483649, 4294967296 + 5, 1e21, -1e21, NaN, Infinity,
+                    -Infinity, "12", "0x10", " 7 ", "abc", "", true, false,
+                    null, undefined, [], [3], {}, 2 ** 53, -(2 ** 53) + 1];
+    const expect = [0, 0, 1, -1, 1, -1, 2147483647, -2147483648,
+                    2147483647, 5, -559939584, 559939584, 0, 0, 0, 12, 16, 7,
+                    0, 0, 1, 0, 0, 0, 0, 3, 0, 0, 1];
+    for (let i = 0; i < values.length; i++) {
+        assert(Object.is(or0(values[i]), expect[i]), true);
+        assert(or0(values[i]), ref(values[i]));
+    }
+    let calls = 0;
+    assert(or0({ valueOf() { calls++; return 42.9; } }), 42);
+    assert(calls, 1);
+    assertThrows(TypeError, () => or0(1n));
+    assertThrows(TypeError, () => or0(Symbol()));
+    assertThrows(TypeError, () => or0({ valueOf() { return 1n; } }));
+    assertThrows(RangeError, () => or0({ valueOf() { throw new RangeError(); } }));
+    assert(0 | 7.5, 7);
+    let acc = 0;
+    for (let i = 0; i < 100; i++)
+        acc = (acc + i * 1.5) | 0;
+    assert(acc, 7400);
+}
+
 test_compare_branch();
+test_or_zero();
