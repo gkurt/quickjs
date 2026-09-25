@@ -102,3 +102,12 @@ TypeScript-to-Native Compiler
 ## [Qbs](https://github.com/qbs/qbs)
 
 Cross-platform build system. Uses QuickJS-NG as its JavaScript backend for evaluating project files.
+
+## [Vayu](https://github.com/athrvk/vayu)
+
+Open-source API client with a native C++ load-testing engine. Embeds QuickJS-NG to enable in-app scripting: pre-request and test scripts with a Postman-compatible `pm.*` API.
+
+## [react-native-quickjs](https://github.com/react-native-quickjs/quickjs)
+
+JSI runtime for React Native using QuickJS-NG. Replaces Hermes / JSC.
+
