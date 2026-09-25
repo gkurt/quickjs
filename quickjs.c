@@ -9006,7 +9006,18 @@ static int JS_OrdinaryIsInstanceOf(JSContext *ctx, JSValueConst val,
     /* Only explicitly boxed values are instances of constructors */
     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
         return false;
-    obj_proto = JS_GetProperty(ctx, obj, JS_ATOM_prototype);
+    /* 'prototype' is usually an own data property of the function:
+       read it from its slot rather than through the generic lookup */
+    obj_proto = JS_UNINITIALIZED;
+    if (likely(!p->is_exotic)) {
+        JSShapeProperty *prs;
+        JSProperty *pr;
+        prs = find_own_property(&pr, (JSObject *)p, JS_ATOM_prototype);
+        if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)
+            obj_proto = js_dup(pr->u.value);
+    }
+    if (JS_IsUninitialized(obj_proto))
+        obj_proto = JS_GetProperty(ctx, obj, JS_ATOM_prototype);
     if (JS_VALUE_GET_TAG(obj_proto) != JS_TAG_OBJECT) {
         if (!JS_IsException(obj_proto))
             JS_ThrowTypeError(ctx, "operand 'prototype' property is not an object");
@@ -9067,6 +9078,29 @@ int JS_IsInstanceOf(JSContext *ctx, JSValueConst val, JSValueConst obj)
 
     if (!JS_IsObject(obj))
         goto fail;
+    /* fast path: Function.prototype[Symbol.hasInstance] is not writable
+       nor configurable, so if no object before Function.prototype in
+       the prototype chain of 'obj' has the property, the method is the
+       builtin one, which does OrdinaryHasInstance() */
+    if (JS_VALUE_GET_TAG(ctx->function_proto) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(obj);
+        JSObject *fproto = JS_VALUE_GET_OBJ(ctx->function_proto);
+        JSProperty *pr;
+        int depth;
+        for (depth = 0; depth < 8; depth++) {
+            if (p == fproto) {
+                if (!JS_IsFunction(ctx, obj))
+                    break;
+                return JS_OrdinaryIsInstanceOf(ctx, val, obj);
+            }
+            if (p->is_exotic ||
+                find_own_property(&pr, p, JS_ATOM_Symbol_hasInstance))
+                break;
+            p = p->shape->proto;
+            if (!p)
+                break;
+        }
+    }
     method = JS_GetProperty(ctx, obj, JS_ATOM_Symbol_hasInstance);
     if (JS_IsException(method))
         return -1;
@@ -10530,6 +10564,16 @@ static JSAtom JS_ValueToAtomInternal(JSContext *ctx, JSValueConst val,
         atom = __JS_AtomFromUInt32(JS_VALUE_GET_INT(val));
     } else if (tag == JS_TAG_SYMBOL) {
         JSAtomStruct *p = JS_VALUE_GET_PTR(val);
+        atom = JS_DupAtom(ctx, js_get_atom_index(ctx->rt, p));
+    } else if (tag == JS_TAG_STRING &&
+               JS_VALUE_GET_STRING(val)->atom_type == JS_ATOM_TYPE_STRING &&
+               !(JS_VALUE_GET_STRING(val)->len != 0 &&
+                 is_digit(string_get(JS_VALUE_GET_STRING(val), 0)))) {
+        /* the string is an atom (a property name from a literal, for-in,
+           Object.keys()...): find its index without hashing it again.
+           The strings which may be integer indexes are left to the
+           generic path */
+        JSAtomStruct *p = JS_VALUE_GET_STRING(val);
         atom = JS_DupAtom(ctx, js_get_atom_index(ctx->rt, p));
     } else {
         JSValue str;
@@ -21587,8 +21631,80 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             OP_EQ(OP_eq, 0);
             OP_EQ(OP_neq, 1);
 #undef OP_EQ
-            OP_CMP(OP_strict_eq, ==, js_strict_eq_slow(ctx, sp, 0));
-            OP_CMP(OP_strict_neq, !=, js_strict_eq_slow(ctx, sp, 1));
+            /* strict equality: the numbers as OP_CMP. The values of
+               the other types which are not strings are equal if they
+               have the same tag and payload, and two strings are equal
+               if they are the same string or, when they are two
+               distinct atoms, different. Values of different types
+               among those are never equal. */
+#define JS_SEQ_TAG_MASK ((1 << (JS_TAG_OBJECT - JS_TAG_FIRST)) |        \
+                         (1 << (JS_TAG_SYMBOL - JS_TAG_FIRST)) |        \
+                         (1 << (JS_TAG_STRING - JS_TAG_FIRST)) |        \
+                         (1 << (JS_TAG_NULL - JS_TAG_FIRST)) |          \
+                         (1 << (JS_TAG_UNDEFINED - JS_TAG_FIRST)) |     \
+                         (1 << (JS_TAG_BOOL - JS_TAG_FIRST)))
+#define JS_SEQ_TAG_OK(tag) ((unsigned)((tag) - JS_TAG_FIRST) < 32 &&    \
+                            ((JS_SEQ_TAG_MASK >> ((tag) - JS_TAG_FIRST)) & 1))
+#define OP_SEQ(opcode, is_neq)                                          \
+            CASE(opcode):                                               \
+                {                                                       \
+                JSValue op1, op2;                                       \
+                uint32_t tag1, tag2;                                    \
+                double d1, d2;                                          \
+                bool res;                                               \
+                op1 = sp[-2];                                           \
+                op2 = sp[-1];                                           \
+                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
+                    res = JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2); \
+                } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {          \
+                    res = JS_VALUE_GET_FLOAT64(op1) == JS_VALUE_GET_FLOAT64(op2); \
+                } else if ((JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) || \
+                            JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) && \
+                           js_arith_to_float64(op1, &d1) &&             \
+                           js_arith_to_float64(op2, &d2)) {             \
+                    res = d1 == d2;                                     \
+                } else {                                                \
+                    tag1 = JS_VALUE_GET_NORM_TAG(op1);                  \
+                    tag2 = JS_VALUE_GET_NORM_TAG(op2);                  \
+                    if (!JS_SEQ_TAG_OK(tag1) || !JS_SEQ_TAG_OK(tag2))   \
+                        goto opcode ## _slow;                           \
+                    if (tag1 != tag2) {                                 \
+                        res = false;                                    \
+                    } else if (tag1 == JS_TAG_STRING) {                 \
+                        JSString *p1 = JS_VALUE_GET_STRING(op1);        \
+                        JSString *p2 = JS_VALUE_GET_STRING(op2);        \
+                        if (p1 == p2) {                                 \
+                            res = true;                                 \
+                        } else if (p1->atom_type == JS_ATOM_TYPE_STRING && \
+                                   p2->atom_type == JS_ATOM_TYPE_STRING) { \
+                            res = false;                                \
+                        } else {                                        \
+                            goto opcode ## _slow;                       \
+                        }                                               \
+                    } else if (tag1 == JS_TAG_BOOL) {                   \
+                        res = JS_VALUE_GET_INT(op1) == JS_VALUE_GET_INT(op2); \
+                    } else if (tag1 == JS_TAG_OBJECT || tag1 == JS_TAG_SYMBOL) { \
+                        res = JS_VALUE_GET_PTR(op1) == JS_VALUE_GET_PTR(op2); \
+                    } else {                                            \
+                        res = true; /* null or undefined */             \
+                    }                                                   \
+                    sp[-2] = js_bool(res ^ is_neq);                     \
+                    sp--;                                               \
+                    JS_FreeValue(ctx, op1);                             \
+                    JS_FreeValue(ctx, op2);                             \
+                    BREAK;                                              \
+                opcode ## _slow:                                        \
+                    js_strict_eq_slow(ctx, sp, is_neq);                 \
+                    sp--;                                               \
+                    BREAK;                                              \
+                }                                                       \
+                sp[-2] = js_bool(res ^ is_neq);                         \
+                sp--;                                                   \
+                }                                                       \
+            BREAK
+            OP_SEQ(OP_strict_eq, 0);
+            OP_SEQ(OP_strict_neq, 1);
+#undef OP_SEQ
 
         CASE(OP_in):
             sf->cur_pc = pc;
@@ -23313,6 +23429,7 @@ typedef struct JSFunctionDef {
     DynBuf byte_code;
     int last_opcode_pos; /* -1 if no last opcode */
     int ic_count; /* inline cache slots allocated by resolve_labels() */
+    bool has_loc_check; /* OP_get_loc_check or OP_put_loc_check emitted */
 
     LabelSlot *label_slots;
     int label_size; /* allocated size for label_slots[] */
@@ -26871,6 +26988,16 @@ static int js_parse_is_arrow_params(JSParseState *s, bool allow_ret_type)
 {
     JSParsePos pos;
     int tok, ret;
+
+    /* fast test: a parameter list starts with ')', an identifier, a
+       binding pattern or '...'. Rejecting the other tokens here avoids
+       scanning the whole parenthesized expression, e.g. the body of
+       (function () { ... })() */
+    tok = peek_token(s, false);
+    if (tok == TOK_FUNCTION || tok == '(' || tok == '"' || tok == '\'' ||
+        tok == '`' || tok == '!' || tok == '~' || tok == '-' || tok == '+' ||
+        tok == '/' || (tok >= '0' && tok <= '9'))
+        return 0;
 
     tok = js_parse_skip_parens_token(s, NULL, true);
     if (tok == TOK_ARROW)
@@ -37488,9 +37615,10 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                     get_op = OP_get_arg;
                     var_idx -= ARGUMENT_VAR_OFFSET;
                 } else {
-                    if (s->vars[var_idx].is_lexical)
+                    if (s->vars[var_idx].is_lexical) {
                         get_op = OP_get_loc_check;
-                    else
+                        s->has_loc_check = true;
+                    } else
                         get_op = OP_get_loc;
                 }
                 pos_next = optimize_scope_make_ref(ctx, s, bc, bc_buf, ls,
@@ -37541,6 +37669,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                                 dbuf_putc(bc, OP_put_loc);
                         } else {
                             dbuf_putc(bc, OP_put_loc_check);
+                            s->has_loc_check = true;
                         }
                     } else {
                         dbuf_putc(bc, OP_put_loc);
@@ -37548,6 +37677,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                 } else {
                     if (s->vars[var_idx].is_lexical) {
                         dbuf_putc(bc, OP_get_loc_check);
+                        s->has_loc_check = true;
                     } else {
                         dbuf_putc(bc, OP_get_loc);
                     }
@@ -39325,9 +39455,11 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
     int nvars = s->var_count;
     int nwords, pos, op, len, idx, label, iter, i;
     uint64_t *label_state, *cur, *st;
+    int *label_iter;
     bool changed, reachable, rewrite;
 
-    if (nvars <= 0)
+    /* nothing to rewrite */
+    if (nvars <= 0 || !s->has_loc_check)
         return 0;
     nwords = (nvars + 63) >> 6;
     label_state = js_malloc(ctx, sizeof(uint64_t) * nwords * (s->label_count + 1));
@@ -39335,6 +39467,16 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
         return -1;
     cur = label_state + (size_t)nwords * s->label_count;
     memset(label_state, 0xff, sizeof(uint64_t) * nwords * s->label_count);
+    /* iteration in which each label was last passed: another iteration
+       is needed only if the state of a label already passed shrinks
+       (backward jump); the forward jumps are seen in the same pass */
+    label_iter = js_malloc(ctx, sizeof(int) * (s->label_count + 1));
+    if (!label_iter) {
+        js_free(ctx, label_state);
+        return -1;
+    }
+    for (i = 0; i < s->label_count; i++)
+        label_iter[i] = -1;
 
     rewrite = false;
     for (iter = 0;; iter++) {
@@ -39370,8 +39512,9 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
                 assert(label >= 0 && label < s->label_count);
                 st = label_state + (size_t)label * nwords;
                 if (reachable)
-                    changed |= tdz_state_meet(st, cur, nwords);
+                    tdz_state_meet(st, cur, nwords);
                 memcpy(cur, st, sizeof(uint64_t) * nwords);
+                label_iter[label] = iter;
                 reachable = true;
                 break;
             case OP_set_loc_uninitialized:
@@ -39404,15 +39547,18 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
                 for (i = 0; i < nwords; i++) {
                     if (st[i]) {
                         st[i] = 0;
-                        changed = true;
+                        if (label_iter[label] == iter)
+                            changed = true;
                     }
                 }
                 break;
             case OP_goto:
                 label = get_u32(bc_buf + pos + 1);
                 assert(label >= 0 && label < s->label_count);
-                if (reachable)
-                    changed |= tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords);
+                if (reachable &&
+                    tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords) &&
+                    label_iter[label] == iter)
+                    changed = true;
                 reachable = false;
                 break;
             case OP_return:
@@ -39441,7 +39587,9 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
                 }
                 if (label >= 0 && reachable) {
                     assert(label < s->label_count);
-                    changed |= tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords);
+                    if (tdz_state_meet(label_state + (size_t)label * nwords, cur, nwords) &&
+                        label_iter[label] == iter)
+                        changed = true;
                 }
                 break;
             }
@@ -39456,6 +39604,7 @@ static __exception int resolve_tdz_checks(JSContext *ctx, JSFunctionDef *s)
             break;
         }
     }
+    js_free(ctx, label_iter);
     js_free(ctx, label_state);
     return 0;
 }

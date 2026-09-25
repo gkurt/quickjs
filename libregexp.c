@@ -2630,6 +2630,20 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
 
     re_emit_op(s, REOP_match);
 
+    /* a pattern starting with '^' (without the 'm' flag) can only match
+       at the start of the input: drop the loop over the start positions
+       so that a failed match does not scan the rest of the input */
+    if (!is_sticky && !dbuf_error(&s->byte_code)) {
+        const int prefix_len = 5 + 1 + 5;
+        uint8_t *bc = s->byte_code.buf + RE_HEADER_LEN;
+        if (bc[prefix_len] == REOP_save_start &&
+            bc[prefix_len + 2] == REOP_line_start) {
+            memmove(bc, bc + prefix_len,
+                    s->byte_code.size - RE_HEADER_LEN - prefix_len);
+            s->byte_code.size -= prefix_len;
+        }
+    }
+
     if (*s->buf_ptr != '\0') {
         re_parse_error(s, "extraneous characters at the end");
         goto error;
