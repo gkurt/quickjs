@@ -319,6 +319,13 @@ function test_compare_branch()
             }
         }
     }
+    // 'x == null' as a value and as a condition
+    const eqn = Function("x", "return [x == null, x != null, null == x, x == null ? 1 : 0," +
+                         " x != null ? 1 : 0];");
+    for (const x of values) {
+        const r = (x === null || x === undefined);
+        assert(eqn(x).join(), [r, !r, r, r ? 1 : 0, r ? 0 : 1].join());
+    }
     // a loop counting down with a comparison jumping backward
     let n = 0, i = 10;
     do { n++; } while (--i > 0);

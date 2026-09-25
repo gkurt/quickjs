@@ -19178,6 +19178,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         print_func_name(b);
 #endif
 
+/* Push the result 'res' of a comparison whose operands were popped.
+   When the next opcode is a conditional jump, as in most comparisons,
+   it is executed as well without pushing the boolean and dispatching
+   it. */
+#define CMP_RESULT_POPPED(res)                                          \
+            do {                                                        \
+                if (*pc == OP_if_false8 || *pc == OP_if_true8) {        \
+                    if ((res) ^ (*pc == OP_if_false8)) {                \
+                        int32_t diff_ = (int8_t)pc[1] - 1;              \
+                        pc += 2 + diff_;                                \
+                        if (diff_ < 0 && unlikely(js_poll_interrupts(ctx))) \
+                            goto exception;                             \
+                    } else {                                            \
+                        pc += 2;                                        \
+                    }                                                   \
+                } else {                                                \
+                    *sp++ = js_bool(res);                               \
+                }                                                       \
+            } while (0)
+/* the same for the two operands on the stack, which need no release */
+#define CMP_RESULT(res)                                                 \
+            do {                                                        \
+                sp -= 2;                                                \
+                CMP_RESULT_POPPED(res);                                 \
+            } while (0)
+
  restart:
     for(;;) {
         int call_argc;
@@ -19284,6 +19310,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             *sp++ = JS_UNDEFINED;
             BREAK;
         CASE(OP_null):
+            if (*pc == OP_eq || *pc == OP_neq) {
+                /* 'x == null' is true for null, undefined and the
+                   IsHTMLDDA objects */
+                JSValue op1 = sp[-1];
+                uint32_t tag = JS_VALUE_GET_TAG(op1);
+                bool res = tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED ||
+                    (tag == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(op1)->is_HTMLDDA);
+                res ^= (*pc == OP_neq);
+                pc++;
+                sp--;
+                JS_FreeValue(ctx, op1);
+                CMP_RESULT_POPPED(res);
+                BREAK;
+            }
             *sp++ = JS_NULL;
             BREAK;
         CASE(OP_push_this):
@@ -21778,32 +21818,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
-/* Push the result 'res' of a comparison whose operands were popped.
-   When the next opcode is a conditional jump, as in most comparisons,
-   it is executed as well without pushing the boolean and dispatching
-   it. */
-#define CMP_RESULT_POPPED(res)                                          \
-            do {                                                        \
-                if (*pc == OP_if_false8 || *pc == OP_if_true8) {        \
-                    if ((res) ^ (*pc == OP_if_false8)) {                \
-                        int32_t diff_ = (int8_t)pc[1] - 1;              \
-                        pc += 2 + diff_;                                \
-                        if (diff_ < 0 && unlikely(js_poll_interrupts(ctx))) \
-                            goto exception;                             \
-                    } else {                                            \
-                        pc += 2;                                        \
-                    }                                                   \
-                } else {                                                \
-                    *sp++ = js_bool(res);                               \
-                }                                                       \
-            } while (0)
-/* the same for the two operands on the stack, which need no release */
-#define CMP_RESULT(res)                                                 \
-            do {                                                        \
-                sp -= 2;                                                \
-                CMP_RESULT_POPPED(res);                                 \
-            } while (0)
-
 /* Comparisons: ints are the common case. Doubles, and an int against a
    double, are compared directly as well: for numbers the C comparison
    has the JS semantics (NaN compares false, +0 equals -0), for every
@@ -21966,8 +21980,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             OP_SEQ(OP_strict_eq, 0);
             OP_SEQ(OP_strict_neq, 1);
 #undef OP_SEQ
-#undef CMP_RESULT
-#undef CMP_RESULT_POPPED
 
         CASE(OP_in):
             sf->cur_pc = pc;
@@ -22313,6 +22325,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
 }
+#undef CMP_RESULT
+#undef CMP_RESULT_POPPED
 
 JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                 int argc, JSValueConst *argv)
