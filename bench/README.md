@@ -8,6 +8,8 @@ Release build is needed.
 | `runtime.js` | micro benchmarks of the runtime hot paths: interpreter, objects, arrays, strings, Map/Set, JSON, regular expressions |
 | `instructions.js` | instructions executed per operation by the `runtime.js` benchmarks, counted with cachegrind |
 | `compare.js` | compares two sets of `runtime.js` and `instructions.js` results, or summarizes repeated runs |
+| `octane.js` | runs the [Octane 2.0](https://github.com/chromium/octane) suite, with the peak memory of each suite |
+| `upstream.js` | compares two sets of `octane.js` and `tests/microbench.js` results |
 | `ts_parse_bench.js` | compile-time cost of TypeScript type erasure on a corpus |
 | `ts_parse_depth.js` | parser behaviour on deeply nested TypeScript |
 
@@ -102,6 +104,49 @@ across related benchmarks, or as a large shift in one of them. A changed
 time with an unchanged instruction count is noise or a code placement
 effect. Re-run the job when in doubt, and reproduce locally before drawing
 conclusions.
+
+## Comparing against upstream
+
+`.github/workflows/bench-upstream.yml` measures this fork against upstream
+quickjs-ng: weekly, on pushes to the default branch, and on demand from the
+Actions tab, where the upstream repository, the ref (`master` by default) and
+the number of runs can be chosen. It builds both, runs three suites on both
+in alternation and writes one report to the job summary, with the result
+files in a workflow artifact:
+
+- `runtime.js`, whose script the upstream binary runs as well, and the
+  instruction counts of `instructions.js`, compared by `compare.js`;
+- `tests/microbench.js` of upstream, the benchmarks upstream measures itself
+  with, so a suite this repository did not write;
+- Octane, larger programs whose score reflects real applications better than
+  any micro benchmark, together with the peak resident memory of each suite.
+
+The last two are compared by `upstream.js`, which takes the median of the
+runs rather than the best one: `tests/microbench.js` calibrates its
+iteration count on every run and some of its benchmarks cost more per
+operation with more iterations, so a single run can land far off in either
+direction. The same comparison can be run locally:
+
+```sh
+git fetch https://github.com/quickjs-ng/quickjs master
+git worktree add ../upstream FETCH_HEAD
+git clone https://github.com/chromium/octane ../octane
+make -C ../upstream && make BUILD_DIR=build-fork
+top=$PWD upstream=$PWD/../upstream/build/qjs fork=$PWD/build-fork/qjs
+for side in upstream fork; do
+    ${!side} bench/octane.js --json $side-octane.json ../octane
+    (cd $(mktemp -d) && ${!side} $top/../upstream/tests/microbench.js &&
+     mv microbench-new.txt $top/$side-microbench.json)
+done
+build-fork/qjs bench/upstream.js --octane upstream-octane.json fork-octane.json \
+    --microbench upstream-microbench.json fork-microbench.json
+```
+
+`octane.js` runs every suite in a separate process started with the same
+binary, which is how it reports the peak memory of each (from
+`/proc/self/status`, so on Linux only) and keeps a suite that crashes from
+taking the others down. `--list` prints the suites and naming some of them
+runs only those.
 
 ## Adding a benchmark
 

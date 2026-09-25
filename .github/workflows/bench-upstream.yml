@@ -1,0 +1,189 @@
+name: bench-upstream
+
+# Compares the performance of this fork against upstream quickjs-ng.
+#
+# Both are built in Release mode from the same toolchain and measured on the
+# same runner with three suites, in alternation so that slow phases of the
+# runner hit both sides:
+#
+#   - bench/runtime.js, the micro benchmarks of this repository (the upstream
+#     binary runs the same script), with the instructions per operation
+#     counted with cachegrind (bench/instructions.js)
+#   - tests/microbench.js of upstream, the benchmarks upstream measures
+#     itself with
+#   - Octane 2.0, larger programs (bench/octane.js), with the peak memory of
+#     each suite
+#
+# The report goes to the job summary and, with the result files, to a
+# workflow artifact. It runs weekly, on pushes to the default branch and on
+# demand, where the upstream repository and ref can be chosen.
+#
+# Hosted runners are noisy: treat single-digit changes of the times as noise
+# unless the instruction count moved as well, see bench/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repository:
+        description: 'Upstream repository (owner/name)'
+        default: 'quickjs-ng/quickjs'
+      upstream_ref:
+        description: 'Upstream branch, tag or commit'
+        default: 'master'
+      runs:
+        description: 'Timed runs per side'
+        default: '3'
+  schedule:
+    - cron: '23 4 * * 1'
+  push:
+    branches:
+      - next
+    paths:
+      - '**.c'
+      - '**.h'
+      - 'CMakeLists.txt'
+      - 'Makefile'
+      - 'bench/**'
+      - '.github/workflows/bench-upstream.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-upstream-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPOSITORY: ${{ inputs.upstream_repository || 'quickjs-ng/quickjs' }}
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'master' }}
+  BENCH_RUNS: ${{ inputs.runs || '3' }}
+  BENCH_ARGS: --rounds 5 --min-ms 100
+  # the last commit of https://github.com/chromium/octane, pinned so that
+  # results stay comparable over time
+  OCTANE_SHA: 570ad1ccfe86e3eecba0636c8f932ac08edec517
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@v7
+        with:
+          repository: chromium/octane
+          ref: ${{ env.OCTANE_SHA }}
+          path: octane
+
+      - name: install valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind
+
+      - name: fetch upstream
+        run: |
+          git fetch --no-tags "https://github.com/$UPSTREAM_REPOSITORY.git" "$UPSTREAM_REF"
+          upstream=$(git rev-parse FETCH_HEAD)
+          echo "comparing against $UPSTREAM_REPOSITORY@$upstream ($UPSTREAM_REF)"
+          echo "$upstream" > upstream.sha
+          git worktree add ../upstream "$upstream"
+
+      - name: build fork
+        run: |
+          make BUILD_DIR=build-fork BUILD_TYPE=Release
+
+      - name: build upstream
+        run: |
+          make -C ../upstream BUILD_DIR=build BUILD_TYPE=Release
+
+      - name: benchmark
+        run: |
+          mkdir -p results
+          fork=$PWD/build-fork/qjs
+          upstream=$PWD/../upstream/build/qjs
+          microbench=$PWD/../upstream/tests/microbench.js
+          for i in $(seq 1 "$BENCH_RUNS"); do
+            for side in upstream fork; do
+              if [ "$side" = upstream ]; then qjs=$upstream; else qjs=$fork; fi
+              echo "::group::$side run $i: bench/runtime.js"
+              $qjs bench/runtime.js $BENCH_ARGS --json "results/$side-runtime-$i.json"
+              echo "::endgroup::"
+              # microbench.js writes microbench-new.txt into its working
+              # directory, and compares against a microbench.txt found there
+              echo "::group::$side run $i: tests/microbench.js"
+              dir=$(mktemp -d)
+              (cd "$dir" && $qjs "$microbench")
+              mv "$dir/microbench-new.txt" "results/$side-microbench-$i.json"
+              rm -rf "$dir"
+              echo "::endgroup::"
+              # a suite that fails is reported, the others still count
+              echo "::group::$side run $i: Octane"
+              $qjs bench/octane.js --json "results/$side-octane-$i.json" octane ||
+                echo "::warning::Octane: a suite failed on $side (run $i), see the report"
+              echo "::endgroup::"
+            done
+          done
+
+      # Deterministic, so once per side is enough. The fork runs the
+      # iteration counts calibrated on upstream so that both do the same work.
+      - name: count instructions
+        run: |
+          jobs="--jobs $(nproc)"
+          echo "::group::upstream"
+          build-fork/qjs bench/instructions.js $jobs --min-ms 20 --json results/upstream-instructions.json ../upstream/build/qjs
+          echo "::endgroup::"
+          echo "::group::fork"
+          build-fork/qjs bench/instructions.js $jobs --iterations-from results/upstream-instructions.json --json results/fork-instructions.json build-fork/qjs
+          echo "::endgroup::"
+
+      - name: report
+        run: |
+          upstream_sha=$(cat upstream.sha)
+          qjs=build-fork/qjs
+          files() { ls results/$1-runtime-*.json results/$1-instructions.json | paste -sd,; }
+          list() { ls results/$1-$2-*.json | paste -sd,; }
+          # text section and whole file of each binary, in bytes
+          sizes() { echo "$(size "$1" | awk 'NR == 2 { print $1 }') $(stat -c %s "$1")"; }
+          size_row() {
+            awk -v what="$1" -v b="$2" -v h="$3" 'BEGIN {
+              printf "| %s | %.2f MB | %.2f MB | %+.1f%% |\n", what, b / 1048576, h / 1048576, (h - b) * 100 / b }'
+          }
+          read -r up_text up_file < <(sizes ../upstream/build/qjs)
+          read -r fork_text fork_file < <(sizes build-fork/qjs)
+          {
+            echo "### Fork vs upstream"
+            echo ""
+            echo "Fork \`$(git rev-parse --short=12 HEAD)\` (\`${GITHUB_REF_NAME}\`) against" \
+                 "[\`$UPSTREAM_REPOSITORY@$(echo "$upstream_sha" | cut -c1-12)\`](https://github.com/$UPSTREAM_REPOSITORY/commit/$upstream_sha)" \
+                 "(\`$UPSTREAM_REF\`): the fork is $(git rev-list --count "$upstream_sha..HEAD") commits ahead and" \
+                 "$(git rev-list --count "HEAD..$upstream_sha") behind." \
+                 "Runner \`${RUNNER_OS}/${RUNNER_ARCH}\`, $BENCH_RUNS timed runs per side," \
+                 "[job]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+            echo ""
+            echo "| Binary | upstream | fork | Change |"
+            echo "|---|---:|---:|---:|"
+            size_row "qjs code (text)" "$up_text" "$fork_text"
+            size_row "qjs file" "$up_file" "$fork_file"
+            echo ""
+            $qjs bench/upstream.js --markdown \
+              --octane "$(list upstream octane)" "$(list fork octane)" \
+              --microbench "$(list upstream microbench)" "$(list fork microbench)"
+            echo "_bench/runtime.js, with upstream as the base and the fork as the head:_"
+            echo ""
+            $qjs bench/compare.js --markdown "$(files upstream)" "$(files fork)"
+          } > results/report.md
+          cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+          # and in plain text in the log
+          $qjs bench/upstream.js \
+            --octane "$(list upstream octane)" "$(list fork octane)" \
+            --microbench "$(list upstream microbench)" "$(list fork microbench)"
+          $qjs bench/compare.js "$(files upstream)" "$(files fork)"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-upstream-${{ github.sha }}-${{ github.run_attempt }}
+          path: results/
+          retention-days: 90
