@@ -2,7 +2,8 @@
 // generic semantics: the computed property store, the global variable
 // cache, arrays made fast again when they become dense, comparisons
 // fused with the conditional jump which follows them, 'x | 0', the
-// elements of typed arrays read inline, ...
+// elements of typed arrays read inline, Function.prototype.apply() on
+// arrays and arguments objects, ...
 import * as std from "qjs:std";
 import { assert, assertThrows } from "./assert.js";
 
@@ -412,4 +413,51 @@ function test_typed_array_read()
 }
 
 test_or_zero();
+function test_apply()
+{
+    const f = function () { return Array.prototype.join.call(arguments, ","); };
+    const count = function () { return arguments.length; };
+    // strict (unmapped) and sloppy (mapped) arguments objects
+    const g = function () { return f.apply(this, arguments); };
+    const sloppy = Function("f", "return function (a, b) { a = 7; return f.apply(this, arguments); };")(f);
+    assert(g(1, 2, 3), "1,2,3");
+    assert(g(), "");
+    assert(sloppy(1, 2), "7,2");
+    assert(sloppy(1), "7");
+    // arrays: holes, a length larger than the elements, array likes
+    assert(f.apply(null, [1, , 3]), "1,,3");
+    const holes = [1, 2];
+    holes.length = 4;
+    assert(count.apply(null, holes), 4);
+    assert(count.apply(null, { length: 2 }), 2);
+    assert(count.apply(null, Array(40).fill(0)), 40);
+    // the callee modifies the array it is called with
+    const arr = [1, 2, 3];
+    assert(Array.prototype.push.apply(arr, arr), 6);
+    assert(arr.join(), "1,2,3,1,2,3");
+    const shrink = [1, 2, 3];
+    assert(function () { shrink.length = 0; return Array.prototype.join.call(arguments); }.apply(null, shrink), "1,2,3");
+    // modified or deleted length of an arguments object
+    const m = function () { arguments.length = 1; return count.apply(null, arguments); };
+    assert(m(1, 2, 3), 1);
+    const n = function () { delete arguments.length; return count.apply(null, arguments); };
+    assert(n(1, 2, 3), 0);
+    const acc = function () {
+        Object.defineProperty(arguments, "length", { get() { return 2; } });
+        return count.apply(null, arguments);
+    };
+    assert(acc(1, 2, 3), 2);
+    // Reflect.apply and Reflect.construct
+    assert(Math.max.apply(null, [1, 5, 3]), 5);
+    assert(Reflect.apply(count, null, [1, 2]), 2);
+    class C { constructor(...a) { this.n = a.length; } }
+    assert(Reflect.construct(C, [1, 2, 3]).n, 3);
+    assertThrows(TypeError, () => Reflect.apply(count, null, undefined));
+    assert(count.apply(null, undefined), 0);
+    // the values survive the call
+    const objs = [{ v: 1 }, { v: 2 }];
+    assert(function (a, b) { objs.length = 0; return a.v + b.v; }.apply(null, objs), 3);
+}
+
 test_typed_array_read();
+test_apply();

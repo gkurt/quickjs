@@ -46910,6 +46910,45 @@ static JSValue *build_arg_list(JSContext *ctx, uint32_t *plen,
     return tab;
 }
 
+/* number of elements js_function_apply() copies to the C stack */
+#define JS_APPLY_STACK_ARGS 16
+
+/* Copy to 'tab' the elements of 'array_arg' when it is a fast array or
+   arguments object whose length is its element count, at most
+   JS_APPLY_STACK_ARGS. Return their number, -1 if the generic
+   build_arg_list() must be used. The arguments objects of
+   'f.apply(this, arguments)' are the common case. */
+static int build_arg_list_fast(JSValue *tab, JSValueConst array_arg)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+    uint32_t i, len;
+
+    if (JS_VALUE_GET_TAG(array_arg) != JS_TAG_OBJECT)
+        return -1;
+    p = JS_VALUE_GET_OBJ(array_arg);
+    if ((p->class_id != JS_CLASS_ARRAY && p->class_id != JS_CLASS_ARGUMENTS &&
+         p->class_id != JS_CLASS_MAPPED_ARGUMENTS) || !p->fast_array)
+        return -1;
+    len = p->u.array.count;
+    /* 'length' is the first property of the arrays and of the arguments
+       objects, where it can be modified or deleted */
+    prs = get_shape_prop(p->shape);
+    if (len > JS_APPLY_STACK_ARGS || prs[0].atom != JS_ATOM_length ||
+        (prs[0].flags & JS_PROP_TMASK) ||
+        JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT ||
+        JS_VALUE_GET_INT(p->prop[0].u.value) != len)
+        return -1;
+    if (p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
+        for(i = 0; i < len; i++)
+            tab[i] = js_dup(*p->u.array.u.var_refs[i]->pvalue);
+    } else {
+        for(i = 0; i < len; i++)
+            tab[i] = js_dup(p->u.array.u.values[i]);
+    }
+    return len;
+}
+
 /* magic value: 0 = normal apply, 1 = apply for constructor, 2 =
    Reflect.apply */
 static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
@@ -46926,6 +46965,20 @@ static JSValue js_function_apply(JSContext *ctx, JSValueConst this_val,
     if ((JS_VALUE_GET_TAG(array_arg) == JS_TAG_UNDEFINED ||
          JS_VALUE_GET_TAG(array_arg) == JS_TAG_NULL) && magic != 2) {
         return JS_Call(ctx, this_val, this_arg, 0, NULL);
+    }
+    {
+        /* the values are copied, so that the callee may modify the array */
+        JSValue stack_tab[JS_APPLY_STACK_ARGS];
+        int n = build_arg_list_fast(stack_tab, array_arg);
+        if (n >= 0) {
+            if (magic & 1)
+                ret = JS_CallConstructor2(ctx, this_val, this_arg, n, vc(stack_tab));
+            else
+                ret = JS_Call(ctx, this_val, this_arg, n, vc(stack_tab));
+            while (n > 0)
+                JS_FreeValue(ctx, stack_tab[--n]);
+            return ret;
+        }
     }
     tab = build_arg_list(ctx, &len, array_arg);
     if (!tab)
