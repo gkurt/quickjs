@@ -380,6 +380,15 @@ struct JSRuntime {
     bool in_free;
 
     struct JSStackFrame *current_stack_frame;
+    /* stack of the local variables of the running bytecode functions,
+       see js_frame_alloc(). frame_stack_base is the start of the current
+       chunk, NULL for the first one which is never left. */
+    uint8_t *frame_stack_base;
+    uint8_t *frame_stack_top; /* first free byte */
+    uint8_t *frame_stack_end;
+    struct JSFrameChunk *frame_chunk; /* current chunk */
+    struct JSFrameChunk *frame_chunk_spare; /* unused chunk kept for reuse */
+    size_t frame_stack_size; /* bytes of the allocated chunks */
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
@@ -2384,7 +2393,20 @@ static int init_class_range(JSRuntime *rt, JSClassShortDef const *tab,
 /* Uses code from LLVM project. */
 static inline uintptr_t js_get_stack_pointer(void)
 {
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__) || defined(__aarch64__))
+    /* read the stack pointer register: __builtin_frame_address() would
+       force a frame pointer in the functions that check the stack, taking
+       a register from the interpreter loop of JS_CallInternal() */
+    uintptr_t sp;
+#if defined(__x86_64__)
+    __asm__ volatile ("movq %%rsp, %0" : "=r" (sp));
+#elif defined(__i386__)
+    __asm__ volatile ("movl %%esp, %0" : "=r" (sp));
+#else
+    __asm__ volatile ("mov %0, sp" : "=r" (sp));
+#endif
+    return sp;
+#elif defined(__clang__) || defined(__GNUC__)
     return (uintptr_t)__builtin_frame_address(0);
 #elif defined(_MSC_VER)
     return (uintptr_t)_AddressOfReturnAddress();
@@ -2405,6 +2427,104 @@ static inline bool js_check_stack_overflow(JSRuntime *rt, size_t alloca_size)
     uintptr_t sp;
     sp = js_get_stack_pointer() - alloca_size;
     return unlikely(sp < rt->stack_limit);
+}
+
+/* The local variables, the stack and the copied arguments of the bytecode
+   functions called by JS_CallInternal() are allocated on a stack of
+   chunks rather than with alloca(): alloca() is slower, and it needs a
+   frame pointer which takes a register from the interpreter loop. The
+   frames are freed in the reverse order. */
+typedef struct JSFrameChunk {
+    struct JSFrameChunk *prev; /* chunk of the previous frames */
+    uint8_t *prev_top; /* frame_stack_top of 'prev' when this one was taken */
+    size_t size; /* bytes after the header */
+    size_t pad; /* the frames are aligned on 16 bytes */
+} JSFrameChunk;
+
+#define JS_FRAME_CHUNK_SIZE (64 * 1024)
+
+static void js_free_frame_chunk(JSRuntime *rt, JSFrameChunk *c)
+{
+    rt->frame_stack_size -= sizeof(*c) + c->size;
+    js_free_rt(rt, c);
+}
+
+static no_inline void *js_frame_alloc_slow(JSContext *ctx, size_t size)
+{
+    JSRuntime *rt = ctx->rt;
+    JSFrameChunk *c;
+    size_t chunk_size;
+
+    c = rt->frame_chunk_spare;
+    if (c) {
+        rt->frame_chunk_spare = NULL;
+        if (c->size < size) {
+            js_free_frame_chunk(rt, c);
+            c = NULL;
+        }
+    }
+    if (!c) {
+        chunk_size = size > JS_FRAME_CHUNK_SIZE ? size : JS_FRAME_CHUNK_SIZE;
+        /* the frames used to be on the C stack: keep them under the
+           same limit */
+        if (rt->stack_size != 0 &&
+            rt->frame_stack_size + chunk_size > rt->stack_size) {
+            JS_ThrowStackOverflow(ctx);
+            return NULL;
+        }
+        c = js_malloc(ctx, sizeof(*c) + chunk_size);
+        if (!c)
+            return NULL;
+        c->size = chunk_size;
+        rt->frame_stack_size += sizeof(*c) + chunk_size;
+    }
+    c->prev = rt->frame_chunk;
+    c->prev_top = rt->frame_stack_top;
+    rt->frame_chunk = c;
+    rt->frame_stack_base = c->prev ? (uint8_t *)(c + 1) : NULL;
+    rt->frame_stack_top = (uint8_t *)(c + 1) + size;
+    rt->frame_stack_end = (uint8_t *)(c + 1) + c->size;
+    return c + 1;
+}
+
+/* Allocate a frame of 'size' bytes, a multiple of 16. Return NULL with
+   an exception if the frames exceed the stack size. */
+static force_inline void *js_frame_alloc(JSContext *ctx, size_t size)
+{
+    JSRuntime *rt = ctx->rt;
+    uint8_t *p = rt->frame_stack_top;
+
+    /* '<=' so that an empty frame is not allocated at a NULL top */
+    if (unlikely((size_t)(rt->frame_stack_end - p) <= size))
+        return js_frame_alloc_slow(ctx, size);
+    rt->frame_stack_top = p + size;
+    return p;
+}
+
+/* the first frame of the current chunk, which is not the first one, is
+   freed: go back to the previous chunk */
+static no_inline void js_frame_free_slow(JSRuntime *rt)
+{
+    JSFrameChunk *c = rt->frame_chunk, *prev = c->prev;
+
+    /* keep the chunk, so that a call at its limit in a loop does not
+       allocate it each time */
+    if (rt->frame_chunk_spare)
+        js_free_frame_chunk(rt, rt->frame_chunk_spare);
+    rt->frame_chunk_spare = c;
+    rt->frame_chunk = prev;
+    rt->frame_stack_base = prev->prev ? (uint8_t *)(prev + 1) : NULL;
+    rt->frame_stack_top = c->prev_top;
+    rt->frame_stack_end = (uint8_t *)(prev + 1) + prev->size;
+}
+
+/* free the frame 'p', the last allocated one */
+static force_inline void js_frame_free(JSRuntime *rt, void *p)
+{
+    if (unlikely(p == rt->frame_stack_base))
+        js_frame_free_slow(rt);
+    else
+        rt->frame_stack_top = p;
 }
 
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
@@ -2812,6 +2932,14 @@ void JS_FreeRuntime(JSRuntime *rt)
         }
     }
     js_free_rt(rt, rt->class_array);
+
+    if (rt->frame_chunk) {
+        assert(!rt->frame_chunk->prev &&
+               rt->frame_stack_top == (uint8_t *)(rt->frame_chunk + 1));
+        js_free_frame_chunk(rt, rt->frame_chunk);
+    }
+    if (rt->frame_chunk_spare)
+        js_free_frame_chunk(rt, rt->frame_chunk_spare);
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOM_LEAKS
     /* only the atoms defined in JS_InitAtoms() should be left */
@@ -19132,7 +19260,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSVarRef **var_refs;
-    size_t alloca_size;
+    size_t frame_size;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
 #define DUMP_BYTECODE_OR_DONT(pc) \
@@ -19156,10 +19284,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 /* the few handlers that need the opcode reload it from pc[-1]: assigning
    'opcode' here would keep it live across every dispatch, costing a
    register move per executed instruction */
-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[*pc++]; });
+#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch[*pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
 #define BREAK           SWITCH(pc)
+#endif
+
+#if DIRECT_DISPATCH
+    /* the address of the table is hidden from the compiler: it would
+       otherwise treat it as a constant, cheap to compute again, and keep
+       something else in a register */
+    const void * const *dispatch = dispatch_table;
+    __asm__ ("" : "+r" (dispatch));
 #endif
 
     if (js_poll_interrupts(caller_ctx))
@@ -19209,11 +19345,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = 0;
     }
 
-    alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
-                                     b->stack_size) +
+    frame_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
+                                    b->stack_size) +
         sizeof(JSVarRef *) * b->var_ref_count;
-    if (js_check_stack_overflow(rt, alloca_size))
+    frame_size = (frame_size + 15) & ~(size_t)15;
+    if (js_check_stack_overflow(rt, 0))
         return JS_ThrowStackOverflow(caller_ctx);
+    local_buf = js_frame_alloc(caller_ctx, frame_size);
+    if (unlikely(!local_buf))
+        return JS_EXCEPTION;
 
     sf->is_strict_mode = b->is_strict_mode;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
@@ -19222,7 +19362,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->cur_func = unsafe_unconst(func_obj);
     var_refs = p->u.func.var_refs;
 
-    local_buf = alloca(alloca_size);
     if (unlikely(arg_allocated_size)) {
         int n = min_int(argc, b->arg_count);
         arg_buf = local_buf;
@@ -22452,6 +22591,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for(pval = local_buf; pval < sp; pval++) {
             JS_FreeValue(ctx, *pval);
         }
+        js_frame_free(rt, local_buf);
     }
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
