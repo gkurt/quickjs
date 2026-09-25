@@ -9654,7 +9654,8 @@ static no_inline int js_ic_put(JSContext *ctx, JSInlineCache *ic, JSObject *p,
    next object with the shape 'old_sh' gets the property without a
    lookup. With 'check_chain', the add depends on the prototypes (a
    setter or a read only property there would prevent it), so their
-   shapes are cached and none of them may have the property */
+   shapes are cached up to the first one having the property, which
+   must be a writable data property */
 static no_inline void js_ic_fill_add(JSContext *ctx, JSInlineCache *ic,
                                      JSObject *p, JSShape *old_sh,
                                      JSAtom atom, bool check_chain)
@@ -9682,12 +9683,24 @@ static no_inline void js_ic_fill_add(JSContext *ctx, JSInlineCache *ic,
     if (check_chain) {
         JSObject *p1 = new_sh->proto;
         while (p1) {
+            JSShapeProperty *prs;
             if (++depth > JS_IC_MAX_DEPTH || p1->is_exotic ||
                 p1->shape->prop_count > JS_IC_MAX_PROPS ||
-                p1->shape->deleted_prop_count != 0 ||
-                find_own_property(&unused, p1, atom))
+                p1->shape->deleted_prop_count != 0)
                 return;
             objs[depth] = p1;
+            prs = find_own_property(&unused, p1, atom);
+            if (prs) {
+                /* a writable data property of a prototype is shadowed
+                   by the add, as in 'C.prototype = { x: 0 }' followed
+                   by 'this.x = v' in the constructor. The cached shape
+                   of the prototype keeps it so, and the prototypes
+                   above do not matter */
+                if ((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) !=
+                    JS_PROP_WRITABLE)
+                    return;
+                break;
+            }
             p1 = p1->shape->proto;
         }
     }

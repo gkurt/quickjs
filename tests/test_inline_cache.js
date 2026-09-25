@@ -268,6 +268,37 @@ function test_property_add()
     delete proto.x;
     for (let i = 0; i < 8; i++)
         assert(make(proto, i).x, i);
+    /* the site is warm with the shadowed writable property, which
+       then becomes read only, then an accessor */
+    proto = { x: 0 };
+    for (let i = 0; i < 8; i++) {
+        o = make(proto, i);
+        assert(Object.hasOwn(o, "x"), true);
+        assert(o.x, i);
+    }
+    assert(proto.x, 0);
+    Object.defineProperty(proto, "x", { writable: false });
+    assertThrows(TypeError, () => make(proto, 1));
+    o = Object.create(proto);
+    sloppy_add(o, 1);
+    assert(Object.hasOwn(o, "x"), false);
+    Object.defineProperty(proto, "x", { writable: true });
+    for (let i = 0; i < 8; i++)
+        assert(make(proto, i).x, i);
+    set_count = 0;
+    Object.defineProperty(proto, "x", { set(v) { set_count++; }, configurable: true });
+    o = make(proto, 3);
+    assert(set_count, 1);
+    assert(Object.hasOwn(o, "x"), false);
+    /* shadowed two levels up, and a read only property above it
+       which does not matter */
+    const shadow_top = {};
+    Object.defineProperty(shadow_top, "x", { value: 1, writable: false });
+    proto = Object.create(Object.create(shadow_top, { x: { value: 2, writable: true } }));
+    for (let i = 0; i < 8; i++)
+        assert(make(proto, i).x, i);
+    Object.defineProperty(Object.getPrototypeOf(proto), "x", { writable: false });
+    assertThrows(TypeError, () => make(proto, 1));
     /* the prototype of the prototype gets the setter */
     proto = Object.create({});
     for (let i = 0; i < 8; i++)
