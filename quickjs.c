@@ -26872,6 +26872,16 @@ static int js_parse_is_arrow_params(JSParseState *s, bool allow_ret_type)
     JSParsePos pos;
     int tok, ret;
 
+    /* fast test: a parameter list starts with ')', an identifier, a
+       binding pattern or '...'. Rejecting the other tokens here avoids
+       scanning the whole parenthesized expression, e.g. the body of
+       (function () { ... })() */
+    tok = peek_token(s, false);
+    if (tok == TOK_FUNCTION || tok == '(' || tok == '"' || tok == '\'' ||
+        tok == '`' || tok == '!' || tok == '~' || tok == '-' || tok == '+' ||
+        tok == '/' || (tok >= '0' && tok <= '9'))
+        return 0;
+
     tok = js_parse_skip_parens_token(s, NULL, true);
     if (tok == TOK_ARROW)
         return 1;
