@@ -428,6 +428,10 @@ struct JSRuntime {
     int shape_hash_size;
     int shape_hash_count; /* number of hashed shapes */
     JSShape **shape_hash;
+    /* shape of the object an OP_put_field or OP_define_field is adding
+       a property to, referenced by the opcode to cache the transition
+       (see add_property()) */
+    JSShape *ic_add_shape;
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
@@ -1157,6 +1161,9 @@ struct JSShape {
     /* true if the shape is inserted in the shape hash table. If not,
        JSShape.hash is not valid */
     uint8_t is_hashed;
+    /* true for the shape of an object used as a dictionary (see
+       add_property()): never hashed, shared or cached, modified in place */
+    uint8_t is_dict;
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -5823,6 +5830,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh->prop_count = 0;
     sh->deleted_prop_count = 0;
     sh->is_hashed = false;
+    sh->is_dict = false;
     return sh;
 }
 
@@ -9320,7 +9328,10 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
 
 #define JS_IC_DISABLED 0xff
 /* objects with more properties are not cached */
-#define JS_IC_MAX_PROPS 128
+#define JS_IC_MAX_PROPS 1024
+/* objects with more properties become dictionaries when they get a
+   property while their shape is shared (see add_property()) */
+#define JS_DICT_MIN_PROPS 128
 
 /* allocate the inline caches of a function: 'count' entries, or one
    shared never filled entry at index 0xffff when there are more sites
@@ -9458,7 +9469,8 @@ static void js_ic_fill(JSRuntime *rt, JSInlineCache *ic, JSObject *p,
            the object changes: leave alone large objects used as
            dictionaries, and the deleted properties of a shared shape
            would be uninitialized in the objects created from it */
-        if (sh->prop_count > JS_IC_MAX_PROPS || sh->deleted_prop_count != 0)
+        if (sh->prop_count > JS_IC_MAX_PROPS || sh->deleted_prop_count != 0 ||
+            sh->is_dict)
             return;
         objs[i] = p;
         if (i == depth)
@@ -9649,6 +9661,22 @@ static no_inline int js_ic_put(JSContext *ctx, JSInlineCache *ic, JSObject *p,
     return 1;
 }
 
+/* Before the generic path adds a property to 'p' at a site with the
+   inline cache 'ic': return a reference to the shape of 'p' so that the
+   transition can be cached by js_ic_fill_add(), or NULL if it cannot
+   be. The shape is also recorded so that add_property() knows that the
+   extra reference is the site's, not a sign of a dictionary */
+static inline JSShape *js_ic_add_start(JSContext *ctx, JSInlineCache *ic,
+                                       JSObject *p)
+{
+    JSShape *sh = p->shape;
+    if (!sh->is_hashed || sh->prop_count >= JS_IC_MAX_PROPS ||
+        ic->e[0].depth == JS_IC_DISABLED)
+        return NULL;
+    ctx->rt->ic_add_shape = sh;
+    return js_dup_shape(sh);
+}
+
 /* The generic path just added the property 'atom' to 'p', changing its
    shape from 'old_sh' to p->shape: remember the transition so that the
    next object with the shape 'old_sh' gets the property without a
@@ -9686,7 +9714,7 @@ static no_inline void js_ic_fill_add(JSContext *ctx, JSInlineCache *ic,
             JSShapeProperty *prs;
             if (++depth > JS_IC_MAX_DEPTH || p1->is_exotic ||
                 p1->shape->prop_count > JS_IC_MAX_PROPS ||
-                p1->shape->deleted_prop_count != 0)
+                p1->shape->deleted_prop_count != 0 || p1->shape->is_dict)
                 return;
             objs[depth] = p1;
             prs = find_own_property(&unused, p1, atom);
@@ -10906,9 +10934,20 @@ static JSProperty *add_property(JSContext *ctx,
             new_sh = js_clone_shape(ctx, sh);
             if (!new_sh)
                 return NULL;
-            /* hash the cloned shape */
-            new_sh->is_hashed = true;
-            js_shape_hash_link(ctx->rt, new_sh);
+            if (sh->prop_count >= JS_DICT_MIN_PROPS &&
+                sh != ctx->rt->ic_add_shape) {
+                /* a large object gets a property which no access
+                   site remembers, typically 'o[key] = v', while its
+                   shape is shared, typically with an inline cache
+                   which read it: each such add would clone the whole
+                   shape again. Keep the clone for this object only,
+                   modified in place from now on and never cached */
+                new_sh->is_dict = true;
+            } else {
+                /* hash the cloned shape */
+                new_sh->is_hashed = true;
+                js_shape_hash_link(ctx->rt, new_sh);
+            }
             js_free_shape(ctx->rt, p->shape);
             p->shape = new_sh;
         }
@@ -20544,12 +20583,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     old_sh = NULL;
                     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
                         p = JS_VALUE_GET_OBJ(obj);
-                        if (p->shape->is_hashed)
-                            old_sh = js_dup_shape(p->shape);
+                        old_sh = js_ic_add_start(ctx, ic, p);
                     }
                     ret = JS_SetPropertyInternal2(ctx, obj, atom, sp[-1], obj,
                                                   JS_PROP_THROW_STRICT);
                     if (old_sh) {
+                        ctx->rt->ic_add_shape = NULL;
                         /* 'p' is kept alive by the stack */
                         if (ret > 0 && p->shape != old_sh)
                             js_ic_fill_add(ctx, ic, p, old_sh, atom, true);
@@ -20647,12 +20686,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto exception;
                     }
                 }
-                old_sh = NULL;
-                if (p->shape->is_hashed)
-                    old_sh = js_dup_shape(p->shape);
+                old_sh = js_ic_add_start(ctx, ic, p);
                 ret = JS_DefinePropertyValue(ctx, sp[-2], atom, sp[-1],
                                              JS_PROP_C_W_E | JS_PROP_THROW);
                 if (old_sh) {
+                    ctx->rt->ic_add_shape = NULL;
                     if (ret > 0 && p->shape != old_sh)
                         js_ic_fill_add(ctx, ic, p, old_sh, atom, false);
                     js_free_shape(ctx->rt, old_sh);

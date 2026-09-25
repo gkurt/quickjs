@@ -1043,6 +1043,74 @@ function test_dictionary_mode()
     assert(read(o), undefined);
     Object.setPrototypeOf(o, { k: 3 });
     assert(read(o), 3);
+
+    /* keyed adds to a large object which a site reads: the object
+       becomes a dictionary and stays correct */
+    const d = {};
+    for (let i = 0; i < 200; i++)
+        d["q" + i] = i;
+    const read_q5 = o => o.q5;
+    const read_k = o => o.k;
+    for (let i = 200; i < 3000; i++) {
+        d["q" + i] = i;
+        assert(read_q5(d), 5);
+        assert(read_k(d), undefined);
+    }
+    d.k = 7;
+    assert(read_k(d), 7);
+    delete d.q5;
+    assert(read_q5(d), undefined);
+    d.q5 = 55;
+    assert(read_q5(d), 55);
+    Object.defineProperty(d, "q5", { get() { return "getter"; } });
+    assert(read_q5(d), "getter");
+    for (let i = 0; i < 3000; i++)
+        assert(d["q" + i], i == 5 ? "getter" : i);
+    assert(Object.keys(d).length, 3001);
+}
+
+function test_large_objects()
+{
+    /* an object with more properties than a small cache limit, built
+       by a constructor, and its large prototype */
+    const n = 300;
+    const src = [];
+    for (let i = 0; i < n; i++)
+        src.push("this.f" + i + " = " + i + ";");
+    const C = Function(src.join("\n"));
+    for (let i = 0; i < n; i++)
+        C.prototype["m" + i] = Function("return this.f" + i + ";");
+    const read = Function("o", "return o.f250 + o.m10() + o.f0;");
+    let o;
+    for (let i = 0; i < 8; i++) {
+        o = new C();
+        assert(read(o), 250 + 10 + 0);
+    }
+    const o2 = new C();
+    assert(read(o2), 260);
+    o.f250 = 1;
+    assert(read(o), 1 + 10);
+    assert(read(o2), 260);
+    delete o.f0;
+    assert(read(o), NaN);
+    o2.m10 = function() { return 1000; };
+    assert(read(o2), 250 + 1000);
+    C.prototype.m10 = function() { return 20; };
+    assert(read(new C()), 250 + 20);
+    Object.defineProperty(o2, "f250", { get() { return 2; } });
+    assert(read(o2), 2 + 1000);
+    assert(Object.keys(new C()).length, n);
+
+    /* object literals larger than the cache limit */
+    const props = [];
+    for (let i = 0; i < 1500; i++)
+        props.push("p" + i + ": " + i);
+    const make = Function("return {" + props.join(",") + "};");
+    for (let k = 0; k < 3; k++) {
+        const lit = make();
+        assert(Object.keys(lit).length, 1500);
+        assert(lit.p0 + lit.p1023 + lit.p1024 + lit.p1499, 0 + 1023 + 1024 + 1499);
+    }
 }
 
 function test_class_instances()
@@ -1175,6 +1243,7 @@ test_two_shapes();
 test_primitive_receiver();
 test_local_receiver();
 test_dictionary_mode();
+test_large_objects();
 test_class_instances();
 test_gc();
 test_bytecode_roundtrip();
