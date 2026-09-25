@@ -78,7 +78,10 @@ extern "C" {
 #  define likely(x)       (x)
 #  define unlikely(x)     (x)
 #  define no_inline __declspec(noinline)
-#  define force_inline __forceinline
+/* not __forceinline: MSVC gives every inlined copy its own stack slots, which
+   grew the JS_CallInternal() frame from 4568 to 5880 bytes and cut the
+   recursion depth by a fifth; GCC and clang share them and are unaffected */
+#  define force_inline inline
 #  define __maybe_unused
 #  define __attribute__(x)
 #  define __attribute(x)
