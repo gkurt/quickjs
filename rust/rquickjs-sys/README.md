@@ -11,15 +11,16 @@ Keep using rquickjs from crates.io and replace its `-sys` crate with this one:
 rquickjs = "0.14"
 
 [patch.crates-io]
-rquickjs-sys = { git = "https://github.com/gkurt/quickjs", branch = "next" }
+rquickjs-sys = { git = "https://github.com/gkurt/quickjs" }
 ```
 
 Every crate of your build that uses rquickjs, directly or not, then runs on
 this engine: about 1.8x faster on the fork's micro benchmarks. The rquickjs
 test suite passes with it (CI runs it on Linux, macOS and Windows).
 
-Pin a commit with `rev = "..."` in place of `branch` for reproducible builds;
-`Cargo.lock` records the commit either way. Cargo does not fetch the test262
+Cargo takes the default branch of the repository, `next`, and records the
+commit in `Cargo.lock`: `cargo update -p rquickjs-sys` moves to the latest
+one. Add `rev = "..."` to pin a commit. Cargo does not fetch the test262
 submodule of the repository.
 
 ## TypeScript
