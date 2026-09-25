@@ -27,7 +27,8 @@ const sum = (n) => 5 * n * (n + 1) / 2;
 
 // the calls of big() which fit in the stack depend on the build (the
 // sanitizers and the unoptimized builds use much larger C frames: 45 calls
-// with clang -O0 in a thread of run-test262): the tests use half of them
+// with clang -O0 in a thread of run-test262, fewer than 8 with clang -O0
+// and ASan): the tests use half of them, and are skipped when too few fit
 let max_depth = 0;
 function probe(n)
 {
@@ -41,7 +42,6 @@ function probe(n)
 }
 assertThrows(RangeError, () => probe(0));
 const DEPTH = Math.min(900, max_depth >> 1);
-assert(max_depth >= 8, true);
 
 function test_deep_calls()
 {
@@ -173,9 +173,14 @@ async function test_async()
     assert(r.join(), [1, 2, 3].map(n => sum(DEPTH >> 1) + n).join());
 }
 
-test_deep_calls();
-test_closures();
-test_exceptions();
-test_stack_overflow();
-test_generators();
-await test_async();
+if (DEPTH >= 8) {
+    test_deep_calls();
+    test_closures();
+    test_exceptions();
+    test_stack_overflow();
+    test_generators();
+    await test_async();
+} else {
+    print(`test_frames.js: ${max_depth} calls fit in the stack, too few for the tests`);
+    assert(big(0, 5), 5);
+}
