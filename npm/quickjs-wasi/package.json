@@ -1,0 +1,16 @@
+{
+  "name": "@gkurt/quickjs-wasi",
+  "version": "0.1.0",
+  "description": "quickjs-wasi with the gkurt/quickjs engine: a faster QuickJS-NG compiled to WASM for the browser, Node.js and Bun.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gkurt/quickjs.git",
+    "directory": "npm/quickjs-wasi"
+  },
+  "homepage": "https://github.com/gkurt/quickjs/tree/next/npm/quickjs-wasi#readme",
+  "keywords": ["quickjs", "wasm", "wasi", "sandbox", "javascript", "typescript"],
+  "publishConfig": {
+    "access": "public"
+  }
+}
