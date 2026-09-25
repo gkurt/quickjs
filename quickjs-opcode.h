@@ -374,6 +374,7 @@ DEF(   is_undefined, 1, 1, 1, none)
 DEF(        is_null, 1, 1, 1, none)
 DEF(typeof_is_undefined, 1, 1, 1, none)
 DEF( typeof_is_function, 1, 1, 1, none)
+DEF(to_propkey_cond, 1, 2, 2, none) /* to_propkey unless the object is null or undefined */
 
 #undef DEF
 #undef def
