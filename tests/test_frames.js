@@ -26,7 +26,8 @@ function big(n, acc)
 const sum = (n) => 5 * n * (n + 1) / 2;
 
 // the calls of big() which fit in the stack depend on the build (the
-// sanitizers use larger C frames): the tests use half of them
+// sanitizers and the unoptimized builds use much larger C frames: 45 calls
+// with clang -O0 in a thread of run-test262): the tests use half of them
 let max_depth = 0;
 function probe(n)
 {
@@ -40,7 +41,7 @@ function probe(n)
 }
 assertThrows(RangeError, () => probe(0));
 const DEPTH = Math.min(900, max_depth >> 1);
-assert(DEPTH >= 50, true);
+assert(max_depth >= 8, true);
 
 function test_deep_calls()
 {
@@ -133,7 +134,7 @@ function test_generators()
     function* gen(n) {
         let a = n;
         for (let i = 0; i < 3; i++) {
-            const r = big(50 + i, a);
+            const r = big((DEPTH >> 2) + i, a);
             yield r;
         }
     }
@@ -144,9 +145,9 @@ function test_generators()
             return drive(depth - 1);
         for (let k = 0; k < 3; k++)
             for (const g of gens)
-                out.push(g.next().value - big(50 + k, 0));
+                out.push(g.next().value - big((DEPTH >> 2) + k, 0));
     }
-    drive(DEPTH >> 1);
+    drive(DEPTH >> 2);
     assert(out.join(), "1,2,3,1,2,3,1,2,3");
     // a generator resumed from deep calls, calling deep itself
     function* deep() {
