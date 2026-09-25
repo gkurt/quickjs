@@ -1,6 +1,6 @@
 // Fast paths of the interpreter and the runtime which must keep the
 // generic semantics: the computed property store, the global variable
-// cache, ...
+// cache, arrays made fast again when they become dense, ...
 import * as std from "qjs:std";
 import { assert, assertThrows } from "./assert.js";
 
@@ -186,5 +186,110 @@ function test_global_var_cache()
     assert(gv3_read(), "lexical2");
 }
 
+function test_array_dense_again()
+{
+    const fill_back = (n, f = i => i) => {
+        const a = [];
+        let i = n;
+        while (--i >= 0)
+            a[i] = f(i);
+        return a;
+    };
+    let a = fill_back(50);
+    assert(a.length, 50);
+    assert(a.join(), Array.from({ length: 50 }, (v, i) => i).join());
+    assert(Object.keys(a).join(), Object.keys(Array.from({ length: 50 }, (v, i) => i)).join());
+    a.push(50);
+    a[51] = 51;
+    assert(a.length, 52);
+    assert(a[51] + a[50] + a[0], 101);
+    assert(a.indexOf(25), 25);
+    a.length = 10;
+    assert(a.join(), "0,1,2,3,4,5,6,7,8,9");
+    delete a[3];
+    assert(3 in a, false);
+    assert(a.length, 10);
+    a[3] = "x";
+    assert(a.join(), "0,1,2,x,4,5,6,7,8,9");
+
+    // holes are not filled
+    a = [];
+    a[5] = 5;
+    a[3] = 3;
+    a[1] = 1;
+    assert(a.length, 6);
+    assert(0 in a, false);
+    assert(JSON.stringify(a), "[null,1,null,3,null,5]");
+    a[0] = 0; a[2] = 2; a[4] = 4;
+    assert(JSON.stringify(a), "[0,1,2,3,4,5]");
+    assert(a.map(x => x * 2).join(), "0,2,4,6,8,10");
+
+    // a named property, an accessor element, a read only element
+    a = [];
+    a.foo = "bar";
+    for (let i = 9; i >= 0; i--)
+        a[i] = i;
+    assert(a.foo, "bar");
+    assert(a.join(), "0,1,2,3,4,5,6,7,8,9");
+    a.push(10);
+    assert(a.length, 11);
+    assert(Object.keys(a).join(), "0,1,2,3,4,5,6,7,8,9,10,foo");
+
+    let gets = 0;
+    a = [];
+    a[3] = 3;
+    Object.defineProperty(a, 2, { get() { gets++; return "g"; }, enumerable: true, configurable: true });
+    a[1] = 1;
+    a[0] = 0;
+    assert(a.join(), "0,1,g,3");
+    assert(gets, 1);
+    for (let i = 4; i < 100; i++)
+        a[i] = i;
+    assert(a[2], "g");
+    assert(a.length, 100);
+
+    a = [];
+    a[2] = 2;
+    Object.defineProperty(a, 1, { value: 1, writable: false, enumerable: true, configurable: true });
+    a[0] = 0;
+    assert(a.join(), "0,1,2");
+    Function("a", "a[1] = 5;")(a);   // sloppy: ignored
+    assert(a[1], 1);
+    assertThrows(TypeError, () => { a[1] = 5; });
+
+    // read only length, frozen, not extensible
+    a = [];
+    a[1] = 1;
+    Object.defineProperty(a, "length", { writable: false });
+    a[0] = 0;
+    assert(a.join(), "0,1");
+    assertThrows(TypeError, () => { a[2] = 2; });
+    assert(a.length, 2);
+    a = [];
+    a[1] = 1;
+    a[0] = 0;
+    Object.freeze(a);
+    assertThrows(TypeError, () => { a[0] = 5; });
+    assert(a[0], 0);
+
+    // a subclass
+    class MyArray extends Array {}
+    a = new MyArray();
+    a[2] = 2; a[1] = 1; a[0] = 0;
+    assert(a instanceof MyArray, true);
+    assert(a.join(), "0,1,2");
+    assert(a.map(x => x + 1) instanceof MyArray, true);
+
+    // typed values and objects survive the move to the fast array
+    a = fill_back(20, i => ({ v: i }));
+    let sum = 0;
+    for (const o of a)
+        sum += o.v;
+    assert(sum, 190);
+    a = fill_back(30, i => "s" + i);
+    assert(a.sort().slice(0, 3).join(), "s0,s1,s10");
+}
+
 test_computed_store_order();
 test_global_var_cache();
+test_array_dense_again();

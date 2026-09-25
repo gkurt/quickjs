@@ -1190,6 +1190,7 @@ struct JSObject {
     uint8_t is_uncatchable_error : 1; /* if true, error is not catchable */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
+    uint8_t array_stay_slow : 1; /* see js_array_make_fast() */
     uint16_t class_id; /* see JS_CLASS_x */
     uint32_t prop_size; /* allocated properties, at least shape->prop_size */
     /* byte offsets: 16/24 */
@@ -6288,6 +6289,7 @@ static JSValue JS_NewObjectFromShape2(JSContext *ctx, JSShape *sh,
     p->is_uncatchable_error = 0;
     p->tmp_mark = 0;
     p->is_HTMLDDA = 0;
+    p->array_stay_slow = 0;
     p->is_prototype = 0;
     p->first_weak_ref = NULL;
     p->u.opaque = NULL;
@@ -11013,6 +11015,60 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
     return 0;
 }
 
+/* An array which is not fast has just got the element property 'prop'.
+   Make it fast again if it has become dense: an array filled from the
+   end, 'while (--i >= 0) a[i] = 0', is converted on its first write and
+   would otherwise stay slow, all its elements being hashed properties.
+   The array is dense when its only properties besides 'length' are its
+   'length' elements (all below 'length': distinct, they are 0 to
+   length - 1), plain writable, enumerable and configurable values. The
+   count is checked first so that most adds cost a comparison; when a
+   complete check fails the array is left slow for good, so that an
+   array appended to after such a failure is not scanned again on every
+   element. */
+static void js_array_make_fast(JSContext *ctx, JSObject *p)
+{
+    JSShape *sh = p->shape, *array_sh = ctx->array_shape;
+    JSShapeProperty *prs;
+    JSValue *values;
+    uint32_t i, len, idx;
+
+    if (JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT)
+        return;
+    len = JS_VALUE_GET_INT(p->prop[0].u.value);
+    if (sh->prop_count - sh->deleted_prop_count - 1 != len)
+        return;
+    prs = get_shape_prop(sh);
+    if (len == 0 || !p->extensible || !array_sh ||
+        sh->proto != array_sh->proto ||
+        prs[0].flags != get_shape_prop(array_sh)[0].flags ||
+        p->prop_size < array_sh->prop_size) {
+        p->array_stay_slow = 1;
+        return;
+    }
+    values = js_malloc(ctx, sizeof(values[0]) * len);
+    if (!values)
+        return; /* not an error: the array stays slow */
+    for(i = 1; i < sh->prop_count; i++) {
+        if (prs[i].atom == JS_ATOM_NULL)
+            continue;
+        if (prs[i].flags != JS_PROP_C_W_E || !__JS_AtomIsTaggedInt(prs[i].atom)) {
+            js_free(ctx, values);
+            p->array_stay_slow = 1;
+            return;
+        }
+        idx = __JS_AtomToUInt32(prs[i].atom);
+        values[idx] = p->prop[i].u.value;
+    }
+    /* the values move to the fast array, the length stays in prop[0] */
+    p->shape = js_dup_shape(array_sh);
+    js_free_shape(ctx->rt, sh);
+    p->u.array.u.values = values;
+    p->u.array.count = len;
+    p->u.array.u1.size = len;
+    p->fast_array = 1;
+}
+
 static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
 {
     JSShape *sh;
@@ -11909,6 +11965,9 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
             pr->u.value = JS_UNDEFINED;
         }
     }
+    if (unlikely(p->class_id == JS_CLASS_ARRAY) && !p->fast_array &&
+        !p->array_stay_slow && __JS_AtomIsTaggedInt(prop))
+        js_array_make_fast(ctx, p);
     return true;
 }
 
