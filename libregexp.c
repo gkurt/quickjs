@@ -2641,6 +2641,22 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
             memmove(bc, bc + prefix_len,
                     s->byte_code.size - RE_HEADER_LEN - prefix_len);
             s->byte_code.size -= prefix_len;
+        } else if (bc[prefix_len] == REOP_save_start &&
+                   bc[prefix_len + 2] == REOP_char) {
+            /* a pattern starting with a character (case sensitive,
+               not a quantified or alternative atom, which start with
+               another opcode) can only match where the character
+               occurs: the loop over the start positions skips to its
+               next occurrence first */
+            uint32_t c = get_u16(bc + prefix_len + 3);
+            if ((c < 0xd800 || c > 0xdfff) &&
+                !dbuf_insert(&s->byte_code, RE_HEADER_LEN, 3)) {
+                bc = s->byte_code.buf + RE_HEADER_LEN;
+                bc[0] = REOP_skip_to_char;
+                put_u16(bc + 1, c);
+                /* the goto of the loop now jumps to REOP_skip_to_char */
+                put_u32(bc + 3 + 5 + 1 + 1, -(3 + 5 + 1 + 5));
+            }
         }
     }
 
@@ -2964,6 +2980,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
         [REOP_set_char_pos] = &&case_REOP_set_char_pos,
         [REOP_check_advance] = &&case_REOP_check_advance,
         [REOP_prev] = &&case_REOP_prev,
+        [REOP_skip_to_char] = &&case_REOP_skip_to_char,
         [REOP_COUNT ... 255] = &&case_default,
     };
 #define RE_NEXT         { opcode = *pc++; goto *dispatch_table[opcode]; }
@@ -3113,6 +3130,27 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
             sp[2].bp.type = RE_EXEC_STATE_LOOKAHEAD + opcode - REOP_lookahead;
             sp += 3;
             bp = sp;
+            RE_NEXT;
+        RE_CASE(REOP_skip_to_char):
+            val = get_u16(pc);
+            pc += 2;
+            if (cbuf_type == 0) {
+                const uint8_t *p1;
+                if (val > 0xff)
+                    goto no_match;
+                p1 = memchr(cptr, val, cbuf_end - cptr);
+                if (!p1)
+                    goto no_match;
+                cptr = p1;
+            } else {
+                const uint16_t *p1 = (const uint16_t *)cptr;
+                const uint16_t *p_end = (const uint16_t *)cbuf_end;
+                while (p1 < p_end && *p1 != val)
+                    p1++;
+                if (p1 == p_end)
+                    goto no_match;
+                cptr = (const uint8_t *)p1;
+            }
             RE_NEXT;
         RE_CASE(REOP_goto):
             val = get_u32(pc);

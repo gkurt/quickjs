@@ -3,7 +3,7 @@
 // cache, arrays made fast again when they become dense, comparisons
 // fused with the conditional jump which follows them, 'x | 0', the
 // elements of typed arrays read inline, Function.prototype.apply() on
-// arrays and arguments objects, ...
+// arrays and arguments objects, regexps starting with a character, ...
 import * as std from "qjs:std";
 import { assert, assertThrows } from "./assert.js";
 
@@ -460,4 +460,37 @@ function test_apply()
 }
 
 test_typed_array_read();
+function test_regexp_first_char()
+{
+    const cases = [
+        [/a/, "xxa", "2:a"], [/ab/, "xaxab", "3:ab"], [/ab/, "xyz", "null"],
+        [/é/, "caféé", "3:é"], [/中/, "abc中def", "3:中"],
+        [/a+b/, "aaab", "0:aaab"], [/a(b)c/, "xxabc", "2:abc"],
+        [/😀/u, "x😀", "1:😀"], [/a/u, "x😀a", "3:a"], [/a/y, "ba", "null"],
+        [/a/i, "xA", "1:A"], [/\u0101/, "x\u0101", "1:\u0101"],
+        [/\u0101/, "xxxx", "null"], [/a|b/, "cb", "1:b"], [/a?b/, "cb", "1:b"],
+        [/a/, "", "null"], [/a/, "a", "0:a"], [/a$/, "aab", "null"],
+        [/a\b/, "ab a", "3:a"], [/x(?=y)/, "xzxy", "2:x"],
+        [/\ud83d/, "a\ud83d\ude00", "1:\ud83d"],
+    ];
+    for (const [re, str, expect] of cases) {
+        const m = re.exec(str);
+        assert(m ? m.index + ":" + m[0] : "null", expect);
+    }
+    const g = /a/g, found = [];
+    let m;
+    while ((m = g.exec("banana")) !== null)
+        found.push(m.index);
+    assert(found.join(), "1,3,5");
+    assert("x-a-b-a".replace(/a/g, "!"), "x-!-b-!");
+    assert("aXbXc".split(/X/).join("|"), "a|b|c");
+    const big = "x".repeat(10000) + "needle";
+    assert(/needle/.exec(big).index, 10000);
+    assert(/q/.test(big), false);
+    const re = /n/g;
+    re.lastIndex = 3;
+    assert(re.exec("nnnxn").index, 4);
+}
+
 test_apply();
+test_regexp_first_char();
