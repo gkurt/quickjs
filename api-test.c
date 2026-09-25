@@ -204,6 +204,41 @@ static void sync_call(void)
     JS_FreeRuntime(rt);
 }
 
+/* the interrupts are polled on backward jumps: every form of loop must
+   still be interrupted */
+static void interrupt_loops(void)
+{
+    static const char *const codes[] = {
+        "for (;;) {}",
+        "while (true) {}",
+        "var i = 0; do { i++; } while (i > 0);",
+        "var i = 0; while (i >= 0) { if (i & 1) i += 2; else i += 1; i = i & 7; }",
+        "for (let i = 0; ; i++) { if (i < 0) break; }",
+        "l: while (true) { continue l; }",
+        "for (const x of (function* () { for (;;) yield 1; })()) {}",
+        "(function f() { return f(); })()",
+        "var i = 0; while (i < 1) { i = i < 0 ? 1 : i; }",
+    };
+    size_t i;
+
+    for (i = 0; i < countof(codes); i++) {
+        JSRuntime *rt = new_runtime();
+        JSContext *ctx = JS_NewContext(rt);
+        int time = 0;
+        JS_SetInterruptHandler(rt, timeout_interrupt_handler, &time);
+        JSValue ret = eval(ctx, codes[i]);
+        assert(JS_IsException(ret));
+        JS_FreeValue(ctx, ret);
+        JSValue e = JS_GetException(ctx);
+        /* the recursion may overflow the stack before the handler is
+           called often enough */
+        assert(time > MAX_TIME || !JS_IsUncatchableError(e));
+        JS_FreeValue(ctx, e);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+    }
+}
+
 static void async_call(void)
 {
     static const char code[] =
@@ -2235,6 +2270,7 @@ int main(void)
     add_intrinsic_bigint();
     new_typed_array();
     std_eval_interrupt_handler();
+    interrupt_loops();
     private_symbols();
     return 0;
 }

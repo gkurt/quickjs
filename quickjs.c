@@ -20190,20 +20190,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+            /* the interrupts are polled on the backward jumps only,
+               which every loop has, and on the function calls: the
+               forward jumps of the conditionals need not */
         CASE(OP_goto):
-            pc += (int32_t)get_u32(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int32_t diff = get_u32(pc);
+                pc += diff;
+                if (diff < 0 && unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+            }
             BREAK;
         CASE(OP_goto16):
-            pc += (int16_t)get_u16(pc);
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int16_t diff = get_u16(pc);
+                pc += diff;
+                if (diff < 0 && unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+            }
             BREAK;
         CASE(OP_goto8):
-            pc += (int8_t)pc[0];
-            if (unlikely(js_poll_interrupts(ctx)))
-                goto exception;
+            {
+                int8_t diff = pc[0];
+                pc += diff;
+                if (diff < 0 && unlikely(js_poll_interrupts(ctx)))
+                    goto exception;
+            }
             BREAK;
         CASE(OP_if_true):
             {
@@ -20219,10 +20231,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (res) {
-                    pc += (int32_t)get_u32(pc - 4) - 4;
+                    int32_t diff = (int32_t)get_u32(pc - 4) - 4;
+                    pc += diff;
+                    if (diff < 0 && unlikely(js_poll_interrupts(ctx)))
+                        goto exception;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
             }
             BREAK;
         CASE(OP_if_false):
@@ -20239,10 +20252,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (!res) {
-                    pc += (int32_t)get_u32(pc - 4) - 4;
+                    int32_t diff = (int32_t)get_u32(pc - 4) - 4;
+                    pc += diff;
+                    if (diff < 0 && unlikely(js_poll_interrupts(ctx)))
+                        goto exception;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
             }
             BREAK;
         CASE(OP_if_true8):
@@ -20259,10 +20273,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (res) {
-                    pc += (int8_t)pc[-1] - 1;
+                    int32_t diff = (int8_t)pc[-1] - 1;
+                    pc += diff;
+                    if (diff < 0 && unlikely(js_poll_interrupts(ctx)))
+                        goto exception;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
             }
             BREAK;
         CASE(OP_if_false8):
@@ -20279,10 +20294,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (!res) {
-                    pc += (int8_t)pc[-1] - 1;
+                    int32_t diff = (int8_t)pc[-1] - 1;
+                    pc += diff;
+                    if (diff < 0 && unlikely(js_poll_interrupts(ctx)))
+                        goto exception;
                 }
-                if (unlikely(js_poll_interrupts(ctx)))
-                    goto exception;
             }
             BREAK;
         CASE(OP_catch):
