@@ -594,6 +594,9 @@ struct JSContext {
        JSFunctionKindEnum, created on first use */
     JSShape *closure_shape[4];
     JSShape *ctor_closure_shape;
+    /* global variable cache (see js_global_var_cache_find()), allocated
+       on first use */
+    struct JSGlobalVarCache *global_var_cache;
 
     JSValue *class_proto;
     JSValue function_proto;
@@ -3183,6 +3186,8 @@ void JS_FreeContext(JSContext *ctx)
 
     JS_FreeValue(ctx, ctx->global_obj);
     JS_FreeValue(ctx, ctx->global_var_obj);
+    js_free_rt(rt, ctx->global_var_cache);
+    ctx->global_var_cache = NULL;
 
     JS_FreeValue(ctx, ctx->throw_type_error);
     JS_FreeValue(ctx, ctx->eval_obj);
@@ -12581,6 +12586,80 @@ static int JS_DefineGlobalFunction(JSContext *ctx, JSAtom prop,
     return 0;
 }
 
+/* Cache of the global variables read or written by OP_get_var and
+   OP_put_var: the slot of the variable in global_var_obj (lexical
+   declarations) or global_obj, found from the atom without a hashed
+   lookup in these large objects. An entry validates itself: the slot
+   must still hold a plain data property of the same name, which fails
+   when it is deleted, moved by compact_properties() or made an
+   accessor, and no lexical declaration, which would shadow a property
+   of global_obj, may have been added since it was filled. */
+#define JS_GLOBAL_VAR_CACHE_SIZE 256 /* power of two */
+#define JS_GLOBAL_VAR_CACHE_LEXICAL (1U << 31) /* in global_var_obj */
+
+typedef struct JSGlobalVarCache {
+    JSAtom atom; /* JS_ATOM_NULL: empty */
+    uint32_t idx; /* property index, with JS_GLOBAL_VAR_CACHE_LEXICAL */
+    uint32_t lexical_count; /* global_var_obj->shape->prop_count */
+} JSGlobalVarCache;
+
+/* return the property of the global variable 'atom' if it is cached,
+   with its shape property in '*pprs', NULL otherwise */
+static force_inline JSProperty *js_global_var_cache_find(JSContext *ctx,
+                                                         JSAtom atom,
+                                                         JSShapeProperty **pprs)
+{
+    JSGlobalVarCache *e;
+    JSShapeProperty *prs;
+    JSObject *p;
+    JSShape *sh;
+    uint32_t idx;
+
+    if (unlikely(!ctx->global_var_cache))
+        return NULL;
+    e = &ctx->global_var_cache[atom & (JS_GLOBAL_VAR_CACHE_SIZE - 1)];
+    if (e->atom != atom)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    if (unlikely(e->lexical_count != p->shape->prop_count))
+        return NULL;
+    idx = e->idx;
+    if (!(idx & JS_GLOBAL_VAR_CACHE_LEXICAL))
+        p = JS_VALUE_GET_OBJ(ctx->global_obj);
+    idx &= ~JS_GLOBAL_VAR_CACHE_LEXICAL;
+    sh = p->shape;
+    if (unlikely(idx >= sh->prop_count))
+        return NULL;
+    prs = &get_shape_prop(sh)[idx];
+    if (unlikely(prs->atom != atom || (prs->flags & JS_PROP_TMASK)))
+        return NULL;
+    *pprs = prs;
+    return &p->prop[idx];
+}
+
+/* remember that the global variable 'atom' is the data property 'prs'
+   of global_var_obj ('lexical' set) or global_obj */
+static void js_global_var_cache_fill(JSContext *ctx, JSAtom atom,
+                                     JSShapeProperty *prs, bool lexical)
+{
+    JSGlobalVarCache *e;
+    JSObject *p;
+
+    if (!ctx->global_var_cache) {
+        ctx->global_var_cache = js_mallocz_rt(ctx->rt,
+                                              sizeof(JSGlobalVarCache) *
+                                              JS_GLOBAL_VAR_CACHE_SIZE);
+        if (!ctx->global_var_cache)
+            return;
+    }
+    p = JS_VALUE_GET_OBJ(lexical ? ctx->global_var_obj : ctx->global_obj);
+    e = &ctx->global_var_cache[atom & (JS_GLOBAL_VAR_CACHE_SIZE - 1)];
+    e->atom = atom;
+    e->idx = (prs - get_shape_prop(p->shape)) |
+        (lexical ? JS_GLOBAL_VAR_CACHE_LEXICAL : 0);
+    e->lexical_count = JS_VALUE_GET_OBJ(ctx->global_var_obj)->shape->prop_count;
+}
+
 static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
                                bool throw_ref_error)
 {
@@ -12595,6 +12674,8 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
         /* XXX: should handle JS_PROP_TMASK properties */
         if (unlikely(JS_IsUninitialized(pr->u.value)))
             return JS_ThrowReferenceErrorUninitialized(ctx, prs->atom);
+        if ((prs->flags & JS_PROP_TMASK) == 0)
+            js_global_var_cache_fill(ctx, prop, prs, true);
         return js_dup(pr->u.value);
     }
 
@@ -12602,8 +12683,10 @@ static JSValue JS_GetGlobalVar(JSContext *ctx, JSAtom prop,
     p = JS_VALUE_GET_OBJ(ctx->global_obj);
     prs = find_own_property(&pr, p, prop);
     if (prs) {
-        if (likely((prs->flags & JS_PROP_TMASK) == 0))
+        if (likely((prs->flags & JS_PROP_TMASK) == 0)) {
+            js_global_var_cache_fill(ctx, prop, prs, false);
             return js_dup(pr->u.value);
+        }
     }
     return JS_GetPropertyInternal(ctx, ctx->global_obj, prop,
                                  ctx->global_obj, throw_ref_error);
@@ -12673,6 +12756,8 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
                 return JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, prop);
             }
         }
+        if ((prs->flags & JS_PROP_TMASK) == 0)
+            js_global_var_cache_fill(ctx, prop, prs, true);
         set_value(ctx, &pr->u.value, val);
         return 0;
     }
@@ -12683,6 +12768,7 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
         if (likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast path */
+            js_global_var_cache_fill(ctx, prop, prs, false);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -19689,6 +19775,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 opcode = pc[-1];
                 atom = get_u32(pc);
                 pc += 4;
+                {
+                    JSShapeProperty *prs;
+                    JSProperty *pr = js_global_var_cache_find(ctx, atom, &prs);
+                    if (likely(pr && !JS_IsUninitialized(pr->u.value))) {
+                        *sp++ = js_dup(pr->u.value);
+                        BREAK;
+                    }
+                }
                 sf->cur_pc = pc;
 
                 val = JS_GetGlobalVar(ctx, atom, opcode - OP_get_var_undef);
@@ -19706,6 +19800,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 opcode = pc[-1];
                 atom = get_u32(pc);
                 pc += 4;
+                if (opcode == OP_put_var) {
+                    JSShapeProperty *prs;
+                    JSProperty *pr = js_global_var_cache_find(ctx, atom, &prs);
+                    if (likely(pr && (prs->flags & (JS_PROP_WRITABLE | JS_PROP_LENGTH)) ==
+                               JS_PROP_WRITABLE &&
+                               !JS_IsUninitialized(pr->u.value))) {
+                        set_value(ctx, &pr->u.value, sp[-1]);
+                        sp--;
+                        BREAK;
+                    }
+                }
                 sf->cur_pc = pc;
 
                 ret = JS_SetGlobalVar(ctx, atom, sp[-1], opcode - OP_put_var);

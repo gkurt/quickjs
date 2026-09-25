@@ -1,5 +1,7 @@
 // Fast paths of the interpreter and the runtime which must keep the
-// generic semantics: the computed property store, ...
+// generic semantics: the computed property store, the global variable
+// cache, ...
+import * as std from "qjs:std";
 import { assert, assertThrows } from "./assert.js";
 
 function test_computed_store_order()
@@ -85,4 +87,104 @@ function test_computed_store_order()
     assert(ta.join(), "0,2,4,6");
 }
 
+function test_global_var_cache()
+{
+    // global code, where var and function declarations are properties
+    // of the global object and let/const are global lexical variables
+    const run = (src) => std.evalScript(src);
+
+    globalThis.gv1 = 1; // configurable, unlike a var declaration
+    run("function gv_read() { return gv1; }" +
+        "function gv_write(v) { gv1 = v; }" +
+        "function gv_typeof() { return typeof gv1; }");
+    for (let i = 0; i < 4; i++)
+        assert(gv_read(), 1);
+    globalThis.gv1 = 2;
+    assert(gv_read(), 2);
+    gv_write(3);
+    assert(globalThis.gv1, 3);
+    assert(gv_read(), 3);
+
+    // delete, then define again
+    globalThis.gv2 = 10;
+    run("function gv2_read() { return gv2; }");
+    assert(gv2_read(), 10);
+    delete globalThis.gv2;
+    assertThrows(ReferenceError, gv2_read);
+    run("function gv2_typeof() { return typeof gv2; }");
+    assert(gv2_typeof(), "undefined");
+    globalThis.gv2 = 11;
+    assert(gv2_read(), 11);
+    assert(gv2_typeof(), "number");
+
+    // accessor, read only
+    let gets = 0;
+    Object.defineProperty(globalThis, "gv1", {
+        get() { gets++; return "getter"; }, set(v) { gets += 10; },
+        configurable: true });
+    assert(gv_read(), "getter");
+    gv_write(5);
+    assert(gets, 11);
+    Object.defineProperty(globalThis, "gv1", { value: 7, writable: false,
+                                               configurable: true });
+    assert(gv_read(), 7);
+    gv_write(8);            // sloppy: ignored
+    assert(gv_read(), 7);
+    run("'use strict'; function gv_write_strict(v) { gv1 = v; }");
+    assertThrows(TypeError, () => gv_write_strict(9));
+    Object.defineProperty(globalThis, "gv1", { writable: true });
+    gv_write(12);
+    assert(gv_read(), 12);
+
+    // a lexical declaration shadows a property of the global object
+    globalThis.gv3 = "property";
+    run("function gv3_read() { return gv3; } function gv3_write(v) { gv3 = v; }");
+    assert(gv3_read(), "property");
+    gv3_write("property2");
+    assert(globalThis.gv3, "property2");
+    run("let gv3 = 'lexical';");
+    assert(gv3_read(), "lexical");
+    gv3_write("lexical2");
+    assert(gv3_read(), "lexical2");
+    assert(globalThis.gv3, "property2");
+
+    // uninitialized lexical variable
+    run("function gv4_read() { return gv4; } function gv4_write(v) { gv4 = v; }");
+    assertThrows(ReferenceError, () =>
+                 run("gv4_read(); let gv4 = 1;"));
+    assertThrows(ReferenceError, gv4_read);
+    assertThrows(ReferenceError, () => gv4_write(2));
+    assertThrows(ReferenceError, gv4_read);
+
+    // const
+    run("const gv5 = 1; function gv5_read() { return gv5; }" +
+        "function gv5_write(v) { gv5 = v; }");
+    for (let i = 0; i < 4; i++) {
+        assert(gv5_read(), 1);
+        assertThrows(TypeError, () => gv5_write(2));
+    }
+
+    // atoms sharing a cache slot, and many deleted properties so that
+    // the properties of the global object are compacted
+    const names = [];
+    for (let i = 0; i < 600; i++)
+        names.push("gv_many" + i);
+    run(names.map((n, i) => "var " + n + " = " + i + ";").join("") +
+        "function gv_many_sum() { return " + names.join("+") + "; }");
+    const sum = names.reduce((s, n, i) => s + i, 0);
+    for (let i = 0; i < 3; i++)
+        assert(gv_many_sum(), sum);
+    for (let i = 0; i < 600; i += 2)
+        globalThis[names[i]] = 0;
+    assert(gv_many_sum(), names.reduce((s, n, i) => s + (i & 1 ? i : 0), 0));
+    for (let i = 0; i < 400; i++)
+        globalThis["gv_tmp" + i] = i;
+    for (let i = 0; i < 400; i++)
+        delete globalThis["gv_tmp" + i];
+    assert(gv_many_sum(), names.reduce((s, n, i) => s + (i & 1 ? i : 0), 0));
+    assert(gv_read(), 12);
+    assert(gv3_read(), "lexical2");
+}
+
 test_computed_store_order();
+test_global_var_cache();
