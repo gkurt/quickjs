@@ -1,29 +1,22 @@
 name: npm-publish
 
-# Publishes the npm package in npm/quickjs-wasi, built by build.sh as in
-# quickjs-wasi.yml, after the quickjs-wasi tests and the smoke test pass.
+# Publishes the npm package in npm/quickjs-wasi whenever its version is not on
+# npm yet: bump "version" in npm/quickjs-wasi/package.json and push to next.
+# A run whose version is already published does nothing. It can also be run
+# by hand. The package is built by build.sh as in quickjs-wasi.yml, and only
+# published once the quickjs-wasi tests and the smoke test pass.
 #
-# To release: bump "version" in npm/quickjs-wasi/package.json, merge, then
-# push the tag quickjs-wasi-v<version> (for example quickjs-wasi-v0.1.0), or
-# run this workflow by hand with dry_run unchecked. A manual run with dry_run
-# checked, the default, builds and tests everything and stops at
-# `npm publish --dry-run`.
-#
-# Authentication: an npm trusted publisher for this repository and workflow
-# (no secret needed, npm >= 11.5.1), or an NPM_TOKEN secret with publish
-# rights on the package. The first publish of a new package needs the token:
-# trusted publishing is configured on a package that exists.
+# Authentication: the npm trusted publisher for this repository and workflow
+# (OIDC, no secret), or an NPM_TOKEN secret.
 
 on:
   push:
-    tags:
-      - 'quickjs-wasi-v*'
+    branches:
+      - next
+    paths:
+      - 'npm/quickjs-wasi/package.json'
+      - '.github/workflows/npm-publish.yml'
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Build and test, but only simulate the publish'
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -37,7 +30,6 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: npm
     env:
       WORK: ${{ github.workspace }}/npm/quickjs-wasi/build
     steps:
@@ -48,49 +40,42 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - uses: oven-sh/setup-bun@v2
-
       - name: check the version
         id: version
         run: |
           name=$(node -p 'require("./npm/quickjs-wasi/package.json").name')
           version=$(node -p 'require("./npm/quickjs-wasi/package.json").version')
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "quickjs-wasi-v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match the package version $version"
-            exit 1
-          fi
-          if npm view "$name@$version" version >/dev/null 2>&1; then
-            echo "::error::$name@$version is already published: bump the version in npm/quickjs-wasi/package.json"
-            exit 1
-          fi
           echo "name=$name" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "::notice::$name@$version is already published, nothing to do"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.version.outputs.publish == 'true'
 
       - name: build and test
+        if: steps.version.outputs.publish == 'true'
         run: RUN_TESTS=1 npm/quickjs-wasi/build.sh
 
       - name: smoke test
+        if: steps.version.outputs.publish == 'true'
         run: npm/quickjs-wasi/smoke-test.sh
 
       # trusted publishing needs npm >= 11.5.1, newer than the one of Node 22
-      - name: update npm
-        run: npm install -g npm@11
-
       - name: publish
+        if: steps.version.outputs.publish == 'true'
         working-directory: npm/quickjs-wasi/build/pkg
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
-          if [ "$DRY_RUN" = true ]; then
-            npm publish --dry-run
-          else
-            npm publish --provenance --access public
-          fi
+          npm install -g npm@11
+          npm publish --provenance --access public
           {
-            echo "### ${{ steps.version.outputs.name }}@${{ steps.version.outputs.version }}"
-            echo
-            [ "$DRY_RUN" = true ] && echo "dry run, nothing was published" || echo "published"
+            echo "### published ${{ steps.version.outputs.name }}@${{ steps.version.outputs.version }}"
             echo
             echo '```json'
             node -p 'JSON.stringify(require("./package.json").build, null, 2)'

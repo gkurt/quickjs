@@ -109,7 +109,8 @@ optimization level and whether TypeScript is included.
 
 It is built by `npm/quickjs-wasi/build.sh` in
 [gkurt/quickjs](https://github.com/gkurt/quickjs), which also runs the
-quickjs-wasi test suite on the result.
+quickjs-wasi test suite on the result. To release, bump `version` in
+`npm/quickjs-wasi/package.json` and push to `next`: CI publishes it.
 
 ## License
 
