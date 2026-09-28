@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 11:54:32 +0000
+Subject: [PATCH 6/8] Add vm.getPromiseResult() and JSValueHandle.promiseResult
+
+Evaluating a module returns a promise of its namespace, and the only way
+to read a settled promise was resolvePromise(), which is async even when
+the promise has already settled.
+
+vm.getPromiseResult(promise) returns, synchronously, a new owned handle
+of the fulfillment value or rejection reason of a settled promise
+(promiseState tells which), with the existing qjs_promise_result export
+(JS_PromiseResult). It throws a TypeError for a non-promise and an
+Error for a pending promise. handle.promiseResult delegates to it.
+---
+ src/index.ts                | 40 +++++++++++++++++++++---
+ test/promise-result.test.ts | 61 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 97 insertions(+), 4 deletions(-)
+ create mode 100644 test/promise-result.test.ts
+
+diff --git a/src/index.ts b/src/index.ts
+index ac32e53..4721726 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -2320,6 +2320,31 @@ export class QuickJS {
+     });
+   }
+ 
++  /**
++   * The outcome of a settled promise, synchronously: a new handle, owned
++   * by the caller, of its fulfillment value or of its rejection reason
++   * (`promise.promiseState` tells which: 1 fulfilled, 2 rejected). For
++   * example the namespace of a module evaluated with
++   * `EvalFlags.TYPE_MODULE`, once `executePendingJobs()` has run.
++   *
++   * Throws a `TypeError` if the value is not a promise, and an `Error` if
++   * it is still pending. Reading a rejection does not mark the promise
++   * handled (see `markPromiseHandled()`).
++   */
++  getPromiseResult(promise: JSValueHandle): JSValueHandle {
++    this.assertNotDisposed();
++    if (this.exports.qjs_is_promise(promise.ptr) === 0) {
++      throw new TypeError('getPromiseResult: the value is not a promise');
++    }
++    if (this.exports.qjs_promise_state(promise.ptr) === 0) {
++      throw new Error(
++        'getPromiseResult: the promise is pending (run executePendingJobs() first, ' +
++          'or wait for it with resolvePromise())',
++      );
++    }
++    return new JSValueHandle(this, this.exports.qjs_promise_result(promise.ptr));
++  }
++
+   /**
+    * Subscribe to a promise without executing guest code, via quickjs-ng's
+    * JS_PromiseThen: no Promise.prototype.then lookup, no Symbol.species.
+@@ -3153,10 +3178,6 @@ export class JSValueHandle {
+     return this.vm._getExports().qjs_is_null(this.ptr) !== 0;
+   }
+ 
+-  /**
+-   * Get the promise state: 0 = pending, 1 = fulfilled, 2 = rejected
+-   */
+-
+   get isBool(): boolean {
+     return this.vm._getExports().qjs_is_bool(this.ptr) !== 0;
+   }
+@@ -3337,10 +3358,21 @@ export class JSValueHandle {
+     }
+   }
+ 
++  /**
++   * The state of this promise: 0 = pending, 1 = fulfilled, 2 = rejected.
++   */
+   get promiseState(): number {
+     return this.vm._getExports().qjs_promise_state(this.ptr);
+   }
+ 
++  /**
++   * The fulfillment value or rejection reason of this settled promise, as
++   * a new handle owned by the caller. See {@link QuickJS.getPromiseResult}.
++   */
++  get promiseResult(): JSValueHandle {
++    return this.vm.getPromiseResult(this);
++  }
++
+   /**
+    * Get the typeof this value as a string.
+    * Returns the same values as the native `typeof` operator.
+diff --git a/test/promise-result.test.ts b/test/promise-result.test.ts
+new file mode 100644
+index 0000000..62d3fa5
+--- /dev/null
++++ b/test/promise-result.test.ts
+@@ -0,0 +1,61 @@
++import { describe, it, expect } from 'vitest';
++import { QuickJS, EvalFlags } from '../src/index.ts';
++import { wasmBytes } from './helpers.ts';
++
++const wasm = new WebAssembly.Module(wasmBytes);
++
++describe('vm.getPromiseResult', () => {
++  it('reads a fulfilled promise', async () => {
++    using vm = await QuickJS.create({ wasm });
++    using p = vm.evalCode('Promise.resolve({ v: 42 })');
++    expect(p.promiseState).toBe(1);
++    using r = vm.getPromiseResult(p);
++    expect(r.getProp('v').consume((h) => h.toNumber())).toBe(42);
++  });
++
++  it('reads a rejected promise\'s reason', async () => {
++    using vm = await QuickJS.create({ wasm });
++    using p = vm.evalCode('Promise.reject(new RangeError("bad"))');
++    vm.markPromiseHandled(p);
++    expect(p.promiseState).toBe(2);
++    using reason = p.promiseResult;
++    expect(reason.isError).toBe(true);
++    expect(reason.getProp('message').consume((h) => h.toString())).toBe('bad');
++  });
++
++  it('reads a module namespace synchronously', async () => {
++    using vm = await QuickJS.create({ wasm });
++    using p = vm.evalCode('export const x = await Promise.resolve(40) + 2;', 'm.js', EvalFlags.TYPE_MODULE);
++    vm.executePendingJobs();
++    using ns = vm.getPromiseResult(p);
++    expect(ns.getProp('x').consume((h) => h.toNumber())).toBe(42);
++  });
++
++  it('reads an async function\'s result once the jobs ran', async () => {
++    using vm = await QuickJS.create({ wasm });
++    using p = vm.evalCode('(async () => { await null; return "done" })()');
++    expect(() => vm.getPromiseResult(p)).toThrow(/pending/);
++    vm.executePendingJobs();
++    expect(p.promiseResult.consume((h) => h.toString())).toBe('done');
++  });
++
++  it('returns a handle of its own', async () => {
++    using vm = await QuickJS.create({ wasm });
++    const p = vm.evalCode('Promise.resolve([1, 2, 3])');
++    const r1 = vm.getPromiseResult(p);
++    const r2 = vm.getPromiseResult(p);
++    p.dispose();
++    r1.dispose();
++    expect(r2.length).toBe(3);
++    r2.dispose();
++  });
++
++  it('throws for a pending promise and for non-promises', async () => {
++    using vm = await QuickJS.create({ wasm });
++    using pending = vm.evalCode('new Promise(() => {})');
++    expect(() => vm.getPromiseResult(pending)).toThrow(/pending/);
++    using obj = vm.evalCode('({ then() {} })');
++    expect(() => vm.getPromiseResult(obj)).toThrow(TypeError);
++    expect(() => vm.getPromiseResult(vm.undefined)).toThrow(/not a promise/);
++  });
++});

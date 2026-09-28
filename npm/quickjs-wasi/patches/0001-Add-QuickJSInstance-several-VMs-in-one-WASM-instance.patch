@@ -1,0 +1,1919 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 11:45:42 +0000
+Subject: [PATCH 1/8] Add QuickJSInstance: several VMs in one WASM instance
+
+Each QuickJS.create() instantiates the WASM module anew, so a host that
+runs many VMs (one per plugin, say) pays for one linear memory per VM,
+and that memory is never returned to the next VM.
+
+QuickJSInstance.create({ wasm, wasi?, extensions? }) instantiates the
+module once; inst.newVm(options) creates a VM in it, with the options of
+QuickJS.create() except those of the instance. Each VM has its own
+JSRuntime: its own heap, memory limit, interrupt handler, module loader,
+rejection handler, timezone, host functions and GC. The VMs share the
+linear memory, the WASI imports, the extensions (initialized in every
+VM) and the native stack. vm.dispose() frees the runtime, and the next
+VM reuses its memory; inst.dispose() drops the instance.
+
+In interface.c, a VM (QJSVm) holds its runtime and context, and the
+memory accounting that was global: the VM is the opaque of the
+runtime's malloc functions, so each runtime is charged for its own
+allocations whatever VM is current, and one VM running out of memory
+does not affect another. The runtime's opaque points back to its VM.
+qjs_vm_new() creates a VM, qjs_vm_select() makes it the one the other
+exports act on (they keep using the rt/ctx globals), qjs_vm_free()
+frees it. qjs_init()/qjs_init2()/qjs_destroy() and
+qjs_set_runtime_and_context() work as before, on top of these.
+
+The host imports pass the VM they come from, and the host dispatches to
+it. A host function of one VM may call into another VM, whose host
+functions may call back: every trampoline saves the current VM before
+calling the import and restores it after, and the host keeps its own
+notion of the current VM in sync (restoring it itself when an import
+throws). The exports of a VM of a shared instance select the VM lazily,
+only when another one is current; the VM of QuickJS.create() owns its
+instance and uses the exports directly, as before.
+
+The boxes that carry JSValues to the host are linked into the list of
+their VM, so that qjs_vm_free() releases the values of handles the host
+never disposed: JS_FreeRuntime() asserts that no object is left, and a
+leaked handle would otherwise abort the whole instance.
+
+A VM cannot be disposed while it is running (from its own host
+functions or handlers). snapshot() captures the whole memory, so it
+throws for a VM of a shared instance unless it is the only VM there.
+---
+ c/interface.c         | 394 ++++++++++++++-------
+ src/index.ts          | 786 ++++++++++++++++++++++++++++++------------
+ test/multi-vm.test.ts | 322 +++++++++++++++++
+ 3 files changed, 1146 insertions(+), 356 deletions(-)
+ create mode 100644 test/multi-vm.test.ts
+
+diff --git a/c/interface.c b/c/interface.c
+index ce944ac..f8fd226 100644
+--- a/c/interface.c
++++ b/c/interface.c
+@@ -14,17 +14,89 @@
+ 
+ /* ---- Module-level state ---- */
+ 
++/*
++ * A heap-allocated JSValue handed to the host (a "box"). The JSValue comes
++ * first, so a QJSBox* is the JSValue* the host sees. Each box is linked
++ * into the list of the VM it belongs to, so that freeing a VM can release
++ * the values the host never freed (see qjs_vm_free).
++ */
++typedef struct QJSBox QJSBox;
++struct QJSBox {
++    JSValue val;
++    QJSBox *prev;
++    QJSBox *next;
++};
++
++/*
++ * A VM: a runtime with its context, and the state the glue keeps for it.
++ * An instance holds any number of VMs (qjs_vm_new), which share its linear
++ * memory. The runtime's opaque (JS_GetRuntimeOpaque) points back to its VM,
++ * and the VM is the `opaque` of the runtime's malloc functions, so memory
++ * is charged to the runtime that allocates it.
++ */
++typedef struct QJSVm {
++    JSRuntime *rt;
++    JSContext *ctx;
++    /* memory accounting, see qjs_wasi_malloc */
++    size_t mem_limit;   /* 0 = unlimited */
++    size_t mem_used;    /* sum of malloc_usable_size of live allocs */
++    int mem_in_oom;     /* a refusal happened; headroom is open */
++    QJSBox boxes;       /* head of the list of live boxes */
++} QJSVm;
++
++/*
++ * The current VM, whose runtime and context the exports below act on
++ * (qjs_vm_select). `rt` and `ctx` cache its runtime and context.
++ *
++ * Host imports may select another VM (the host function of one VM calling
++ * into another VM), so every trampoline that calls an import saves the
++ * current VM and restores it when the import returns: the code of the
++ * calling VM, and the exports the host calls next on its behalf, see its
++ * runtime again. The host keeps its own notion of the current VM in sync.
++ */
++static QJSVm *cur_vm = NULL;
+ static JSRuntime *rt = NULL;
+ static JSContext *ctx = NULL;
+ 
++static void qjs_activate(QJSVm *vm) {
++    cur_vm = vm;
++    rt = vm ? vm->rt : NULL;
++    ctx = vm ? vm->ctx : NULL;
++}
++
++static QJSVm *qjs_vm_of(JSContext *c) {
++    return (QJSVm *)JS_GetRuntimeOpaque(JS_GetRuntime(c));
++}
++
+ /* ---- Helper: heap-allocate a JSValue so it can cross the WASM boundary ---- */
+ 
+-static JSValue *jsvalue_to_heap(JSValue val) {
+-    JSValue *ptr = (JSValue *)malloc(sizeof(JSValue));
+-    if (ptr) {
+-        *ptr = val;
++static JSValue *jsvalue_to_heap_vm(QJSVm *vm, JSValue val) {
++    QJSBox *box = (QJSBox *)malloc(sizeof(QJSBox));
++    if (!box)
++        return NULL;
++    box->val = val;
++    if (vm) {
++        box->prev = &vm->boxes;
++        box->next = vm->boxes.next;
++        vm->boxes.next->prev = box;
++        vm->boxes.next = box;
++    } else {
++        box->prev = box->next = box;
+     }
+-    return ptr;
++    return &box->val;
++}
++
++/* Box a value of the current VM */
++static JSValue *jsvalue_to_heap(JSValue val) {
++    return jsvalue_to_heap_vm(cur_vm, val);
++}
++
++/* Free a box (not the value in it) */
++static void qjs_box_free(JSValue *ptr) {
++    QJSBox *box = (QJSBox *)ptr;
++    box->prev->next = box->next;
++    box->next->prev = box->prev;
++    free(box);
+ }
+ 
+ /* ---- Host callback support ---- */
+@@ -32,6 +104,7 @@ static JSValue *jsvalue_to_heap(JSValue val) {
+ /*
+  * Imported from the host environment. When QuickJS calls a host function,
+  * this import is invoked with:
++ *   vm       - the VM the function belongs to
+  *   name_ptr - pointer to the UTF-8 function name string in WASM memory
+  *   name_len - byte length of the function name
+  *   this_ptr - pointer to heap-allocated JSValue for 'this'
+@@ -41,23 +114,26 @@ static JSValue *jsvalue_to_heap(JSValue val) {
+  * Returns a pointer to a heap-allocated JSValue (the return value).
+  */
+ __attribute__((import_module("env"), import_name("host_call")))
+-extern JSValue *host_call(const char *name_ptr, int name_len, JSValue *this_ptr, int argc, JSValue **argv_ptr);
++extern JSValue *host_call(QJSVm *vm, const char *name_ptr, int name_len, JSValue *this_ptr, int argc, JSValue **argv_ptr);
+ 
+ /*
+  * Imported from the host environment. Called periodically during JS execution
+- * when an interrupt handler is enabled. Returns non-zero to interrupt execution.
++ * of `vm` when its interrupt handler is enabled. Returns non-zero to
++ * interrupt execution.
+  */
+ __attribute__((import_module("env"), import_name("host_interrupt")))
+-extern int host_interrupt(void);
++extern int host_interrupt(QJSVm *vm);
+ 
+ /*
+  * Interrupt handler trampoline: dispatches to the host_interrupt import.
+  */
+ static int interrupt_handler_trampoline(JSRuntime *rt, void *opaque)
+ {
+-    (void)rt;
+     (void)opaque;
+-    return host_interrupt();
++    QJSVm *saved = cur_vm;
++    int ret = host_interrupt((QJSVm *)JS_GetRuntimeOpaque(rt));
++    qjs_activate(saved);
++    return ret;
+ }
+ 
+ /*
+@@ -68,7 +144,7 @@ static int interrupt_handler_trampoline(JSRuntime *rt, void *opaque)
+  * with malloc). The caller frees it with js_free(). Returns NULL on error.
+  */
+ __attribute__((import_module("env"), import_name("host_module_normalize")))
+-extern char *host_module_normalize(const char *base_name, const char *name);
++extern char *host_module_normalize(QJSVm *vm, const char *base_name, const char *name);
+ 
+ /*
+  * Imported from the host environment. Called to load module source code.
+@@ -77,7 +153,7 @@ extern char *host_module_normalize(const char *base_name, const char *name);
+  * The caller frees it. Returns NULL on error.
+  */
+ __attribute__((import_module("env"), import_name("host_module_load")))
+-extern char *host_module_load(const char *module_name, size_t *out_len);
++extern char *host_module_load(QJSVm *vm, const char *module_name, size_t *out_len);
+ 
+ /*
+  * Module normalizer trampoline: dispatches to the host_module_normalize import.
+@@ -88,7 +164,9 @@ static char *module_normalizer_trampoline(JSContext *ctx,
+                                            const char *module_name, void *opaque)
+ {
+     (void)opaque;
+-    char *result = host_module_normalize(module_base_name, module_name);
++    QJSVm *saved = cur_vm;
++    char *result = host_module_normalize(qjs_vm_of(ctx), module_base_name, module_name);
++    qjs_activate(saved);
+     if (!result) {
+         /* The host may have already thrown a more specific error via
+            qjs_throw; only throw the generic error if the host has not
+@@ -120,7 +198,9 @@ static JSModuleDef *module_loader_trampoline(JSContext *ctx,
+ {
+     (void)opaque;
+     size_t source_len = 0;
+-    char *source = host_module_load(module_name, &source_len);
++    QJSVm *saved = cur_vm;
++    char *source = host_module_load(qjs_vm_of(ctx), module_name, &source_len);
++    qjs_activate(saved);
+     if (!source) {
+         /* The host may have already thrown a more specific error via
+            qjs_throw; only throw the generic error if the host has not
+@@ -154,7 +234,7 @@ static JSModuleDef *module_loader_trampoline(JSContext *ctx,
+  *   is_handled  - 1 if a handler was just attached, 0 if newly unhandled
+  */
+ __attribute__((import_module("env"), import_name("host_promise_rejection")))
+-extern void host_promise_rejection(JSValue *promise_ptr, JSValue *reason_ptr, int is_handled);
++extern void host_promise_rejection(QJSVm *vm, JSValue *promise_ptr, JSValue *reason_ptr, int is_handled);
+ 
+ /*
+  * Promise rejection tracker trampoline: heap-allocates the promise and reason
+@@ -165,9 +245,12 @@ static void promise_rejection_trampoline(JSContext *ctx, JSValueConst promise,
+                                           bool is_handled, void *opaque)
+ {
+     (void)opaque;
+-    JSValue *promise_ptr = jsvalue_to_heap(JS_DupValue(ctx, promise));
+-    JSValue *reason_ptr = jsvalue_to_heap(JS_DupValue(ctx, reason));
+-    host_promise_rejection(promise_ptr, reason_ptr, is_handled ? 1 : 0);
++    QJSVm *vm = qjs_vm_of(ctx);
++    QJSVm *saved = cur_vm;
++    JSValue *promise_ptr = jsvalue_to_heap_vm(vm, JS_DupValue(ctx, promise));
++    JSValue *reason_ptr = jsvalue_to_heap_vm(vm, JS_DupValue(ctx, reason));
++    host_promise_rejection(vm, promise_ptr, reason_ptr, is_handled ? 1 : 0);
++    qjs_activate(saved);
+     /* The host is responsible for freeing these via qjs_free_value */
+ }
+ 
+@@ -185,43 +268,46 @@ static JSValue host_callback_trampoline(JSContext *ctx, JSValueConst this_val,
+     size_t name_len;
+     const char *name = JS_ToCStringLen(ctx, &name_len, func_data[0]);
+ 
++    QJSVm *vm = qjs_vm_of(ctx);
++
+     /* Heap-allocate this_val for the host */
+-    JSValue *this_ptr = jsvalue_to_heap(JS_DupValue(ctx, this_val));
++    JSValue *this_ptr = jsvalue_to_heap_vm(vm, JS_DupValue(ctx, this_val));
+ 
+     /* Heap-allocate each argument for the host */
+     JSValue **argv_ptrs = NULL;
+     if (argc > 0) {
+         argv_ptrs = (JSValue **)malloc(sizeof(JSValue *) * argc);
+         for (int i = 0; i < argc; i++) {
+-            argv_ptrs[i] = jsvalue_to_heap(JS_DupValue(ctx, argv[i]));
++            argv_ptrs[i] = jsvalue_to_heap_vm(vm, JS_DupValue(ctx, argv[i]));
+         }
+     }
+ 
+-    /* Call into the host */
+-    JSValue *result_ptr = host_call(name, (int)name_len, this_ptr, argc, argv_ptrs);
++    /* Call into the host, which may select other VMs on the way */
++    QJSVm *saved = cur_vm;
++    JSValue *result_ptr = host_call(vm, name, (int)name_len, this_ptr, argc, argv_ptrs);
++    qjs_activate(saved);
+ 
+     JS_FreeCString(ctx, name);
+ 
+-    /* Extract and dup the result, then free the pointer.
++    /* Take the value out of the result box, then free the box.
+        NULL means the host threw an exception (via qjs_throw). */
+     JSValue result;
+     if (result_ptr) {
+-        result = JS_DupValue(ctx, *result_ptr);
+-        JS_FreeValue(ctx, *result_ptr);
+-        free(result_ptr);
++        result = *result_ptr;
++        qjs_box_free(result_ptr);
+     } else {
+         result = JS_EXCEPTION;
+     }
+ 
+     /* Free the this_ptr (was dup'd for host) */
+     JS_FreeValue(ctx, *this_ptr);
+-    free(this_ptr);
++    qjs_box_free(this_ptr);
+ 
+     /* Free the argv pointers (were dup'd for host) */
+     if (argv_ptrs) {
+         for (int i = 0; i < argc; i++) {
+             JS_FreeValue(ctx, *argv_ptrs[i]);
+-            free(argv_ptrs[i]);
++            qjs_box_free(argv_ptrs[i]);
+         }
+         free(argv_ptrs);
+     }
+@@ -322,21 +408,17 @@ const char *qjs_get_quickjs_version(void) {
+ 
+ #define QJS_OOM_HEADROOM (64 * 1024)
+ 
+-static size_t qjs_mem_limit = 0; /* 0 = unlimited */
+-static size_t qjs_mem_used = 0;  /* sum of malloc_usable_size of live allocs */
+-static int qjs_mem_in_oom = 0;   /* a refusal happened; headroom is open */
+-
+ /* The limit normal allocations are held to: memoryLimit minus the OOM
+    headroom (or half the limit when the limit is tiny). */
+-static size_t qjs_mem_soft_limit(void) {
+-    if (qjs_mem_limit > 2 * QJS_OOM_HEADROOM)
+-        return qjs_mem_limit - QJS_OOM_HEADROOM;
+-    return qjs_mem_limit / 2;
++static size_t qjs_mem_soft_limit(QJSVm *vm) {
++    if (vm->mem_limit > 2 * QJS_OOM_HEADROOM)
++        return vm->mem_limit - QJS_OOM_HEADROOM;
++    return vm->mem_limit / 2;
+ }
+ 
+-/* Overflow-safe: would qjs_mem_used + size exceed cap? */
+-static int qjs_mem_exceeds(size_t size, size_t cap) {
+-    return size > cap || qjs_mem_used > cap - size;
++/* Overflow-safe: would vm->mem_used + size exceed cap? */
++static int qjs_mem_exceeds(QJSVm *vm, size_t size, size_t cap) {
++    return size > cap || vm->mem_used > cap - size;
+ }
+ 
+ /*
+@@ -344,46 +426,52 @@ static int qjs_mem_exceeds(size_t size, size_t cap) {
+  * refused. Opens the OOM headroom on refusal; re-arms it once usage fits
+  * under the soft limit again.
+  */
+-static int qjs_mem_refuse(size_t size) {
+-    if (qjs_mem_limit == 0)
++static int qjs_mem_refuse(QJSVm *vm, size_t size) {
++    if (vm->mem_limit == 0)
+         return 0; /* unlimited */
+-    if (!qjs_mem_exceeds(size, qjs_mem_soft_limit())) {
+-        qjs_mem_in_oom = 0; /* healthy again: re-arm the reserve */
++    if (!qjs_mem_exceeds(vm, size, qjs_mem_soft_limit(vm))) {
++        vm->mem_in_oom = 0; /* healthy again: re-arm the reserve */
+         return 0;
+     }
+-    if (qjs_mem_in_oom && !qjs_mem_exceeds(size, qjs_mem_limit))
++    if (vm->mem_in_oom && !qjs_mem_exceeds(vm, size, vm->mem_limit))
+         return 0; /* constructing/handling the OOM error: use the reserve */
+-    qjs_mem_in_oom = 1;
++    vm->mem_in_oom = 1;
+     return 1;
+ }
+ 
++static void qjs_mem_release(QJSVm *vm, size_t usable) {
++    vm->mem_used -= usable <= vm->mem_used ? usable : vm->mem_used;
++}
++
++/* `opaque` is the QJSVm of the runtime (the opaque of JS_NewRuntime2), so
++   each runtime is charged for its own allocations, whichever VM is the
++   current one. */
++
+ static void *qjs_wasi_calloc(void *opaque, size_t count, size_t size) {
+-    (void)opaque;
++    QJSVm *vm = (QJSVm *)opaque;
+     /* quickjs checks count*size for overflow before calling us */
+-    if (qjs_mem_refuse(count * size)) return NULL;
++    if (qjs_mem_refuse(vm, count * size)) return NULL;
+     void *ptr = calloc(count, size);
+-    if (ptr) qjs_mem_used += malloc_usable_size(ptr);
++    if (ptr) vm->mem_used += malloc_usable_size(ptr);
+     return ptr;
+ }
+ 
+ static void *qjs_wasi_malloc(void *opaque, size_t size) {
+-    (void)opaque;
+-    if (qjs_mem_refuse(size)) return NULL;
++    QJSVm *vm = (QJSVm *)opaque;
++    if (qjs_mem_refuse(vm, size)) return NULL;
+     void *ptr = malloc(size);
+-    if (ptr) qjs_mem_used += malloc_usable_size(ptr);
++    if (ptr) vm->mem_used += malloc_usable_size(ptr);
+     return ptr;
+ }
+ 
+ static void qjs_wasi_free(void *opaque, void *ptr) {
+-    (void)opaque;
+     if (!ptr) return;
+-    size_t usable = malloc_usable_size(ptr);
+-    qjs_mem_used -= usable <= qjs_mem_used ? usable : qjs_mem_used;
++    qjs_mem_release((QJSVm *)opaque, malloc_usable_size(ptr));
+     free(ptr);
+ }
+ 
+ static void *qjs_wasi_realloc(void *opaque, void *ptr, size_t size) {
+-    (void)opaque;
++    QJSVm *vm = (QJSVm *)opaque;
+     size_t old_usable = ptr ? malloc_usable_size(ptr) : 0;
+     /* Only consult the limiter when the block grows: a shrinking or
+        same-size realloc releases (or keeps) memory and must never be
+@@ -392,16 +480,16 @@ static void *qjs_wasi_realloc(void *opaque, void *ptr, size_t size) {
+        restored snapshot, and refusing would turn a memory-RELEASING
+        operation into a spurious OOM. */
+     size_t growth = size > old_usable ? size - old_usable : 0;
+-    if (growth > 0 && qjs_mem_refuse(growth)) return NULL;
++    if (growth > 0 && qjs_mem_refuse(vm, growth)) return NULL;
+     void *new_ptr = realloc(ptr, size);
+     if (new_ptr) {
+-        qjs_mem_used -= old_usable <= qjs_mem_used ? old_usable : qjs_mem_used;
+-        qjs_mem_used += malloc_usable_size(new_ptr);
++        qjs_mem_release(vm, old_usable);
++        vm->mem_used += malloc_usable_size(new_ptr);
+     } else if (ptr && size == 0) {
+         /* Unreachable via quickjs (js_realloc_rt routes size==0 to
+            js_free_rt), but defensive: a libc whose realloc(ptr, 0) frees
+            and returns NULL must not leave the freed block accounted. */
+-        qjs_mem_used -= old_usable <= qjs_mem_used ? old_usable : qjs_mem_used;
++        qjs_mem_release(vm, old_usable);
+     }
+     return new_ptr;
+ }
+@@ -418,81 +506,124 @@ static const JSMallocFunctions qjs_wasi_malloc_funcs = {
+     qjs_wasi_malloc_usable_size,
+ };
+ 
+-static JSRuntime *qjs_new_runtime(void) {
+-    return JS_NewRuntime2(&qjs_wasi_malloc_funcs, NULL);
+-}
++/*
++ * Create a context with selective intrinsics. Pass QJS_INTRINSIC_ALL for
++ * all intrinsics (same as JS_NewContext), or a bitmask of QJS_INTRINSIC_*
++ * flags to create a minimal context.
++ *
++ * Note: BaseObjects is always included; it provides fundamental types
++ * (Object, Array, Number, String, etc.) without which nothing works.
++ */
++static JSContext *qjs_new_context(JSRuntime *rt, unsigned int intrinsics) {
++    if (intrinsics == QJS_INTRINSIC_ALL)
++        return JS_NewContext(rt);
+ 
+-__attribute__((export_name("qjs_init")))
+-int qjs_init(void) {
+-    if (rt) return -1; /* already initialized */
++    JSContext *ctx = JS_NewContextRaw(rt);
++    if (!ctx)
++        return NULL;
++    /* BaseObjects is always required */
++    JS_AddIntrinsicBaseObjects(ctx);
++    if (intrinsics & QJS_INTRINSIC_DATE)          JS_AddIntrinsicDate(ctx);
++    if (intrinsics & QJS_INTRINSIC_EVAL)          JS_AddIntrinsicEval(ctx);
++    if (intrinsics & QJS_INTRINSIC_REGEXP) {
++        JS_AddIntrinsicRegExpCompiler(ctx);
++        JS_AddIntrinsicRegExp(ctx);
++    }
++    if (intrinsics & QJS_INTRINSIC_JSON)          JS_AddIntrinsicJSON(ctx);
++    if (intrinsics & QJS_INTRINSIC_PROXY)         JS_AddIntrinsicProxy(ctx);
++    if (intrinsics & QJS_INTRINSIC_MAP_SET)        JS_AddIntrinsicMapSet(ctx);
++    if (intrinsics & QJS_INTRINSIC_TYPED_ARRAYS)   JS_AddIntrinsicTypedArrays(ctx);
++    if (intrinsics & QJS_INTRINSIC_PROMISE)        JS_AddIntrinsicPromise(ctx);
++    if (intrinsics & QJS_INTRINSIC_BIG_INT)        JS_AddIntrinsicBigInt(ctx);
++    if (intrinsics & QJS_INTRINSIC_WEAK_REF)       JS_AddIntrinsicWeakRef(ctx);
++    if (intrinsics & QJS_INTRINSIC_PERFORMANCE)    JS_AddPerformance(ctx);
++    if (intrinsics & QJS_INTRINSIC_DOM_EXCEPTION)  JS_AddIntrinsicDOMException(ctx);
++    /* JS_AddIntrinsicAToB also adds DOMException if not already present. */
++    if (intrinsics & QJS_INTRINSIC_ATOB_BTOA)      JS_AddIntrinsicAToB(ctx);
++    return ctx;
++}
+ 
+-    rt = qjs_new_runtime();
+-    if (!rt) return -1;
++/*
++ * Create a VM: a runtime with a context (see qjs_new_context for the
++ * intrinsics). Does not change the current VM. Returns NULL on failure.
++ */
++__attribute__((export_name("qjs_vm_new")))
++QJSVm *qjs_vm_new(unsigned int intrinsics) {
++    QJSVm *vm = (QJSVm *)calloc(1, sizeof(QJSVm));
++    if (!vm) return NULL;
++    vm->boxes.prev = vm->boxes.next = &vm->boxes;
++
++    vm->rt = JS_NewRuntime2(&qjs_wasi_malloc_funcs, vm);
++    if (!vm->rt) {
++        free(vm);
++        return NULL;
++    }
++    JS_SetRuntimeOpaque(vm->rt, vm);
+ 
+-    ctx = JS_NewContext(rt);
+-    if (!ctx) {
+-        JS_FreeRuntime(rt);
+-        rt = NULL;
+-        return -1;
++    vm->ctx = qjs_new_context(vm->rt, intrinsics);
++    if (!vm->ctx) {
++        JS_FreeRuntime(vm->rt);
++        free(vm);
++        return NULL;
+     }
++    return vm;
++}
+ 
+-    return 0;
++/* Make `vm` the VM the other exports act on. */
++__attribute__((export_name("qjs_vm_select")))
++void qjs_vm_select(QJSVm *vm) {
++    qjs_activate(vm);
++}
++
++/* The current VM (after a snapshot restore, the one recovered from it). */
++__attribute__((export_name("qjs_vm_current")))
++QJSVm *qjs_vm_current(void) {
++    return cur_vm;
+ }
+ 
+ /*
+- * Initialize with selective intrinsics. Pass QJS_INTRINSIC_ALL for all
+- * intrinsics (same as qjs_init), or a bitmask of QJS_INTRINSIC_* flags
+- * to create a minimal context.
+- *
+- * Note: BaseObjects is always included; it provides fundamental types
+- * (Object, Array, Number, String, etc.) without which nothing works.
++ * Free a VM: its runtime, its context, and every box the host still holds
++ * (the handles it never disposed: they would keep objects alive, and
++ * JS_FreeRuntime requires that none are). Its memory returns to the heap
++ * of the instance, for the next VM. The VM must not be running.
+  */
+-__attribute__((export_name("qjs_init2")))
+-int qjs_init2(unsigned int intrinsics) {
+-    if (rt) return -1; /* already initialized */
+-
+-    rt = qjs_new_runtime();
+-    if (!rt) return -1;
+-
+-    if (intrinsics == QJS_INTRINSIC_ALL) {
+-        ctx = JS_NewContext(rt);
+-    } else {
+-        ctx = JS_NewContextRaw(rt);
+-        if (!ctx) {
+-            JS_FreeRuntime(rt);
+-            rt = NULL;
+-            return -1;
+-        }
+-        /* BaseObjects is always required */
+-        JS_AddIntrinsicBaseObjects(ctx);
+-        if (intrinsics & QJS_INTRINSIC_DATE)          JS_AddIntrinsicDate(ctx);
+-        if (intrinsics & QJS_INTRINSIC_EVAL)          JS_AddIntrinsicEval(ctx);
+-        if (intrinsics & QJS_INTRINSIC_REGEXP) {
+-            JS_AddIntrinsicRegExpCompiler(ctx);
+-            JS_AddIntrinsicRegExp(ctx);
+-        }
+-        if (intrinsics & QJS_INTRINSIC_JSON)          JS_AddIntrinsicJSON(ctx);
+-        if (intrinsics & QJS_INTRINSIC_PROXY)         JS_AddIntrinsicProxy(ctx);
+-        if (intrinsics & QJS_INTRINSIC_MAP_SET)        JS_AddIntrinsicMapSet(ctx);
+-        if (intrinsics & QJS_INTRINSIC_TYPED_ARRAYS)   JS_AddIntrinsicTypedArrays(ctx);
+-        if (intrinsics & QJS_INTRINSIC_PROMISE)        JS_AddIntrinsicPromise(ctx);
+-        if (intrinsics & QJS_INTRINSIC_BIG_INT)        JS_AddIntrinsicBigInt(ctx);
+-        if (intrinsics & QJS_INTRINSIC_WEAK_REF)       JS_AddIntrinsicWeakRef(ctx);
+-        if (intrinsics & QJS_INTRINSIC_PERFORMANCE)    JS_AddPerformance(ctx);
+-        if (intrinsics & QJS_INTRINSIC_DOM_EXCEPTION)  JS_AddIntrinsicDOMException(ctx);
+-        /* JS_AddIntrinsicAToB also adds DOMException if not already present. */
+-        if (intrinsics & QJS_INTRINSIC_ATOB_BTOA)      JS_AddIntrinsicAToB(ctx);
++__attribute__((export_name("qjs_vm_free")))
++void qjs_vm_free(QJSVm *vm) {
++    if (!vm) return;
++    while (vm->boxes.next != &vm->boxes) {
++        QJSBox *box = vm->boxes.next;
++        JSValue val = box->val;
++        qjs_box_free(&box->val);
++        JS_FreeValue(vm->ctx, val);
+     }
++    /* Run GC to collect any cycles before freeing the context */
++    JS_RunGC(vm->rt);
++    JS_FreeContext(vm->ctx);
++    JS_FreeRuntime(vm->rt);
++    if (cur_vm == vm)
++        qjs_activate(NULL);
++    free(vm);
++}
+ 
+-    if (!ctx) {
+-        JS_FreeRuntime(rt);
+-        rt = NULL;
+-        return -1;
+-    }
++/*
++ * Create a VM (see qjs_vm_new) and make it the current one, unless there
++ * is a current VM already.
++ */
++__attribute__((export_name("qjs_init2")))
++int qjs_init2(unsigned int intrinsics) {
++    if (cur_vm) return -1; /* already initialized */
+ 
++    QJSVm *vm = qjs_vm_new(intrinsics);
++    if (!vm) return -1;
++    qjs_activate(vm);
+     return 0;
+ }
+ 
++__attribute__((export_name("qjs_init")))
++int qjs_init(void) {
++    return qjs_init2(QJS_INTRINSIC_ALL);
++}
++
+ /* ---- Runtime Limits ---- */
+ 
+ __attribute__((export_name("qjs_set_interrupt_handler")))
+@@ -531,8 +662,9 @@ void qjs_set_module_loader(int enable) {
+ 
+ __attribute__((export_name("qjs_set_memory_limit")))
+ void qjs_set_memory_limit(size_t limit) {
+-    qjs_mem_limit = limit;
+-    qjs_mem_in_oom = 0;
++    if (!cur_vm) return;
++    cur_vm->mem_limit = limit;
++    cur_vm->mem_in_oom = 0;
+     /* The limit is enforced by our malloc functions (see the comment above
+        qjs_wasi_malloc): the engine-level check refuses at exactly the limit
+        and leaves no headroom to construct the "out of memory" InternalError,
+@@ -588,7 +720,7 @@ void qjs_compute_memory_usage(int64_t *out) {
+     out[0]  = s.malloc_size;
+     /* The engine-level malloc_limit is intentionally left unlimited (see
+        qjs_set_memory_limit); report the limit we actually enforce. */
+-    out[1]  = (int64_t)qjs_mem_limit;
++    out[1]  = (int64_t)cur_vm->mem_limit;
+     out[2]  = s.memory_used_size;
+     out[3]  = s.malloc_count;
+     out[4]  = s.memory_used_count;
+@@ -615,18 +747,10 @@ void qjs_compute_memory_usage(int64_t *out) {
+     out[25] = s.binary_object_size;
+ }
+ 
++/* Free the current VM (see qjs_vm_free) */
+ __attribute__((export_name("qjs_destroy")))
+ void qjs_destroy(void) {
+-    if (ctx) {
+-        /* Run GC to collect any cycles before freeing the context */
+-        if (rt) JS_RunGC(rt);
+-        JS_FreeContext(ctx);
+-        ctx = NULL;
+-    }
+-    if (rt) {
+-        JS_FreeRuntime(rt);
+-        rt = NULL;
+-    }
++    qjs_vm_free(cur_vm);
+ }
+ 
+ /* ---- Evaluation ---- */
+@@ -1122,7 +1246,7 @@ JSValue *qjs_dup_value(JSValue *val) {
+ __attribute__((export_name("qjs_free_value")))
+ void qjs_free_value(JSValue *val) {
+     JS_FreeValue(ctx, *val);
+-    free(val);
++    qjs_box_free(val);
+ }
+ 
+ /* ---- Property Operations ---- */
+@@ -1664,11 +1788,13 @@ void *qjs_get_context_ptr(void) {
+ 
+ /* Sets the runtime and context pointers after a memory restore.
+    This allows the host to bypass qjs_init() and directly set the
+-   pointers that were recovered from the snapshotted memory. */
++   pointers that were recovered from the snapshotted memory. The VM
++   they belong to is the runtime's opaque. */
+ __attribute__((export_name("qjs_set_runtime_and_context")))
+ void qjs_set_runtime_and_context(void *runtime_ptr, void *context_ptr) {
+     rt = (JSRuntime *)runtime_ptr;
+     ctx = (JSContext *)context_ptr;
++    cur_vm = rt ? (QJSVm *)JS_GetRuntimeOpaque(rt) : NULL;
+ }
+ 
+ /* ---- Memory management exports (for host to allocate in WASM memory) ---- */
+diff --git a/src/index.ts b/src/index.ts
+index 367b67b..88d8804 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -342,6 +342,28 @@ export interface QuickJSOptions {
+   timezoneOffset?: 'host' | number | ((timeSecs: number) => number);
+ }
+ 
++/**
++ * Options of a {@link QuickJSInstance}: the WASM module and what its VMs
++ * share.
++ */
++export interface QuickJSInstanceOptions {
++  /** WASM module bytes or pre-compiled module, as for `QuickJS.create()`. */
++  wasm: BufferSource | WebAssembly.Module;
++  /** Custom WASI function implementations, shared by every VM of the instance. */
++  wasi?: WasiOptions;
++  /**
++   * Native WASM extensions, loaded once into the instance and initialized
++   * in every VM it creates, in order.
++   */
++  extensions?: ExtensionDescriptor[];
++}
++
++/**
++ * Options of a VM created by {@link QuickJSInstance.newVm}: those of
++ * `QuickJS.create()` except what belongs to the instance.
++ */
++export type QuickJSVmOptions = Omit<QuickJSOptions, 'wasm' | 'wasi' | 'extensions'>;
++
+ // ---- WASM Export Types ----
+ 
+ interface QuickJSExports {
+@@ -357,6 +379,10 @@ interface QuickJSExports {
+   qjs_init(): number;
+   qjs_init2(intrinsics: number): number;
+   qjs_destroy(): void;
++  qjs_vm_new(intrinsics: number): number;
++  qjs_vm_select(vmPtr: number): void;
++  qjs_vm_current(): number;
++  qjs_vm_free(vmPtr: number): void;
+ 
+   // Evaluation
+   qjs_eval(codePtr: number, codeLen: number, filenamePtr: number, flags: number): number;
+@@ -557,12 +583,406 @@ export interface Deferred {
+   reject(value: JSValueHandle): void;
+ }
+ 
++// Guard against async (or otherwise non-string-returning) module loader
++// callbacks. The WASM boundary is synchronous (a Promise cannot be
++// awaited here), so fail with a clear error instead of coercing the
++// Promise to source text.
++function assertSyncString(value: unknown, callbackName: string): string {
++  if (typeof value === 'string') return value;
++  const got = value !== null && typeof value === 'object' && typeof (value as PromiseLike<unknown>).then === 'function'
++    ? 'a Promise'
++    : `type ${typeof value}`;
++  throw new TypeError(
++    `moduleLoader.${callbackName} must synchronously return a string (got ${got}). ` +
++    `Async module loading is not supported. Pre-fetch module sources instead ` +
++    `(see the "ES Modules" section of the quickjs-wasi README).`
++  );
++}
++
++// ---- QuickJS instance: several VMs sharing one WASM instance ----
++
++/**
++ * Exports that do not depend on the current VM: the tag and brand checks
++ * read the value only. Every other `qjs_*` export acts on the current VM
++ * of the instance, so a VM of a shared instance selects itself first.
++ */
++const VM_INDEPENDENT_EXPORTS = new Set([
++  'qjs_get_quickjs_version',
++  'qjs_vm_new', 'qjs_vm_select', 'qjs_vm_current', 'qjs_vm_free',
++  'qjs_typeof', 'qjs_is_exception', 'qjs_is_undefined', 'qjs_is_null',
++  'qjs_is_bool', 'qjs_is_number', 'qjs_is_string', 'qjs_is_object',
++  'qjs_is_array', 'qjs_is_error', 'qjs_is_promise', 'qjs_is_symbol',
++  'qjs_is_big_int', 'qjs_is_array_buffer', 'qjs_is_proxy', 'qjs_is_map',
++  'qjs_is_set', 'qjs_is_date', 'qjs_is_regexp', 'qjs_is_weak_ref',
++  'qjs_is_weak_map', 'qjs_is_weak_set', 'qjs_is_data_view',
++  'qjs_get_class_id', 'qjs_get_value_ptr',
++]);
++
++/**
++ * A QuickJS WASM instance that holds several VMs.
++ *
++ * Each VM ({@link newVm}) has its own runtime: its own heap, memory limit,
++ * interrupt handler, module loader, host functions and GC, and values
++ * never cross between VMs. What they share is the WASM instance: its
++ * linear memory (a disposed VM's memory is reused by the next one), its
++ * WASI imports, its extensions, and its native stack.
++ *
++ * ```ts
++ * const inst = await QuickJSInstance.create({ wasm });
++ * const a = inst.newVm({ memoryLimit: 16 << 20 });
++ * const b = inst.newVm({ interruptHandler: () => Date.now() > deadline });
++ * // ...
++ * a.dispose(); // frees a's runtime; b lives on
++ * inst.dispose();
++ * ```
++ *
++ * The host function of one VM may call into another VM, and the other
++ * VM's host functions back into the first: the instance tracks which VM
++ * is running and restores it when a call returns.
++ *
++ * Snapshots capture the whole memory of the instance, so `snapshot()`
++ * works on a VM of a shared instance only while it is the instance's only
++ * VM; a snapshot restores into a new instance of its own (`QuickJS.restore()`).
++ */
++export class QuickJSInstance {
++  /** @internal The raw exports of the WASM instance. */
++  _exports: QuickJSExports = null!;
++  /** @internal */
++  _module: WebAssembly.Module;
++  /** @internal Extensions loaded into this instance, in order. */
++  _loadedExtensions: LoadedExtension[] = [];
++  /** @internal Created by `QuickJS.create()`/`restore()` for one VM, which owns it. */
++  readonly _owned: boolean;
++  /**
++   * @internal The VM whose runtime the C side has selected, or null when
++   * unknown (the next export call of any VM selects again).
++   */
++  _current: QuickJS | null = null;
++  /** @internal */
++  _wasiBuiltins: WasiImports = {};
++  /** @internal */
++  _wasiUserOverrides: WasiImports | undefined;
++  /** @internal */
++  _memoryProxy: WebAssembly.Memory = null!;
++
++  private vms = new Map<number, QuickJS>();
++  private memory: WebAssembly.Memory | null = null;
++  private disposed = false;
++
++  private constructor(module: WebAssembly.Module, owned: boolean) {
++    this._module = module;
++    this._owned = owned;
++  }
++
++  /**
++   * Instantiate the WASM module for VMs created with {@link newVm}.
++   */
++  static async create(options: QuickJSInstanceOptions): Promise<QuickJSInstance> {
++    return QuickJSInstance._create(options, false);
++  }
++
++  /** @internal */
++  static async _create(options: QuickJSInstanceOptions, owned: boolean): Promise<QuickJSInstance> {
++    const inst = await QuickJSInstance._instantiate(options, owned);
++    // Initialize the WASI reactor
++    inst._exports._initialize();
++    if (options.extensions) {
++      const mainExports = inst._exports as unknown as Record<string, WebAssembly.ExportValue>;
++      for (const desc of options.extensions) {
++        inst._loadedExtensions.push(
++          await loadExtension(desc, mainExports, inst._wasiBuiltins, inst._wasiUserOverrides, inst._memoryProxy),
++        );
++      }
++    }
++    return inst;
++  }
++
++  /** @internal Instantiate without initializing (a restore overwrites the memory). */
++  static async _instantiate(options: QuickJSInstanceOptions, owned: boolean): Promise<QuickJSInstance> {
++    const module = await resolveModule(options.wasm);
++    const inst = new QuickJSInstance(module, owned);
++    const imports = inst.createImports(options.wasi);
++    inst.attach(await WebAssembly.instantiate(module, imports));
++    return inst;
++  }
++
++  /** The number of live VMs of this instance. */
++  get vmCount(): number {
++    return this.vms.size;
++  }
++
++  /**
++   * Create a VM in this instance. Its options are those of
++   * `QuickJS.create()` except `wasm`, `wasi` and `extensions`, which
++   * belong to the instance; the extensions of the instance are
++   * initialized in the new VM.
++   *
++   * Dispose the VM when done: that frees its runtime (with any handle
++   * still undisposed), and its memory is reused by the next VM.
++   */
++  newVm(options: QuickJSVmOptions = {}): QuickJS {
++    this.assertNotDisposed();
++    if (this._owned) {
++      throw new Error('This instance belongs to a VM created by QuickJS.create(); use QuickJSInstance.create()');
++    }
++    return this._newVm(options);
++  }
++
++  /** @internal */
++  _newVm(options: QuickJSVmOptions): QuickJS {
++    validateVmOptions(options);
++    const e = this._exports;
++    const vmPtr = e.qjs_vm_new(options.intrinsics ?? Intrinsics.ALL);
++    if (vmPtr === 0) {
++      throw new Error('Failed to initialize QuickJS runtime');
++    }
++    const vm = this._adopt(vmPtr);
++    try {
++      this._select(vm);
++      const mainExports = e as unknown as Record<string, WebAssembly.ExportValue>;
++      for (const ext of this._loadedExtensions) {
++        initExtension(ext, mainExports);
++      }
++      QuickJS._applyLimits(vm, options);
++    } catch (err) {
++      if (!this._owned) vm.dispose();
++      throw err;
++    }
++    return vm;
++  }
++
++  /** @internal Register the VM at `vmPtr` and wrap it. */
++  _adopt(vmPtr: number): QuickJS {
++    const vm = QuickJS._attach(this, vmPtr);
++    this.vms.set(vmPtr, vm);
++    return vm;
++  }
++
++  /** @internal Select `vm` on the C side. */
++  _select(vm: QuickJS): void {
++    this._exports.qjs_vm_select(vm._vmPtr);
++    this._current = vm;
++  }
++
++  /**
++   * @internal The exports as `vm` sees them: for a VM of a shared
++   * instance, each VM-dependent export selects the VM first, if it is
++   * not the current one already.
++   */
++  _exportsFor(vm: QuickJS): QuickJSExports {
++    const raw = this._exports;
++    if (this._owned) return raw;
++    const wrapped: Record<string, unknown> = {};
++    for (const [name, value] of Object.entries(raw)) {
++      if (typeof value !== 'function' || !name.startsWith('qjs_') || VM_INDEPENDENT_EXPORTS.has(name)) {
++        wrapped[name] = value;
++        continue;
++      }
++      const fn = value as (a?: number, b?: number, c?: number, d?: number, e?: number, f?: number) => number;
++      wrapped[name] = (a?: number, b?: number, c?: number, d?: number, e?: number, f?: number) => {
++        if (this._current !== vm) this._select(vm);
++        return fn(a, b, c, d, e, f);
++      };
++    }
++    return wrapped as unknown as QuickJSExports;
++  }
++
++  /** @internal Forget a VM whose runtime is gone (or going with the instance). */
++  _forget(vm: QuickJS): void {
++    this.vms.delete(vm._vmPtr);
++    if (this._current === vm) this._current = null;
++  }
++
++  /**
++   * Dispose the instance and every VM still alive in it, releasing the
++   * WASM instance and its memory to the host's garbage collector.
++   */
++  dispose(): void {
++    if (this.disposed) return;
++    for (const vm of this.vms.values()) {
++      if (!this._owned && vm._depth > 0) {
++        throw new Error('Cannot dispose a QuickJSInstance while one of its VMs is running');
++      }
++    }
++    this.disposed = true;
++    for (const vm of [...this.vms.values()]) vm._release();
++    this.vms.clear();
++    this._current = null;
++    this._loadedExtensions = [];
++    this._exports = null!;
++    this.memory = null;
++  }
++
++  [Symbol.dispose](): void {
++    this.dispose();
++  }
++
++  private assertNotDisposed(): void {
++    if (this.disposed) {
++      throw new Error('QuickJSInstance has been disposed');
++    }
++  }
++
++  private attach(instance: WebAssembly.Instance): void {
++    this._exports = instance.exports as unknown as QuickJSExports;
++    this.memory = this._exports.memory;
++  }
++
++  /** The VM a host import comes from. */
++  private vmAt(vmPtr: number): QuickJS {
++    const vm = this.vms.get(vmPtr);
++    if (!vm) throw new Error(`QuickJS: host call from an unknown VM (0x${vmPtr.toString(16)})`);
++    return vm;
++  }
++
++  /**
++   * Build the import object. Each `env` import is a call from the C side
++   * of a VM, which passes its pointer. While the host handles it, the VM
++   * is the current one; the host may select other VMs (a host function
++   * calling into another VM). When the import returns, the C trampoline
++   * restores the VM that was current before it; when it throws, the host
++   * does.
++   */
++  private createImports(wasiOptions?: WasiOptions): WebAssembly.Imports {
++    // Create a memory proxy that defers to the actual memory once set.
++    // This allows WASI override factories to close over the memory reference
++    // before the WASM instance is created.
++    const memoryOf = (): WebAssembly.Memory => {
++      if (!this.memory) {
++        throw new Error('QuickJS: the WASM memory is not available (the instance is not instantiated yet, or disposed)');
++      }
++      return this.memory;
++    };
++    this._memoryProxy = new Proxy({} as WebAssembly.Memory, {
++      get(_target, prop) {
++        const memory = memoryOf();
++        const value = (memory as any)[prop];
++        return typeof value === 'function' ? value.bind(memory) : value;
++      },
++    });
++
++    // Build the builtins (no user overrides)
++    this._wasiBuiltins = createWasiShim(memoryOf);
++
++    // Resolve user overrides via factory
++    this._wasiUserOverrides = wasiOptions ? wasiOptions(this._memoryProxy) : undefined;
++
++    // Final shim for the main module: builtins + user overrides
++    const wasiShim = { ...this._wasiBuiltins, ...this._wasiUserOverrides };
++
++    const enter = (vmPtr: number): QuickJS => {
++      const vm = this.vmAt(vmPtr);
++      // The C side of `vm` is running, so it is the current VM already;
++      // this only corrects a stale host-side notion.
++      if (this._current !== vm) this._select(vm);
++      vm._depth++;
++      return vm;
++    };
++    // After a normal return the trampoline restores `saved` on the C side.
++    const leave = (vm: QuickJS, saved: QuickJS | null): void => {
++      vm._depth--;
++      this._current = saved;
++    };
++    // An exception unwinds the trampoline: restore `saved` here.
++    const abort = (vm: QuickJS, saved: QuickJS | null): void => {
++      vm._depth--;
++      if (saved && this._current !== saved) this._select(saved);
++      else if (!saved) this._current = null;
++    };
++    const wrap = <A extends number[], R>(handler: (vm: QuickJS, ...args: A) => R) =>
++      (vmPtr: number, ...args: A): R => {
++        const saved = this._current;
++        const vm = enter(vmPtr);
++        let result: R;
++        try {
++          result = handler(vm, ...args);
++        } catch (err) {
++          abort(vm, saved);
++          throw err;
++        }
++        leave(vm, saved);
++        return result;
++      };
++
++    const hostCall = (vmPtr: number, namePtr: number, nameLen: number, thisPtr: number, argc: number, argvPtr: number): number => {
++      const saved = this._current;
++      const vm = enter(vmPtr);
++      let result: number;
++      try {
++        result = vm._handleHostCall(namePtr, nameLen, thisPtr, argc, argvPtr);
++      } catch (err) {
++        abort(vm, saved);
++        throw err;
++      }
++      leave(vm, saved);
++      return result;
++    };
++
++    // host_get_timezone_offset receives time as split i32 (hi, lo) and
++    // returns the UTC offset in seconds. It comes from libc, not from a
++    // VM: it serves the current one.
++    const hostGetTimezoneOffset = (hi: number, lo: number): number => {
++      const timeSecs = Number((BigInt(hi) << 32n) | BigInt(lo >>> 0));
++      const vm = this._current;
++      return vm ? vm._hostTimezoneOffset(timeSecs) : -new Date(timeSecs * 1000).getTimezoneOffset() * 60;
++    };
++
++    return {
++      env: {
++        host_call: hostCall,
++        host_interrupt: wrap((vm) => vm._hostInterrupt()),
++        host_promise_rejection: wrap((vm, promisePtr: number, reasonPtr: number, isHandled: number) =>
++          vm._hostPromiseRejection(promisePtr, reasonPtr, isHandled)),
++        host_module_normalize: wrap((vm, baseNamePtr: number, namePtr: number) =>
++          vm._hostModuleNormalize(baseNamePtr, namePtr)),
++        host_module_load: wrap((vm, namePtr: number, outLenPtr: number) =>
++          vm._hostModuleLoad(namePtr, outLenPtr)),
++        host_get_timezone_offset: hostGetTimezoneOffset,
++      },
++      wasi_snapshot_preview1: wasiShim,
++    };
++  }
++}
++
++/** Validate the VM options of `QuickJS.create()` and `newVm()`. */
++function validateVmOptions(opts: QuickJSVmOptions): void {
++  if (
++    opts.maxStackSize !== undefined &&
++    (!Number.isInteger(opts.maxStackSize) ||
++      opts.maxStackSize < 0 ||
++      opts.maxStackSize > MAX_STACK_SIZE)
++  ) {
++    throw new RangeError(
++      `maxStackSize must be an integer between 0 and ${MAX_STACK_SIZE}`,
++    );
++  }
++}
++
++async function resolveModule(wasmInput?: BufferSource | WebAssembly.Module): Promise<WebAssembly.Module> {
++  if (wasmInput instanceof WebAssembly.Module) {
++    return wasmInput;
++  }
++  if (wasmInput) {
++    return WebAssembly.compile(wasmInput);
++  }
++  throw new TypeError(
++    'QuickJS: `wasm` option is required. Provide WASM bytes or a compiled ' +
++    '`WebAssembly.Module`. The binary is shipped at `quickjs-wasi/quickjs.wasm` ' +
++    'and can be loaded via your environment\'s preferred mechanism (e.g. ' +
++    "`fetch()`, `node:fs/promises`, or a bundler import like Vite's `?url`).",
++  );
++}
++
+ // ---- QuickJS VM ----
+ 
+ export class QuickJS {
+   private exports: QuickJSExports;
+-  private module: WebAssembly.Module;
+-  private instance: WebAssembly.Instance;
++  /** @internal The instance this VM lives in. */
++  readonly _inst: QuickJSInstance;
++  /** @internal The VM's pointer in the instance (its QJSVm). */
++  readonly _vmPtr: number;
++  /** @internal How many host imports of this VM are on the stack. */
++  _depth = 0;
+   private encoder = new TextEncoder();
+   private decoder = new TextDecoder();
+   private disposed = false;
+@@ -595,18 +1015,20 @@ export class QuickJS {
+    */
+   _activeScope: Set<JSValueHandle> | null = null;
+ 
+-  /** Loaded extensions in deterministic order */
+-  private loadedExtensions: LoadedExtension[] = [];
++  private constructor(inst: QuickJSInstance, vmPtr: number) {
++    this._inst = inst;
++    this._vmPtr = vmPtr;
++    this.exports = inst._exportsFor(this);
++  }
+ 
+-  private constructor(module: WebAssembly.Module) {
+-    this.module = module;
+-    this.instance = null!;
+-    this.exports = null!;
++  /** @internal */
++  static _attach(inst: QuickJSInstance, vmPtr: number): QuickJS {
++    return new QuickJS(inst, vmPtr);
+   }
+ 
+-  private setInstance(instance: WebAssembly.Instance) {
+-    this.instance = instance;
+-    this.exports = instance.exports as unknown as QuickJSExports;
++  /** Loaded extensions in deterministic order */
++  private get loadedExtensions(): LoadedExtension[] {
++    return this._inst._loadedExtensions;
+   }
+ 
+   // ---- Cached property accessors ----
+@@ -682,36 +1104,10 @@ export class QuickJS {
+    */
+   static async create(options?: QuickJSOptions | BufferSource | WebAssembly.Module): Promise<QuickJS> {
+     const opts = QuickJS.normalizeOptions(options);
+-    const module = await QuickJS.resolveModule(opts.wasm);
+-    const vm = new QuickJS(module);
+-    const { instance, wasiBuiltins, wasiUserOverrides, memoryProxy } = await QuickJS.instantiate(module, vm, opts.wasi);
+-    vm.setInstance(instance);
+-
+-    // Initialize the WASI reactor
+-    vm.exports._initialize();
+-
+-    // Initialize QuickJS runtime and context
+-    const result = opts.intrinsics !== undefined
+-      ? vm.exports.qjs_init2(opts.intrinsics)
+-      : vm.exports.qjs_init();
+-    if (result !== 0) {
+-      throw new Error('Failed to initialize QuickJS runtime');
+-    }
+-
+-    // Load and initialize extensions
+-    if (opts.extensions) {
+-      const mainExports = instance.exports as Record<string, WebAssembly.ExportValue>;
+-      for (const desc of opts.extensions) {
+-        const ext = await loadExtension(desc, mainExports, wasiBuiltins, wasiUserOverrides, memoryProxy);
+-        vm.loadedExtensions.push(ext);
+-        initExtension(ext, mainExports);
+-      }
+-    }
+-
+-    // Apply runtime limits
+-    QuickJS.applyLimits(vm, opts);
+-
+-    return vm;
++    // An instance of its own, which the VM owns (see QuickJSInstance for
++    // several VMs in one instance)
++    const inst = await QuickJSInstance._create(opts, true);
++    return inst._newVm(opts);
+   }
+ 
+   /**
+@@ -723,13 +1119,11 @@ export class QuickJS {
+    */
+   static async restore(snapshot: Snapshot, options?: QuickJSOptions | BufferSource | WebAssembly.Module): Promise<QuickJS> {
+     const opts = QuickJS.normalizeOptions(options);
+-    const module = await QuickJS.resolveModule(opts.wasm);
+-    const vm = new QuickJS(module);
+-    const { instance, wasiBuiltins, wasiUserOverrides, memoryProxy } = await QuickJS.instantiate(module, vm, opts.wasi);
+-    vm.setInstance(instance);
++    const inst = await QuickJSInstance._instantiate(opts, true);
++    const exports = inst._exports;
+ 
+-    const mainExports = instance.exports as Record<string, WebAssembly.ExportValue>;
+-    const exportedMemory = vm.exports.memory;
++    const mainExports = exports as unknown as Record<string, WebAssembly.ExportValue>;
++    const exportedMemory = exports.memory;
+ 
+     // Grow memory FIRST: extensions need the memory to be large enough
+     // for their __memory_base offsets (which were allocated in the original
+@@ -747,13 +1141,13 @@ export class QuickJS {
+     // function table indices match what the snapshotted QuickJS state expects.
+     if (snapshot.extensions.length > 0) {
+       const descriptors = opts.extensions ?? [];
+-      vm.loadedExtensions = await restoreExtensions(
++      inst._loadedExtensions = await restoreExtensions(
+         descriptors,
+         snapshot.extensions,
+         mainExports,
+-        wasiBuiltins,
+-        wasiUserOverrides,
+-        memoryProxy,
++        inst._wasiBuiltins,
++        inst._wasiUserOverrides,
++        inst._memoryProxy,
+       );
+     }
+ 
+@@ -765,13 +1159,16 @@ export class QuickJS {
+     dst.set(snapshot.memory);
+ 
+     // Set runtime/context pointers (they already exist in the restored memory)
+-    vm.exports.qjs_set_runtime_and_context(snapshot.runtimePtr, snapshot.contextPtr);
++    exports.qjs_set_runtime_and_context(snapshot.runtimePtr, snapshot.contextPtr);
+ 
+     // Restore the stack pointer
+-    vm.exports.__stack_pointer.value = snapshot.stackPointer;
++    exports.__stack_pointer.value = snapshot.stackPointer;
++
++    const vm = inst._adopt(exports.qjs_vm_current());
++    inst._current = vm;
+ 
+     // Apply runtime limits
+-    QuickJS.applyLimits(vm, opts);
++    QuickJS._applyLimits(vm, opts);
+ 
+     return vm;
+   }
+@@ -933,23 +1330,15 @@ export class QuickJS {
+     if (options instanceof WebAssembly.Module) return { wasm: options };
+     if (typeof options === 'object' && ('wasm' in options || 'wasi' in options || 'memoryLimit' in options || 'maxStackSize' in options || 'interruptHandler' in options || 'onUnhandledRejection' in options || 'moduleLoader' in options || 'intrinsics' in options || 'extensions' in options || 'timezoneOffset' in options)) {
+       const opts = options as QuickJSOptions;
+-      if (
+-        opts.maxStackSize !== undefined &&
+-        (!Number.isInteger(opts.maxStackSize) ||
+-          opts.maxStackSize < 0 ||
+-          opts.maxStackSize > MAX_STACK_SIZE)
+-      ) {
+-        throw new RangeError(
+-          `maxStackSize must be an integer between 0 and ${MAX_STACK_SIZE}`,
+-        );
+-      }
++      validateVmOptions(opts);
+       return opts;
+     }
+     // BufferSource (ArrayBuffer or ArrayBufferView)
+     return { wasm: options as BufferSource };
+   }
+ 
+-  private static applyLimits(vm: QuickJS, opts: QuickJSOptions): void {
++  /** @internal */
++  static _applyLimits(vm: QuickJS, opts: QuickJSVmOptions): void {
+     if (opts.memoryLimit !== undefined) {
+       vm.exports.qjs_set_memory_limit(opts.memoryLimit);
+     }
+@@ -989,159 +1378,87 @@ export class QuickJS {
+     }
+   }
+ 
+-  private static async resolveModule(wasmInput?: BufferSource | WebAssembly.Module): Promise<WebAssembly.Module> {
+-    if (wasmInput instanceof WebAssembly.Module) {
+-      return wasmInput;
++  // ---- Host imports (called by the instance for this VM) ----
++
++  /** @internal host_interrupt */
++  _hostInterrupt(): number {
++    return this.interruptHandler ? (this.interruptHandler() ? 1 : 0) : 0;
++  }
++
++  /** @internal host_promise_rejection */
++  _hostPromiseRejection(promisePtr: number, reasonPtr: number, isHandled: number): void {
++    if (!this.unhandledRejectionHandler) {
++      // No handler registered; free the heap-allocated values
++      this.exports.qjs_free_value(promisePtr);
++      this.exports.qjs_free_value(reasonPtr);
++      return;
+     }
+-    if (wasmInput) {
+-      return WebAssembly.compile(wasmInput);
++    const promise = new JSValueHandle(this, promisePtr);
++    const reason = new JSValueHandle(this, reasonPtr);
++    try {
++      this.unhandledRejectionHandler(promise, reason, isHandled !== 0);
++    } finally {
++      promise.dispose();
++      reason.dispose();
+     }
+-    throw new TypeError(
+-      'QuickJS: `wasm` option is required. Provide WASM bytes or a compiled ' +
+-      '`WebAssembly.Module`. The binary is shipped at `quickjs-wasi/quickjs.wasm` ' +
+-      'and can be loaded via your environment\'s preferred mechanism (e.g. ' +
+-      "`fetch()`, `node:fs/promises`, or a bundler import like Vite's `?url`).",
+-    );
+   }
+ 
+-  private static async instantiate(module: WebAssembly.Module, vm: QuickJS, wasiOptions?: WasiOptions): Promise<{
+-    instance: WebAssembly.Instance;
+-    wasiBuiltins: WasiImports;
+-    wasiUserOverrides: WasiImports | undefined;
+-    memoryProxy: WebAssembly.Memory;
+-  }> {
+-    let memory: WebAssembly.Memory | null = null;
+-
+-    // Create a memory proxy that defers to the actual memory once set.
+-    // This allows WASI override factories to close over the memory reference
+-    // before the WASM instance is created.
+-    const memoryProxy = new Proxy({} as WebAssembly.Memory, {
+-      get(_target, prop) {
+-        return (memory as any)[prop];
+-      },
+-    });
+-
+-    // Build the builtins (no user overrides)
+-    const wasiBuiltins = createWasiShim(() => memory!);
+-
+-    // Resolve user overrides via factory
+-    const wasiUserOverrides = wasiOptions ? wasiOptions(memoryProxy) : undefined;
+-
+-    // Final shim for the main module: builtins + user overrides
+-    const wasiShim = { ...wasiBuiltins, ...wasiUserOverrides };
+-
+-    const hostCall = (namePtr: number, nameLen: number, thisPtr: number, argc: number, argvPtr: number): number => {
+-      return vm.handleHostCall(namePtr, nameLen, thisPtr, argc, argvPtr);
+-    };
+-
+-    const hostInterrupt = (): number => {
+-      return vm.interruptHandler ? (vm.interruptHandler() ? 1 : 0) : 0;
+-    };
+-
+-    const hostPromiseRejection = (promisePtr: number, reasonPtr: number, isHandled: number): void => {
+-      if (!vm.unhandledRejectionHandler) {
+-        // No handler registered; free the heap-allocated values
+-        vm.exports.qjs_free_value(promisePtr);
+-        vm.exports.qjs_free_value(reasonPtr);
+-        return;
+-      }
+-      const promise = new JSValueHandle(vm, promisePtr);
+-      const reason = new JSValueHandle(vm, reasonPtr);
+-      try {
+-        vm.unhandledRejectionHandler(promise, reason, isHandled !== 0);
+-      } finally {
+-        promise.dispose();
+-        reason.dispose();
+-      }
+-    };
+-
+-    // Throw a host-side error into the QuickJS context so module loader
+-    // failures surface with their real message instead of the generic
+-    // "could not load module" error.
+-    const throwIntoContext = (err: unknown): void => {
+-      const errHandle = vm.newError(err instanceof Error ? err : String(err));
+-      vm.exports.qjs_throw(errHandle.ptr);
+-      errHandle.dispose();
+-    };
+-
+-    // Guard against async (or otherwise non-string-returning) module loader
+-    // callbacks. The WASM boundary is synchronous (a Promise cannot be
+-    // awaited here), so fail with a clear error instead of coercing the
+-    // Promise to source text.
+-    const assertSyncString = (value: unknown, callbackName: string): string => {
+-      if (typeof value === 'string') return value;
+-      const got = value !== null && typeof value === 'object' && typeof (value as PromiseLike<unknown>).then === 'function'
+-        ? 'a Promise'
+-        : `type ${typeof value}`;
+-      throw new TypeError(
+-        `moduleLoader.${callbackName} must synchronously return a string (got ${got}). ` +
+-        `Async module loading is not supported. Pre-fetch module sources instead ` +
+-        `(see the "ES Modules" section of the quickjs-wasi README).`
+-      );
+-    };
+-
+-    // Module normalizer: resolve a specifier relative to a base name.
+-    // Returns a malloc'd null-terminated string in WASM memory, or 0 (NULL) on error.
+-    const hostModuleNormalize = (baseNamePtr: number, namePtr: number): number => {
+-      if (!vm.moduleNormalizeHandler) {
+-        // No normalize handler; return a copy of the specifier as-is
+-        const name = vm.readCString(namePtr);
+-        return vm.writeString(name).ptr;
+-      }
+-      const baseName = vm.readCString(baseNamePtr);
+-      const specifier = vm.readCString(namePtr);
+-      try {
+-        const normalized = assertSyncString(vm.moduleNormalizeHandler(baseName, specifier), 'normalize');
+-        return vm.writeString(normalized).ptr;
+-      } catch (err) {
+-        throwIntoContext(err);
+-        return 0;
+-      }
+-    };
+-
+-    // Module loader: return source code for a module.
+-    // Returns a malloc'd string pointer, writes length to *outLenPtr.
+-    const hostModuleLoad = (namePtr: number, outLenPtr: number): number => {
+-      if (!vm.moduleLoadHandler) return 0;
+-      const name = vm.readCString(namePtr);
+-      try {
+-        const source = assertSyncString(vm.moduleLoadHandler(name), 'load');
+-        const { ptr, len } = vm.writeString(source);
+-        new Uint32Array(vm.exports.memory.buffer, outLenPtr, 1)[0] = len;
+-        return ptr;
+-      } catch (err) {
+-        throwIntoContext(err);
+-        return 0;
+-      }
+-    };
++  // Throw a host-side error into the QuickJS context so module loader
++  // failures surface with their real message instead of the generic
++  // "could not load module" error.
++  private throwIntoContext(err: unknown): void {
++    const errHandle = this.newError(err instanceof Error ? err : String(err));
++    this.exports.qjs_throw(errHandle.ptr);
++    errHandle.dispose();
++  }
+ 
+-    // host_get_timezone_offset receives time as split i32 (hi, lo) and
+-    // returns the UTC offset in seconds.
+-    const hostGetTimezoneOffset = (hi: number, lo: number): number => {
+-      const timeSecs = Number((BigInt(hi) << 32n) | BigInt(lo >>> 0));
+-      return vm.timezoneOffsetHandler ? vm.timezoneOffsetHandler(timeSecs) : 0;
+-    };
++  /** @internal host_module_normalize */
++  _hostModuleNormalize(baseNamePtr: number, namePtr: number): number {
++    // Resolve a specifier relative to a base name. Returns a malloc'd
++    // null-terminated string in WASM memory, or 0 (NULL) on error.
++    if (!this.moduleNormalizeHandler) {
++      // No normalize handler; return a copy of the specifier as-is
++      const name = this.readCString(namePtr);
++      return this.writeString(name).ptr;
++    }
++    const baseName = this.readCString(baseNamePtr);
++    const specifier = this.readCString(namePtr);
++    try {
++      const normalized = assertSyncString(this.moduleNormalizeHandler(baseName, specifier), 'normalize');
++      return this.writeString(normalized).ptr;
++    } catch (err) {
++      this.throwIntoContext(err);
++      return 0;
++    }
++  }
+ 
+-    const instance = await WebAssembly.instantiate(module, {
+-      env: {
+-        host_call: hostCall,
+-        host_interrupt: hostInterrupt,
+-        host_promise_rejection: hostPromiseRejection,
+-        host_module_normalize: hostModuleNormalize,
+-        host_module_load: hostModuleLoad,
+-        host_get_timezone_offset: hostGetTimezoneOffset,
+-      },
+-      wasi_snapshot_preview1: wasiShim,
+-    });
++  /** @internal host_module_load */
++  _hostModuleLoad(namePtr: number, outLenPtr: number): number {
++    // Return source code for a module: a malloc'd string pointer, with
++    // its length written to *outLenPtr.
++    if (!this.moduleLoadHandler) return 0;
++    const name = this.readCString(namePtr);
++    try {
++      const source = assertSyncString(this.moduleLoadHandler(name), 'load');
++      const { ptr, len } = this.writeString(source);
++      new Uint32Array(this.exports.memory.buffer, outLenPtr, 1)[0] = len;
++      return ptr;
++    } catch (err) {
++      this.throwIntoContext(err);
++      return 0;
++    }
++  }
+ 
+-    memory = (instance.exports as any).memory as WebAssembly.Memory;
+-    return { instance, wasiBuiltins, wasiUserOverrides, memoryProxy };
++  /** @internal host_get_timezone_offset, in seconds east of UTC */
++  _hostTimezoneOffset(timeSecs: number): number {
++    return this.timezoneOffsetHandler ? this.timezoneOffsetHandler(timeSecs) : 0;
+   }
+ 
+   /**
+    * Called from WASM when a host function is invoked from QuickJS code.
++   * @internal
+    */
+-  private handleHostCall(namePtr: number, nameLen: number, thisPtr: number, argc: number, argvPtr: number): number {
++  _handleHostCall(namePtr: number, nameLen: number, thisPtr: number, argc: number, argvPtr: number): number {
+     const name = this.decoder.decode(new Uint8Array(this.exports.memory.buffer, namePtr, nameLen));
+     const callback = this.hostCallbacks.get(name);
+     if (!callback) {
+@@ -2315,6 +2632,13 @@ export class QuickJS {
+    */
+   snapshot(): Snapshot {
+     this.assertNotDisposed();
++    if (this._inst.vmCount !== 1) {
++      throw new Error(
++        'snapshot() captures the memory of the whole WASM instance, which holds ' +
++          `${this._inst.vmCount} VMs: a VM of a QuickJSInstance can be snapshotted ` +
++          'only while it is the only VM of its instance',
++      );
++    }
+ 
+     return {
+       memory: new Uint8Array(this.exports.memory.buffer).slice(),
+@@ -2343,23 +2667,41 @@ export class QuickJS {
+    * so it can be garbage collected by the host JS engine.
+    */
+   dispose(): void {
+-    if (!this.disposed) {
+-      this.disposed = true;
+-
+-      // Release references so the WASM instance and its linear memory
+-      // can be garbage collected even if someone holds onto this QuickJS object.
+-      this._global = null;
+-      this._undefined = null;
+-      this._null = null;
+-      this._true = null;
+-      this._false = null;
+-      this._ownedHandles.clear();
+-      this.hostCallbacks.clear();
+-      this._activeScope = null;
+-      this.exports = null!;
+-      this.instance = null!;
+-      this.module = null!;
++    if (this.disposed) return;
++    if (this._inst._owned) {
++      // The instance is this VM's own: drop it whole.
++      this._inst.dispose();
++      return;
+     }
++    if (this._depth > 0) {
++      throw new Error(
++        'Cannot dispose a VM while it is running (from one of its own host ' +
++          'functions, interrupt handler, module loader or rejection handler)',
++      );
++    }
++    // Free the runtime, with every value still held by a handle, so the
++    // next VM of the instance reuses its memory.
++    this._inst._exports.qjs_vm_free(this._vmPtr);
++    this._release();
++  }
++
++  /** @internal Mark disposed and drop references (the runtime is gone or going). */
++  _release(): void {
++    if (this.disposed) return;
++    this.disposed = true;
++    this._inst._forget(this);
++
++    // Release references so the WASM instance and its linear memory
++    // can be garbage collected even if someone holds onto this QuickJS object.
++    this._global = null;
++    this._undefined = null;
++    this._null = null;
++    this._true = null;
++    this._false = null;
++    this._ownedHandles.clear();
++    this.hostCallbacks.clear();
++    this._activeScope = null;
++    this.exports = null!;
+   }
+ 
+   /**
+diff --git a/test/multi-vm.test.ts b/test/multi-vm.test.ts
+new file mode 100644
+index 0000000..57605ce
+--- /dev/null
++++ b/test/multi-vm.test.ts
+@@ -0,0 +1,322 @@
++import { describe, it, expect } from 'vitest';
++import { readFileSync } from 'node:fs';
++import { QuickJS, QuickJSInstance, JSException, EvalFlags, type JSValueHandle } from '../src/index.ts';
++import { wasmBytes } from './helpers.ts';
++
++const wasm = new WebAssembly.Module(wasmBytes);
++const encodingExtension = {
++  name: 'encoding',
++  wasm: readFileSync(new URL('../extensions/encoding/encoding.so', import.meta.url)),
++};
++
++const num = (h: JSValueHandle) => h.consume((x) => x.toNumber());
++const str = (h: JSValueHandle) => h.consume((x) => x.toString());
++
++describe('QuickJSInstance', () => {
++  it('creates independent VMs in one instance', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const a = inst.newVm();
++    const b = inst.newVm();
++    expect(inst.vmCount).toBe(2);
++    a.evalCode('globalThis.x = "a"').dispose();
++    b.evalCode('globalThis.x = "b"').dispose();
++    expect(str(a.evalCode('x'))).toBe('a');
++    expect(str(b.evalCode('x'))).toBe('b');
++    // interleaved handle use: each handle acts on its own VM
++    const ha = a.evalCode('({ v: 1 })');
++    const hb = b.evalCode('({ v: 2 })');
++    expect(num(ha.getProp('v'))).toBe(1);
++    expect(num(hb.getProp('v'))).toBe(2);
++    ha.dispose();
++    hb.dispose();
++    a.dispose();
++    expect(inst.vmCount).toBe(1);
++    expect(str(b.evalCode('x'))).toBe('b');
++  });
++
++  it('runs nested cross-VM calls and returns to the calling VM', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const a = inst.newVm();
++    const b = inst.newVm();
++
++    // b.callA(n) re-enters a while a is running
++    b.newFunction('callA', (n) => {
++      const r = a.evalCode(`inner(${n.toNumber()})`);
++      const v = r.toNumber();
++      r.dispose();
++      return b.newNumber(v + 1000);
++    }).consume((f) => b.setProp(b.global, 'callA', f));
++    // a.callB(n) calls into b, whose code calls back into a
++    a.newFunction('callB', (n) => {
++      const r = b.evalCode(`callA(${n.toNumber()}) + 1`);
++      const v = r.toNumber();
++      r.dispose();
++      // after b returned, the exports act on a again
++      const s = a.newString(`a:${v}`);
++      return s;
++    }).consume((f) => a.setProp(a.global, 'callB', f));
++
++    a.evalCode('function inner(n) { return n * 2 }').dispose();
++    const result = a.evalCode(`
++      const out = [];
++      for (let i = 0; i < 3; i++) out.push(callB(i));
++      out.join(',') + '|' + typeof inner
++    `);
++    expect(str(result)).toBe('a:1001,a:1003,a:1005|function');
++
++    // the state of each VM survived the nesting
++    expect(str(b.evalCode('typeof inner'))).toBe('undefined');
++    a.dispose();
++    b.dispose();
++  });
++
++  it('propagates exceptions across VMs', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const a = inst.newVm();
++    const b = inst.newVm();
++    a.newFunction('callB', (code) => {
++      try {
++        return b.evalCode(code.toString()).consume((h) => a.newString(h.toString()));
++      } catch (err) {
++        expect(err).toBeInstanceOf(JSException);
++        const message = (err as JSException).message;
++        (err as JSException).dispose();
++        // rethrown into a, as an a error
++        throw new Error(`from b: ${message}`);
++      }
++    }).consume((f) => a.setProp(a.global, 'callB', f));
++
++    expect(str(a.evalCode('callB("1 + 1")'))).toBe('2');
++    expect(str(a.evalCode(`
++      try { callB('throw new TypeError("nope")') } catch (e) { e.message }
++    `))).toBe('from b: nope');
++    // an uncaught one reaches the host as a JSException of a
++    expect(() => a.evalCode('callB("null.x")')).toThrow(/from b: .*null/);
++    // both VMs still work
++    expect(num(a.evalCode('40 + 2'))).toBe(42);
++    expect(num(b.evalCode('40 + 3'))).toBe(43);
++  });
++
++  it('calls each VM\'s own interrupt handler', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    let aCalls = 0;
++    let bCalls = 0;
++    let deadline = Infinity;
++    const a = inst.newVm({ interruptHandler: () => { aCalls++; return Date.now() > deadline; } });
++    const b = inst.newVm({ interruptHandler: () => { bCalls++; return false; } });
++    const c = inst.newVm();
++
++    deadline = Date.now() + 30;
++    expect(() => a.evalCode('while (true) {}')).toThrow(/interrupted/);
++    expect(aCalls).toBeGreaterThan(0);
++    expect(bCalls).toBe(0);
++    deadline = Infinity;
++
++    const before = aCalls;
++    expect(num(b.evalCode('let n = 0; for (let i = 0; i < 1e6; i++) n++; n'))).toBe(1e6);
++    expect(bCalls).toBeGreaterThan(0);
++    expect(aCalls).toBe(before);
++    expect(num(c.evalCode('let m = 0; for (let i = 0; i < 1e6; i++) m++; m'))).toBe(1e6);
++
++    // nested: b's loop runs inside a's host function and polls b's handler
++    const bBefore = bCalls;
++    a.newFunction('runB', () => b.evalCode('let k = 0; for (let i = 0; i < 1e6; i++) k++; k').consume((h) => a.newNumber(h.toNumber())))
++      .consume((f) => a.setProp(a.global, 'runB', f));
++    expect(num(a.evalCode('runB()'))).toBe(1e6);
++    expect(bCalls).toBeGreaterThan(bBefore);
++  });
++
++  it('keeps memory limits per VM', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const limited = inst.newVm({ memoryLimit: 4 << 20 });
++    const free = inst.newVm();
++    const other = inst.newVm({ memoryLimit: 64 << 20 });
++    expect(limited.getMemoryUsage().mallocLimit).toBe(4 << 20);
++    expect(free.getMemoryUsage().mallocLimit).toBe(0);
++    expect(other.getMemoryUsage().mallocLimit).toBe(64 << 20);
++
++    const grow = 'globalThis.keep = []; for (let i = 0; i < 400; i++) keep.push(new Uint8Array(64 * 1024)); keep.length';
++    expect(() => limited.evalCode(grow)).toThrow(/out of memory/);
++    // the others are not affected by limited's OOM
++    expect(num(free.evalCode(grow))).toBe(400);
++    expect(num(other.evalCode(grow))).toBe(400);
++    expect(free.getMemoryUsage().mallocSize).toBeGreaterThan(20 << 20);
++    // and limited recovers once it drops its garbage
++    limited.evalCode('globalThis.keep = null').dispose();
++    limited.runGC();
++    expect(num(limited.evalCode('new Uint8Array(1024).length'))).toBe(1024);
++    expect(limited.getMemoryUsage().mallocSize).toBeLessThan(4 << 20);
++  });
++
++  it('frees a disposed VM while others live, with handles still undisposed', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const a = inst.newVm();
++    const b = inst.newVm();
++    b.evalCode('globalThis.state = { n: 1 }').dispose();
++
++    // leaks: handles, a host function, a pending promise, a cycle
++    const leaked = a.evalCode('globalThis.o = { self: null }; o.self = o; o');
++    const fn = a.newFunction('f', () => a.undefined);
++    const deferred = a.newPromise();
++    a.evalCode('new Promise(() => {})');
++    a.evalCode('[1, 2, 3].map(x => x * 2)');
++    const usedBefore = b.getMemoryUsage().mallocSize;
++
++    a.dispose();
++    expect(inst.vmCount).toBe(1);
++    // disposing handles of a disposed VM is a no-op
++    leaked.dispose();
++    fn.dispose();
++    expect(() => a.evalCode('1')).toThrow(/disposed/);
++    expect(deferred.handle.disposed).toBe(false);
++
++    expect(num(b.evalCode('state.n + 1'))).toBe(2);
++    expect(b.getMemoryUsage().mallocSize).toBe(usedBefore);
++    b.dispose();
++    expect(inst.vmCount).toBe(0);
++  });
++
++  it('reuses the memory of disposed VMs', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const memory = inst._exports.memory;
++    const sizes: number[] = [];
++    for (let i = 0; i < 40; i++) {
++      const vm = inst.newVm();
++      vm.evalCode(`
++        globalThis.data = [];
++        for (let i = 0; i < 2000; i++) data.push({ i, s: "x".repeat(100) + i });
++        globalThis.buf = new Uint8Array(2 * 1024 * 1024);
++      `).dispose();
++      const leak = vm.evalCode('data'); // never disposed: freed with the VM
++      void leak;
++      vm.dispose();
++      sizes.push(memory.buffer.byteLength);
++    }
++    // the memory reached its size in the first iterations, then stays
++    expect(sizes[sizes.length - 1]).toBe(sizes[4]);
++    expect(sizes[sizes.length - 1]).toBeLessThan(32 << 20);
++  });
++
++  it('collects garbage per VM', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const a = inst.newVm();
++    const b = inst.newVm();
++    b.evalCode('globalThis.keep = []; for (let i = 0; i < 1000; i++) keep.push({ i })').dispose();
++    a.gcThreshold = 0x7fffffff; // no automatic GC in a
++    a.evalCode('for (let i = 0; i < 1000; i++) { const x = { i }; x.self = x }').dispose();
++    const aBefore = a.getMemoryUsage().objCount;
++    const bBefore = b.getMemoryUsage().objCount;
++    a.runGC();
++    expect(a.getMemoryUsage().objCount).toBeLessThan(aBefore - 900);
++    b.runGC();
++    expect(b.getMemoryUsage().objCount).toBe(bBefore);
++  });
++
++  it('gives each VM its own module loader, timezone and rejection handler', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const rejections: string[] = [];
++    const a = inst.newVm({
++      moduleLoader: { load: (name) => `export default "a:${name}"` },
++      timezoneOffset: 0,
++      onUnhandledRejection: (_p, reason) => rejections.push(`a:${reason.toString()}`),
++    });
++    const b = inst.newVm({
++      moduleLoader: { load: (name) => `export default "b:${name}"` },
++      timezoneOffset: -60,
++      onUnhandledRejection: (_p, reason) => rejections.push(`b:${reason.toString()}`),
++    });
++    const importDefault = async (vm: QuickJS) => {
++      const p = vm.evalCode('import m from "mod"; export const v = m;', 'main.js', EvalFlags.TYPE_MODULE);
++      vm.executePendingJobs();
++      const settled = await vm.resolvePromise(p);
++      p.dispose();
++      if (!('value' in settled)) throw new Error('module evaluation failed');
++      return str(settled.value.consume((h) => h.getProp('v')));
++    };
++    expect(await importDefault(a)).toBe('a:mod');
++    expect(await importDefault(b)).toBe('b:mod');
++
++    expect(num(a.evalCode('new Date(0).getTimezoneOffset()'))).toBe(0);
++    expect(num(b.evalCode('new Date(0).getTimezoneOffset()'))).toBe(-60);
++    // b's timezone also inside a's host function
++    a.newFunction('bOffset', () => b.evalCode('new Date(0).getTimezoneOffset()').consume((h) => a.newNumber(h.toNumber())))
++      .consume((f) => a.setProp(a.global, 'bOffset', f));
++    expect(str(a.evalCode('[new Date(0).getTimezoneOffset(), bOffset(), new Date(0).getTimezoneOffset()].join()'))).toBe('0,-60,0');
++
++    a.evalCode('Promise.reject("x")').dispose();
++    a.executePendingJobs();
++    b.evalCode('Promise.reject("y")').dispose();
++    b.executePendingJobs();
++    expect(rejections).toEqual(['a:x', 'b:y']);
++  });
++
++  it('initializes the instance extensions in every VM', async () => {
++    using inst = await QuickJSInstance.create({ wasm, extensions: [encodingExtension] });
++    const a = inst.newVm();
++    const b = inst.newVm();
++    const roundTrip = 'new TextDecoder().decode(new TextEncoder().encode("héllo"))';
++    expect(str(a.evalCode(roundTrip))).toBe('héllo');
++    expect(str(b.evalCode(roundTrip))).toBe('héllo');
++    a.dispose();
++    const c = inst.newVm();
++    expect(str(c.evalCode(roundTrip))).toBe('héllo');
++    expect(str(b.evalCode('new TextEncoder().encode("abc").length + ""'))).toBe('3');
++  });
++
++  it('snapshots a VM only while it is the only VM of its instance', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const a = inst.newVm();
++    const b = inst.newVm();
++    a.evalCode('globalThis.saved = 42').dispose();
++    expect(() => a.snapshot()).toThrow(/only VM of its instance/);
++    b.dispose();
++    const snapshot = a.snapshot();
++    using restored = await QuickJS.restore(snapshot, { wasm });
++    expect(num(restored.evalCode('saved'))).toBe(42);
++    expect(num(a.evalCode('saved'))).toBe(42);
++  });
++
++  it('refuses to dispose a VM from its own callbacks, not from another VM\'s', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const a = inst.newVm();
++    const b = inst.newVm();
++    a.newFunction('selfDispose', () => {
++      a.dispose();
++      return a.undefined;
++    }).consume((f) => a.setProp(a.global, 'selfDispose', f));
++    expect(() => a.evalCode('selfDispose()')).toThrow(/while it is running/);
++    expect(num(a.evalCode('1 + 1'))).toBe(2);
++
++    b.newFunction('disposeA', () => {
++      a.dispose();
++      return b.true;
++    }).consume((f) => b.setProp(b.global, 'disposeA', f));
++    expect(b.evalCode('disposeA()').consume((h) => h.toBoolean())).toBe(true);
++    expect(inst.vmCount).toBe(1);
++    expect(num(b.evalCode('2 + 2'))).toBe(4);
++  });
++
++  it('disposes every VM with the instance', async () => {
++    const inst = await QuickJSInstance.create({ wasm });
++    const a = inst.newVm();
++    inst.newVm();
++    inst.dispose();
++    expect(() => a.evalCode('1')).toThrow(/disposed/);
++    expect(() => inst.newVm()).toThrow(/disposed/);
++  });
++
++  it('validates VM options', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    expect(() => inst.newVm({ maxStackSize: -1 })).toThrow(/maxStackSize/);
++    expect(inst.vmCount).toBe(0);
++  });
++
++  it('leaves QuickJS.create VMs on instances of their own', async () => {
++    using a = await QuickJS.create({ wasm });
++    using b = await QuickJS.create({ wasm });
++    a.evalCode('globalThis.x = 1').dispose();
++    expect(str(b.evalCode('typeof x'))).toBe('undefined');
++    expect(a._inst).not.toBe(b._inst);
++    expect(() => a._inst.newVm()).toThrow(/QuickJS.create/);
++  });
++});

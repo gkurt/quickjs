@@ -18,6 +18,7 @@ on:
       - '**.c'
       - '**.h'
       - 'npm/quickjs-wasi/**'
+      - 'scripts/engine-source-hash.mjs'
       - '.github/workflows/quickjs-wasi.yml'
   push:
     branches:
@@ -26,6 +27,7 @@ on:
       - '**.c'
       - '**.h'
       - 'npm/quickjs-wasi/**'
+      - 'scripts/engine-source-hash.mjs'
       - '.github/workflows/quickjs-wasi.yml'
   workflow_dispatch:
 
