@@ -26570,6 +26570,11 @@ static int __exception js_parse_property_name(JSParseState *s,
             if (s->token.val == ':' || s->token.val == ',' ||
                 s->token.val == '}' || s->token.val == '(' ||
                 s->token.val == '=' || s->token.val == ';' ||
+                /* in a class, a field named get or set followed by a
+                   generator method: accessors cannot be generators,
+                   so that 'get *g() {}' is a SyntaxError unless ASI
+                   ends the field before the '*' */
+                (s->token.val == '*' && allow_private) ||
                 /* TypeScript: get?: T, get!: T, get<T>() are plain members */
                 (ts_enabled(s) && (s->token.val == '?' || s->token.val == '!' ||
                            s->token.val == '<'))) {
