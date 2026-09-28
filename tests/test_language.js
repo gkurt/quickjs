@@ -733,6 +733,12 @@ function test_optional_chaining()
     assert((a?.b)().c, 42);
 
     assert((a?.["b"])().c, 42);
+
+    /* the callee of new cannot be an optional chain */
+    assert_throws(SyntaxError, "var a = { b: function() {} }; new a?.b()");
+    assert_throws(SyntaxError, "var a = { b: function() {} }; new a?.['b']()");
+    assert(eval("var a = { b: function() { this.c = 1 } }; new (a?.b)().c"), 1);
+    assert(eval("function F() { this.c = 2 } new F()?.c"), 2);
 }
 
 function test_parse_semicolon()

@@ -30659,6 +30659,10 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         bool has_optional_chain = false;
 
         if (s->token.val == TOK_QUESTION_MARK_DOT) {
+            /* the callee of new (parsed without PF_POSTFIX_CALL) cannot
+               be an optional chain */
+            if (!accept_lparen)
+                return js_parse_error(s, "new keyword cannot be used with an optional chain");
             /* optional chaining */
             if (next_token(s))
                 return -1;
