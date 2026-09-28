@@ -1105,6 +1105,10 @@ struct JSModuleDef {
     int dfs_index, dfs_ancestor_index;
     JSModuleDef *stack_prev;
     /* temp use during js_module_evaluate() */
+    /* the stack of the evaluation which pushed the module, while it is
+       EVALUATING: tells a module on the stack of the current evaluation
+       from one of an evaluation this one is nested in */
+    JSModuleDef **eval_stack;
     JSModuleDef **async_parent_modules;
     int async_parent_modules_count;
     int async_parent_modules_size;
@@ -34881,6 +34885,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
             goto fail;
         assert(m1->status == JS_MODULE_STATUS_LINKING ||
                m1->status == JS_MODULE_STATUS_LINKED ||
+               m1->status == JS_MODULE_STATUS_EVALUATING ||
                m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
                m1->status == JS_MODULE_STATUS_EVALUATED);
         if (m1->status == JS_MODULE_STATUS_LINKING) {
@@ -36343,6 +36348,7 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
     /* push 'm' on stack */
     m->stack_prev = *pstack_top;
     *pstack_top = m;
+    m->eval_stack = pstack_top;
 
     for(i = 0; i < m->req_module_entries_count; i++) {
         JSReqModuleEntry *rme = &m->req_module_entries[i];
@@ -36354,8 +36360,14 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
                m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
                m1->status == JS_MODULE_STATUS_EVALUATED);
         if (m1->status == JS_MODULE_STATUS_EVALUATING) {
-            m->dfs_ancestor_index = min_int(m->dfs_ancestor_index,
-                                            m1->dfs_ancestor_index);
+            /* m1 may also be on the stack of an evaluation this one is
+               nested in, when its body ran the jobs which evaluate m
+               (a host function draining the job queue): its dfs indexes
+               belong to that evaluation, and its body has started, so
+               as for an evaluated module there is no cycle to join */
+            if (m1->eval_stack == pstack_top)
+                m->dfs_ancestor_index = min_int(m->dfs_ancestor_index,
+                                                m1->dfs_ancestor_index);
         } else {
             m1 = m1->cycle_root;
             assert(m1->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
