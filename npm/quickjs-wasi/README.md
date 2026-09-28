@@ -17,7 +17,8 @@ additions below. Compared with `quickjs-wasi` itself:
 - synchronous creation: `QuickJS.createSync()`, `QuickJSInstance.createSync()`
 - `vm.getPromiseResult()`: the outcome of a settled promise, synchronously
 - the handle a host function returns is consumed, instead of leaking
-- a 2 MiB stack: `maxStackSize` up to 1 MiB (`MAX_STACK_SIZE`)
+- a 2 MiB stack: `maxStackSize` up to 1 MiB (`MAX_STACK_SIZE`); the stack
+  pointer survives a host stack overflow (see Stack)
 - `vm.versions.engineCommit` and `engineSourceHash`: the engine inside
 
 These changes are a patch series on quickjs-wasi, in
@@ -237,12 +238,36 @@ const ns = vm.getPromiseResult(p); // the module's exports
 `DEFAULT_STACK_SIZE` (512 KiB). Past it, the guest gets `RangeError: Maximum
 call stack size exceeded`, which it can catch, and the VM stays usable.
 
-The host engine runs the WASM code on its own native stack too, which
-recursion fills a little faster than the WASM stack. 1 MiB needs about 2 MiB
-of native stack or more, as on JavaScriptCore or in a Node.js worker (4 MiB
-by default); on a 1 MiB native stack (Node.js's main thread) the host's
-stack overflows first, which throws the host's `RangeError` out of the call
-and leaves the VM unusable. The default fits a 1 MiB native stack.
+The limit counts only the WASM stack (the C code's shadow stack). The host
+engine runs the WASM code on its own native stack too, where most locals
+live, and the limit does not see it. Recursion that takes little WASM stack
+per level but much native stack, such as `JSON.parse` of deeply nested input,
+can overflow the host's stack long before the limit: the host throws its own
+`RangeError` out of the call instead of the guest getting a catchable one.
+Measured with `maxStackSize` (HOST: the host's stack overflowed first):
+
+| Host                     | Plain recursion  | `JSON.parse`, 100k levels        |
+| ------------------------ | ---------------- | -------------------------------- |
+| Node.js, main thread     | HOST at 512 KiB  |                                  |
+| Bun, main thread         | HOST at 768 KiB  |                                  |
+| Chromium                 | HOST at 512 KiB  | HOST even at 256 KiB             |
+| WebKit                   | fine to 1 MiB    | HOST at 512 KiB, guest error at 256 KiB |
+| Node.js worker (4 MiB)   | fine to 1 MiB    |                                  |
+
+So the default does **not** fit every host's native stack (a 1 MiB one, as on
+Node.js's main thread, is too small for it), and no value is safe for all
+hosts and inputs: for untrusted code, choose `maxStackSize` for your host, and
+run it where the native stack is large (a Node.js worker with `resourceLimits:
+{ stackSizeMb }`) or keep it small (256 KiB reaches the depth native
+`rquickjs` reaches at 1 MiB).
+
+The host's overflow can be survived: when an error other than a guest
+exception leaves WASM (the host's `RangeError`, or a trap), the stack pointer
+is put back, so the instance's other VMs are not affected and the stack is not
+lost. The VM that was running is left half-way through an operation and
+becomes unusable: every later call on it, and on its handles, throws `the VM
+is unusable` (disposing them is fine). Its memory stays with the instance
+until the instance is disposed. Create a new VM to go on.
 
 The VMs of an instance share its stack: a VM running from the host function
 of another VM starts where the other one is, and has only the rest. The
