@@ -54656,116 +54656,6 @@ fail:
     return ret;
 }
 
-/* delete portions of a string that match a given regex */
-static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue arg)
-{
-    JSRegExp *re = js_get_regexp(ctx, this_val, true);
-    JSString *str;
-    JSValue str_val, val;
-    uint8_t *re_bytecode;
-    int ret;
-    uint8_t **capture, *str_buf;
-    int alloc_count, shift, re_flags;
-    int next_src_pos, start, end;
-    int64_t last_index;
-    StringBuffer b_s, *b = &b_s;
-
-    if (!re)
-        return JS_EXCEPTION;
-
-    string_buffer_init(ctx, b, 0);
-
-    capture = NULL;
-    str_val = JS_ToString(ctx, arg);
-    if (JS_IsException(str_val))
-        goto fail;
-    str = JS_VALUE_GET_STRING(str_val);
-    re_bytecode = str8(re->bytecode);
-    re_flags = lre_get_flags(re_bytecode);
-    if ((re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) == 0) {
-        last_index = 0;
-    } else {
-        val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
-        if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
-            goto fail;
-    }
-    /* size by alloc_count: the register executor uses capture[] beyond
-       the capture positions for its registers (see js_regexp_exec). */
-    alloc_count = lre_get_alloc_count(re_bytecode);
-    if (alloc_count > 0) {
-        capture = js_malloc(ctx, sizeof(capture[0]) * alloc_count);
-        if (!capture)
-            goto fail;
-    }
-    shift = str->is_wide_char;
-    str_buf = str8(str);
-    next_src_pos = 0;
-    for (;;) {
-        if (last_index > str->len)
-            break;
-
-        ret = lre_exec(capture, re_bytecode,
-                       str_buf, last_index, str->len, shift, ctx);
-        if (ret != 1) {
-            if (ret >= 0) {
-                if (ret == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
-                    if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                                       js_int32(0)) < 0)
-                        goto fail;
-                }
-            } else {
-                switch(ret) {
-                case LRE_RET_TIMEOUT:
-                    JS_ThrowInterrupted(ctx);
-                    break;
-                case LRE_RET_MEMORY_ERROR:
-                    JS_ThrowInternalError(ctx, "out of memory in regexp execution");
-                    break;
-                case LRE_RET_BYTECODE_ERROR:
-                    JS_ThrowInternalError(ctx, "corrupted bytecode in regexp execution");
-                    break;
-                default:
-                    abort();
-                }
-                goto fail;
-            }
-            break;
-        }
-        start = (capture[0] - str_buf) >> shift;
-        end = (capture[1] - str_buf) >> shift;
-        last_index = end;
-        if (next_src_pos < start) {
-            if (string_buffer_concat(b, str, next_src_pos, start))
-                goto fail;
-        }
-        next_src_pos = end;
-        if (!(re_flags & LRE_FLAG_GLOBAL)) {
-            if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                               js_int32(end)) < 0)
-                goto fail;
-            break;
-        }
-        if (end == start) {
-            if (!(re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) || (unsigned)end >= str->len || !str->is_wide_char) {
-                end++;
-            } else {
-                string_getc(str, &end);
-            }
-        }
-        last_index = end;
-    }
-    if (string_buffer_concat(b, str, next_src_pos, str->len))
-        goto fail;
-    JS_FreeValue(ctx, str_val);
-    js_free(ctx, capture);
-    return string_buffer_end(b);
-fail:
-    JS_FreeValue(ctx, str_val);
-    js_free(ctx, capture);
-    string_buffer_free(b);
-    return JS_EXCEPTION;
-}
-
 static JSValue JS_RegExpExec(JSContext *ctx, JSValueConst r, JSValueConst s)
 {
     JSValue method, ret;
@@ -55093,26 +54983,204 @@ static int value_buffer_append(ValueBuffer *b, JSValue val)
     return 0;
 }
 
-static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
+/* true if 'p' has the getter 'func' with 'magic' as own property 'atom' */
+static bool js_has_own_getter(JSContext *ctx, JSObject *p, JSAtom atom,
+                              JSCFunctionType func, int magic)
 {
-    JSValue val;
-    int res;
+    JSProperty *pr;
+    JSShapeProperty *prs;
 
-    val = JS_GetProperty(ctx, rx, JS_ATOM_constructor);
-    if (JS_IsException(val))
-        return -1;
-    // rx.constructor === RegExp
-    res = js_same_value(ctx, val, ctx->regexp_ctor);
-    JS_FreeValue(ctx, val);
-    if (res) {
-        val = JS_GetProperty(ctx, rx, JS_ATOM_exec);
-        if (JS_IsException(val))
-            return -1;
-        // rx.exec === RE_exec
-        res = JS_IsCFunction(ctx, val, js_regexp_exec, 0);
-        JS_FreeValue(ctx, val);
+    prs = find_own_property(&pr, p, atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET ||
+        !pr->u.getset.getter)
+        return false;
+    return JS_IsCFunction(ctx, JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter),
+                          func.generic, magic);
+}
+
+/* true if 'rx' is a RegExp object which the RegExp.prototype methods can
+   match without the property accesses of the specification: lastIndex
+   is a number, 'exec', 'flags' and the flag getters are the built-in ones
+   of RegExp.prototype (it has no other own property and RegExp.prototype
+   is its prototype). Reading them then has no side effect and gives the
+   flags of the regexp. */
+static bool js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
+{
+    JSObject *p, *proto;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    JSCFunctionType ft;
+    int i;
+
+    if (JS_VALUE_GET_TAG(rx) != JS_TAG_OBJECT)
+        return false;
+    p = JS_VALUE_GET_OBJ(rx);
+    if (p->class_id != JS_CLASS_REGEXP)
+        return false;
+    /* lastIndex, the first property, is the only one */
+    if (p->shape->prop_count != 1 || !JS_IsNumber(p->prop[0].u.value))
+        return false;
+    proto = p->shape->proto;
+    if (!proto || proto != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_REGEXP]))
+        return false;
+
+    prs = find_own_property(&pr, proto, JS_ATOM_exec);
+    if (!prs)
+        return false;
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+        /* not instantiated yet */
+        const JSCFunctionListEntry *e = pr->u.init.opaque;
+        if (js_autoinit_get_id(pr) != JS_AUTOINIT_ID_PROP ||
+            e->def_type != JS_DEF_CFUNC ||
+            e->u.func.cfunc.generic != js_regexp_exec)
+            return false;
+    } else if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
+               !JS_IsCFunction(ctx, pr->u.value, js_regexp_exec, 0)) {
+        return false;
     }
-    return res;
+    ft.getter = js_regexp_get_flags;
+    if (!js_has_own_getter(ctx, proto, JS_ATOM_flags, ft, 0))
+        return false;
+    ft.getter_magic = js_regexp_get_flag;
+    for(i = 0; i < countof(js_regexp_flag_getters); i++) {
+        if (!js_has_own_getter(ctx, proto, ctx->regexp_flag_atoms[i], ft,
+                               js_regexp_flag_getters[i].flag))
+            return false;
+    }
+    return true;
+}
+
+/* true if the replacement string contains "$<" */
+static bool js_string_has_named_ref(JSString *rp)
+{
+    int i;
+
+    for(i = 0; (i = string_indexof_char(rp, '$', i)) >= 0; i++) {
+        if (i + 1 < rp->len && string_get(rp, i + 1) == '<')
+            return true;
+    }
+    return false;
+}
+
+/* RegExp.prototype[Symbol.replace] for a standard regexp (see
+   js_is_standard_regexp()) and a replacement string 'rep_val', without
+   the result objects of exec(): the replacement is appended at each
+   match. Return JS_UNDEFINED if it does not apply (a reference to a
+   named group in the replacement). */
+static JSValue js_regexp_replace(JSContext *ctx, JSValueConst this_val,
+                                 JSValueConst str_val, JSValueConst rep_val)
+{
+    JSRegExp *re = js_get_regexp(ctx, this_val, true);
+    JSString *str = JS_VALUE_GET_STRING(str_val);
+    JSString *rp = JS_VALUE_GET_STRING(rep_val);
+    uint8_t *re_bytecode;
+    uint8_t **capture, *str_buf;
+    int ret, capture_count, alloc_count, shift, re_flags;
+    int next_src_pos, start, end;
+    int64_t last_index;
+    StringBuffer b_s, *b = &b_s;
+    bool full_unicode;
+
+    if (!re)
+        return JS_EXCEPTION;
+    re_bytecode = str8(re->bytecode);
+    /* the named groups are only needed for "$<" */
+    if (lre_get_groupnames(re_bytecode) && js_string_has_named_ref(rp))
+        return JS_UNDEFINED;
+    re_flags = lre_get_flags(re_bytecode);
+
+    string_buffer_init(ctx, b, 0);
+    capture = NULL;
+    if (re_flags & LRE_FLAG_GLOBAL) {
+        if (js_regexp_set_lastIndex(ctx, this_val, 0) < 0)
+            goto fail;
+    }
+    if ((re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) == 0) {
+        last_index = 0;
+    } else {
+        if (js_regexp_get_lastIndex(ctx, &last_index, this_val))
+            goto fail;
+    }
+    /* sized by alloc_count: see js_regexp_exec() */
+    alloc_count = lre_get_alloc_count(re_bytecode);
+    if (alloc_count > 0) {
+        capture = js_malloc(ctx, sizeof(capture[0]) * alloc_count);
+        if (!capture)
+            goto fail;
+    }
+    capture_count = lre_get_capture_count(re_bytecode);
+    full_unicode = (re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0;
+    shift = str->is_wide_char;
+    str_buf = str8(str);
+    next_src_pos = 0;
+    for(;;) {
+        if (last_index > str->len) {
+            ret = 2;
+        } else {
+            ret = lre_exec(capture, re_bytecode,
+                           str_buf, last_index, str->len, shift, ctx);
+        }
+        if (ret != 1) {
+            if (ret >= 0) {
+                if (ret == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
+                    if (js_regexp_set_lastIndex(ctx, this_val, 0) < 0)
+                        goto fail;
+                }
+            } else {
+                switch(ret) {
+                case LRE_RET_TIMEOUT:
+                    JS_ThrowInterrupted(ctx);
+                    break;
+                case LRE_RET_MEMORY_ERROR:
+                    JS_ThrowInternalError(ctx, "out of memory in regexp execution");
+                    break;
+                case LRE_RET_BYTECODE_ERROR:
+                    JS_ThrowInternalError(ctx, "corrupted bytecode in regexp execution");
+                    break;
+                default:
+                    abort();
+                }
+                goto fail;
+            }
+            break;
+        }
+        start = (capture[0] - str_buf) >> shift;
+        end = (capture[1] - str_buf) >> shift;
+        if (string_buffer_concat(b, str, next_src_pos, start))
+            goto fail;
+        if (rp->len != 0) {
+            if (js_string_GetSubstitution(ctx, b, JS_UNDEFINED, str, start,
+                                          JS_UNDEFINED, JS_UNDEFINED, rep_val,
+                                          capture, capture_count))
+                goto fail;
+        }
+        next_src_pos = end;
+        if (!(re_flags & LRE_FLAG_GLOBAL)) {
+            if (re_flags & LRE_FLAG_STICKY) {
+                if (js_regexp_set_lastIndex(ctx, this_val, end) < 0)
+                    goto fail;
+            }
+            break;
+        }
+        /* an empty match advances of one character */
+        if (end == start)
+            end = string_advance_index(str, end, full_unicode);
+        last_index = end;
+    }
+    js_free(ctx, capture);
+    if (b->len == 0 && next_src_pos == 0) {
+        /* no match */
+        string_buffer_free(b);
+        return js_dup(str_val);
+    }
+    if (string_buffer_concat(b, str, next_src_pos, str->len))
+        goto fail1;
+    return string_buffer_end(b);
+fail:
+    js_free(ctx, capture);
+fail1:
+    string_buffer_free(b);
+    return JS_EXCEPTION;
 }
 
 static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
@@ -55122,7 +55190,7 @@ static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
     JSValueConst rx = this_val, rep = argv[1];
     JSValueConst args[2];
     JSValue flags, str, rep_val, matched, tab, rep_str, namedCaptures, res;
-    JSString *p, *sp, *rp;
+    JSString *p, *sp;
     StringBuffer b_s, *b = &b_s;
     ValueBuffer v_b, *results = &v_b;
     int nextSourcePosition, n, j, functionalReplace, is_global, fullUnicode;
@@ -55147,13 +55215,18 @@ static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
         goto exception;
 
     sp = JS_VALUE_GET_STRING(str);
-    rp = NULL;
     functionalReplace = JS_IsFunction(ctx, rep);
     if (!functionalReplace) {
         rep_val = JS_ToString(ctx, rep);
         if (JS_IsException(rep_val))
             goto exception;
-        rp = JS_VALUE_GET_STRING(rep_val);
+    }
+
+    if (!functionalReplace && js_is_standard_regexp(ctx, rx)) {
+        /* the same without the result objects of exec() */
+        res = js_regexp_replace(ctx, rx, str, rep_val);
+        if (!JS_IsUndefined(res))
+            goto done;
     }
 
     flags = JS_GetProperty(ctx, rx, JS_ATOM_flags);
@@ -55172,12 +55245,6 @@ static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
                        string_indexof_char(p, 'v', 0) >= 0);
         if (JS_SetProperty(ctx, rx, JS_ATOM_lastIndex, js_int32(0)) < 0)
             goto exception;
-    }
-
-    if (rp && rp->len == 0 && is_global && js_is_standard_regexp(ctx, rx)) {
-        /* use faster version for simple cases */
-        res = JS_RegExpDelete(ctx, rx, str);
-        goto done;
     }
     for(;;) {
         JSValue result;
