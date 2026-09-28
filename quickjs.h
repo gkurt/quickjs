@@ -531,6 +531,12 @@ JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
 /* should be called when changing thread to update the stack top value
    used to check stack overflow. */
 JS_EXTERN void JS_UpdateStackTop(JSRuntime *rt);
+/* when enabled, JS_Eval() and the other JS_Eval*() functions parse a
+   source whose file name ends in .ts, .mts or .cts as TypeScript, as if
+   JS_EVAL_FLAG_TYPESCRIPT were given: for bindings which do not pass the
+   eval flags through, such as rquickjs, where the file name is the module
+   name of Module::declare(). Disabled by default. */
+JS_EXTERN void JS_SetTypeScriptByFilename(JSRuntime *rt, bool enable);
 JS_EXTERN JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
 JS_EXTERN void JS_FreeRuntime(JSRuntime *rt);
 JS_EXTERN void *JS_GetRuntimeOpaque(JSRuntime *rt);

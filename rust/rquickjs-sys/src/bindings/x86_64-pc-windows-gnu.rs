@@ -271,6 +271,9 @@ unsafe extern "C" {
     pub fn JS_UpdateStackTop(rt: *mut JSRuntime);
 }
 unsafe extern "C" {
+    pub fn JS_SetTypeScriptByFilename(rt: *mut JSRuntime, enable: bool);
+}
+unsafe extern "C" {
     pub fn JS_NewRuntime2(
         mf: *const JSMallocFunctions,
         opaque: *mut ::core::ffi::c_void,

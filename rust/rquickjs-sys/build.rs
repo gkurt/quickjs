@@ -244,6 +244,28 @@ fn main() {
     println!("cargo:rerun-if-changed=quickjs.bind.h");
     fs::copy("quickjs.bind.h", out_dir.join("quickjs.bind.h")).expect("Unable to copy source");
 
+    // which engine this is, to compare with the npm package (build.engine in
+    // its package.json, versions of a VM)
+    let commit = match engine_commit(src_dir) {
+        Some(commit) => format!("Some({commit:?})"),
+        None => "None".into(),
+    };
+    fs::write(
+        out_dir.join("engine.rs"),
+        format!(
+            "/// Hash of the engine sources this crate was built from: the same as\n\
+             /// `build.engine.sourceHash` of the @gkurt/quickjs-wasi package (and\n\
+             /// `engineSourceHash` in the versions of its VMs) when both were built\n\
+             /// from the same engine. See scripts/engine-source-hash.mjs.\n\
+             pub const ENGINE_SOURCE_HASH: &str = {:?};\n\
+             /// The gkurt/quickjs commit the engine was built from, when the\n\
+             /// sources were a git checkout.\n\
+             pub const ENGINE_COMMIT: Option<&str> = {commit};\n",
+            engine_source_hash(src_dir)
+        ),
+    )
+    .expect("Unable to write engine.rs");
+
     if target_os == "wasi" && !matches!(env::var("RQUICKJS_SYS_NO_WASI_SDK").as_deref(), Ok("1")) {
         let wasi_sdk_path = get_wasi_sdk_path();
         if !wasi_sdk_path.try_exists().unwrap() {
@@ -299,6 +321,64 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", vendor_lib.display());
         println!("cargo:rustc-link-lib=static=c");
     }
+}
+
+/// The engine files hashed into ENGINE_SOURCE_HASH, in this order. The list and
+/// the hash are those of scripts/engine-source-hash.mjs: keep them in sync.
+const ENGINE_HASH_FILES: [&str; 18] = [
+    "cutils.h",
+    "dtoa.c",
+    "dtoa.h",
+    "libregexp-opcode.h",
+    "libregexp.c",
+    "libregexp.h",
+    "libunicode-table.h",
+    "libunicode.c",
+    "libunicode.h",
+    "list.h",
+    "quickjs-atom.h",
+    "quickjs-c-atomics.h",
+    "quickjs-opcode.h",
+    "quickjs.c",
+    "quickjs.h",
+    "builtin-array-fromasync.h",
+    "builtin-iterator-zip.h",
+    "builtin-iterator-zip-keyed.h",
+];
+
+/// FNV-1a 64 of, for each file: its name, a NUL byte, its bytes without the
+/// CRs (a Windows checkout may have CRLF line ends), a NUL byte.
+fn engine_source_hash(src_dir: &Path) -> String {
+    fn feed(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for name in ENGINE_HASH_FILES {
+        // watched by the copy of the sources above
+        let path = src_dir.join(name);
+        let data = fs::read(&path).unwrap_or_else(|e| panic!("Unable to read {}: {e}", path.display()));
+        let data: Vec<u8> = data.into_iter().filter(|&b| b != b'\r').collect();
+        feed(&mut h, name.as_bytes());
+        feed(&mut h, &[0]);
+        feed(&mut h, &data);
+        feed(&mut h, &[0]);
+    }
+    format!("{h:016x}")
+}
+
+/// The commit of the engine's git checkout, if it is one and git is installed.
+fn engine_commit(src_dir: &Path) -> Option<String> {
+    let output = process::Command::new("git")
+        .arg("-C")
+        .arg(src_dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    let commit = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && commit.len() == 40).then_some(commit)
 }
 
 fn feature_to_cargo(name: impl AsRef<str>) -> String {

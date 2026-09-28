@@ -15,6 +15,8 @@ pub const SIZE_T_ERROR: &str =
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+include!(concat!(env!("OUT_DIR"), "/engine.rs"));
+
 #[cfg(not(feature = "bindgen"))]
 include!(concat!("bindings/", bindings_env!("TARGET"), ".rs"));
 

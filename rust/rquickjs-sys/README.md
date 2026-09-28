@@ -25,25 +25,62 @@ submodule of the repository.
 
 ## TypeScript
 
-TypeScript type erasure is included. rquickjs has no option for it, so
-evaluate through the raw API with `JS_EVAL_FLAG_TYPESCRIPT`:
+TypeScript type erasure is included. rquickjs has no option for it, but the
+engine can take it from the file name: after
+`JS_SetTypeScriptByFilename(rt, true)`, every source whose name ends in `.ts`,
+`.mts` or `.cts` is parsed as TypeScript, including modules declared or loaded
+through rquickjs, whose name is the module name:
 
 ```rust
-use rquickjs::qjs;
+use rquickjs::{context::EvalOptions, qjs, Context, Module, Runtime};
 
+let rt = Runtime::new()?;
+let context = Context::full(&rt)?;
+// once per runtime
+unsafe { qjs::JS_SetTypeScriptByFilename(context.get_runtime_ptr(), true) };
+context.with(|ctx| {
+    let n: i32 = ctx.eval_with_options(
+        "const n: number = 40; n + 2",
+        EvalOptions { filename: Some("input.ts".into()), ..Default::default() },
+    )?;
+    Module::declare(ctx.clone(), "plugin.ts", "export const n: number = 42;")?;
+    Ok::<_, rquickjs::Error>(())
+})?;
+```
+
+Module loaders (`Loader`s) get the same: return the source of `foo.ts` from
+`load` and it is compiled as TypeScript. Other names stay JavaScript; to parse
+one as TypeScript, evaluate it through the raw API with
+`JS_EVAL_FLAG_TYPESCRIPT`:
+
+```rust
 let src = c"const n: number = 40; n + 2";
 let v = unsafe {
-    qjs::JS_Eval(ctx.as_raw().as_ptr(), src.as_ptr(), src.count_bytes() as _, c"input.ts".as_ptr(),
+    qjs::JS_Eval(ctx.as_raw().as_ptr(), src.as_ptr(), src.count_bytes() as _, c"input".as_ptr(),
                  (qjs::JS_EVAL_TYPE_GLOBAL | qjs::JS_EVAL_FLAG_TYPESCRIPT) as i32)
 };
 ```
 
-To leave it out, enable the `disable-typescript` feature:
+To leave it out, enable the `disable-typescript` feature (TypeScript sources
+then fail with a SyntaxError):
 
 ```toml
 [dependencies]
 rquickjs-sys = { version = "0.14", features = ["disable-typescript"] }
 ```
+
+## Engine version
+
+`rquickjs_sys::ENGINE_SOURCE_HASH` is a hash of the engine sources the crate
+was built from, and `rquickjs_sys::ENGINE_COMMIT` their commit (`None` when
+the sources were not a git checkout). The npm package
+[@gkurt/quickjs-wasi](https://www.npmjs.com/package/@gkurt/quickjs-wasi)
+records the same two in `build.engine` of its `package.json` and in the
+`versions` of its VMs (`engineSourceHash`, `engineCommit`): an app shipping
+both can check that its native and its wasm plugins run the same engine by
+comparing the hashes, which only differ when the engine sources do (commits
+can differ while the engine is identical). The hash is computed by
+`scripts/engine-source-hash.mjs`, and the same way by `build.rs`.
 
 ## Differences from rquickjs-sys
 

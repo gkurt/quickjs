@@ -421,6 +421,7 @@ struct JSRuntime {
     JSSharedArrayBufferFunctions sab_funcs;
 
     bool can_block; /* true if Atomics.wait can block */
+    bool typescript_by_filename; /* see JS_SetTypeScriptByFilename() */
     uint32_t dump_flags : 24;
 
     /* Shape hash table */
@@ -2580,6 +2581,19 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 void JS_SetCanBlock(JSRuntime *rt, bool can_block)
 {
     rt->can_block = can_block;
+}
+
+void JS_SetTypeScriptByFilename(JSRuntime *rt, bool enable)
+{
+    rt->typescript_by_filename = enable;
+}
+
+static bool js_filename_is_typescript(const char *filename)
+{
+    size_t len = strlen(filename);
+    return (len >= 3 && !strcmp(filename + len - 3, ".ts")) ||
+           (len >= 4 && (!strcmp(filename + len - 4, ".mts") ||
+                         !strcmp(filename + len - 4, ".cts")));
 }
 
 void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
@@ -42922,6 +42936,9 @@ JSValue JS_EvalThis2(JSContext *ctx, JSValueConst this_obj,
         eval_flags = options->eval_flags;
     }
     JSValue ret;
+
+    if (ctx->rt->typescript_by_filename && js_filename_is_typescript(filename))
+        eval_flags |= JS_EVAL_FLAG_TYPESCRIPT;
 
     assert((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL ||
            (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE);

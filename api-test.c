@@ -2230,6 +2230,61 @@ void private_symbols(void)
     JS_FreeRuntime(rt);
 }
 
+static void typescript_by_filename(void)
+{
+    static const char ts[] = "const n: number = 40; n + 2";
+    static const char mod[] = "export const n: number = 42;";
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue ret;
+    int32_t v;
+
+    rt = new_runtime();
+    ctx = JS_NewContext(rt);
+
+    /* off by default: a .ts file name alone does not enable TypeScript */
+    ret = JS_Eval(ctx, ts, strlen(ts), "a.ts", JS_EVAL_TYPE_GLOBAL);
+    assert(JS_IsException(ret));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+
+    JS_SetTypeScriptByFilename(rt, true);
+    ret = JS_Eval(ctx, ts, strlen(ts), "a.ts", JS_EVAL_TYPE_GLOBAL);
+#ifdef QJS_DISABLE_TYPESCRIPT
+    assert(JS_IsException(ret));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+#else
+    assert(!JS_ToInt32(ctx, &v, ret) && v == 42);
+    JS_FreeValue(ctx, ret);
+    ret = JS_Eval(ctx, mod, strlen(mod), "dir/m.mts",
+                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(JS_VALUE_GET_TAG(ret) == JS_TAG_MODULE);
+    JS_FreeValue(ctx, ret);
+    ret = JS_Eval(ctx, "1 as number", 11, "c.cts", JS_EVAL_TYPE_GLOBAL);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+#endif
+    /* other names are still JavaScript */
+    ret = JS_Eval(ctx, ts, strlen(ts), "a.js", JS_EVAL_TYPE_GLOBAL);
+    assert(JS_IsException(ret));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    ret = JS_Eval(ctx, ts, strlen(ts), "ts", JS_EVAL_TYPE_GLOBAL);
+    assert(JS_IsException(ret));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    /* nor does it apply to eval() */
+    ret = JS_Eval(ctx, "eval('let x: number = 1')", 24, "b.ts",
+                  JS_EVAL_TYPE_GLOBAL);
+    assert(JS_IsException(ret));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+
+    JS_SetTypeScriptByFilename(rt, false);
+    ret = JS_Eval(ctx, ts, strlen(ts), "a.ts", JS_EVAL_TYPE_GLOBAL);
+    assert(JS_IsException(ret));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -2272,5 +2327,6 @@ int main(void)
     std_eval_interrupt_handler();
     interrupt_loops();
     private_symbols();
+    typescript_by_filename();
     return 0;
 }

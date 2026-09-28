@@ -26,7 +26,12 @@ $ qjsc -o main.c main.ts
 `import` or `export` statements, like `.js` files.
 
 From C, pass `JS_EVAL_FLAG_TYPESCRIPT` to `JS_Eval()` and use
-`JS_DetectModule2()` to autodetect modules in TypeScript source.
+`JS_DetectModule2()` to autodetect modules in TypeScript source. Bindings
+which do not pass eval flags through (rquickjs, say) can call
+`JS_SetTypeScriptByFilename(rt, true)` instead: `JS_Eval()` then parses a
+source whose file name ends in `.ts`, `.mts` or `.cts` as TypeScript, which
+covers the modules a module loader returns, since their file name is the
+module name.
 
 ## Supported syntax
 
