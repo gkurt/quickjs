@@ -335,6 +335,18 @@ typedef struct JSValue {
 #define JS_VALUE_GET_SHORT_BIG_INT(v) ((v).u.short_big_int)
 #define JS_VALUE_GET_PTR(v) ((v).u.ptr)
 
+/* JS_MKVAL() writes the 32 bit value as a whole 64 bit pointer: with
+   the upper half of the union left undefined, GCC keeps a copy of the
+   value on the C stack, two useless stores for each integer the
+   interpreter makes. The value is where 'int32' reads it. */
+#if UINTPTR_MAX > UINT32_MAX
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define JS__MKVAL_PTR(val) ((void *)((uintptr_t)(uint32_t)(val) << 32))
+#else
+#define JS__MKVAL_PTR(val) ((void *)(uintptr_t)(uint32_t)(val))
+#endif
+#endif
+
 /* msvc doesn't understand designated initializers without /std:c++20 */
 #ifdef __cplusplus
 static inline JSValue JS_MKPTR(int64_t tag, void *ptr)
@@ -347,7 +359,11 @@ static inline JSValue JS_MKPTR(int64_t tag, void *ptr)
 static inline JSValue JS_MKVAL(int64_t tag, int32_t int32)
 {
     JSValue v;
+#ifdef JS__MKVAL_PTR
+    v.u.ptr = JS__MKVAL_PTR(int32);
+#else
     v.u.int32 = int32;
+#endif
     v.tag = tag;
     return v;
 }
@@ -364,7 +380,11 @@ static inline JSValue JS_MKNAN(void)
 #define JS_NAN             JS_MKNAN() /* alas, not a constant expression */
 #else
 #define JS_MKPTR(tag, p)   (JSValue){ (JSValueUnion){ .ptr = p }, tag }
+#ifdef JS__MKVAL_PTR
+#define JS_MKVAL(tag, val) (JSValue){ (JSValueUnion){ .ptr = JS__MKVAL_PTR(val) }, tag }
+#else
 #define JS_MKVAL(tag, val) (JSValue){ (JSValueUnion){ .int32 = val }, tag }
+#endif
 #define JS_NAN             (JSValue){ (JSValueUnion){ .float64 = NAN }, JS_TAG_FLOAT64 }
 #endif
 

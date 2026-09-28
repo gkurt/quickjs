@@ -669,17 +669,19 @@ typedef struct JSMapRecord {
     bool empty; /* true if the record is deleted */
     struct JSMapState *map;
     struct list_head link;
-    struct list_head hash_link;
+    struct JSMapRecord *hash_next; /* next record of the hash chain */
     JSValue key;
     JSValue value;
 } JSMapRecord;
 
 typedef struct JSMapState {
     bool is_weak; /* true if WeakSet/WeakMap */
+    uint8_t hash_bits; /* 1 <= hash_bits <= 31 */
+    uint32_t hash_seed;
     struct list_head records; /* list of JSMapRecord.link */
     uint32_t record_count;
-    struct list_head *hash_table;
-    uint32_t hash_size; /* must be a power of two */
+    JSMapRecord **hash_table;
+    uint32_t hash_size; /* = 1 << hash_bits */
     uint32_t record_count_threshold; /* count at which a hash table
                                         resize is needed */
 } JSMapState;
@@ -3388,23 +3390,35 @@ static inline bool is_num_string(uint32_t *pval, JSString *p)
 }
 
 /* XXX: could use faster version ? */
-static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
+static inline uint32_t hash_string8_poly(const uint8_t *str, size_t len,
+                                         uint32_t h)
 {
     size_t i;
 
     for(i = 0; i < len; i++)
         h = h * 263 + str[i];
-    return h ^ hash32(len);
+    return h;
+}
+
+static inline uint32_t hash_string16_poly(const uint16_t *str,
+                                          size_t len, uint32_t h)
+{
+    size_t i;
+
+    for(i = 0; i < len; i++)
+        h = h * 263 + str[i];
+    return h;
+}
+
+static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
+{
+    return hash_string8_poly(str, len, h) ^ hash32(len);
 }
 
 static inline uint32_t hash_string16(const uint16_t *str,
                                      size_t len, uint32_t h)
 {
-    size_t i;
-
-    for(i = 0; i < len; i++)
-        h = h * 263 + str[i];
-    return h ^ hash32(len);
+    return hash_string16_poly(str, len, h) ^ hash32(len);
 }
 
 static uint32_t hash_string(JSString *str, uint32_t h)
@@ -3416,14 +3430,30 @@ static uint32_t hash_string(JSString *str, uint32_t h)
     return h;
 }
 
+static uint32_t hash_string_rope_poly(JSValueConst val, uint32_t h)
+{
+    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
+        JSString *p = JS_VALUE_GET_STRING(val);
+        if (p->is_wide_char)
+            return hash_string16_poly(str16(p), p->len, h);
+        else
+            return hash_string8_poly(str8(p), p->len, h);
+    } else {
+        JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
+        h = hash_string_rope_poly(r->left, h);
+        return hash_string_rope_poly(r->right, h);
+    }
+}
+
+/* the hash_string() of the flattened string: the length is mixed in
+   once, at the end */
 static uint32_t hash_string_rope(JSValueConst val, uint32_t h)
 {
     if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
         return hash_string(JS_VALUE_GET_STRING(val), h);
     } else {
         JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
-        h = hash_string_rope(r->left, h);
-        return hash_string_rope(r->right, h);
+        return hash_string_rope_poly(val, h) ^ hash32(r->len);
     }
 }
 
@@ -10869,6 +10899,22 @@ static force_inline bool js_typed_array_get_fast(JSObject *p, uint32_t idx,
         return true;
     default:
         return false;
+    }
+}
+
+/* The element 'idx' < p->u.array.count of the fast array 'p' if it is
+   an arguments object, JS_UNINITIALIZED otherwise. Not inlined, to keep
+   the registers of the interpreter, and returned by value: the element
+   stays in registers */
+static no_inline JSValue js_get_arguments_element(JSObject *p, uint32_t idx)
+{
+    switch(p->class_id) {
+    case JS_CLASS_ARGUMENTS:
+        return js_dup(p->u.array.u.values[idx]);
+    case JS_CLASS_MAPPED_ARGUMENTS:
+        return js_dup(*p->u.array.u.var_refs[idx]->pvalue);
+    default:
+        return JS_UNINITIALIZED;
     }
 }
 
@@ -21004,6 +21050,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* second receiver shape, always a cached own
                            writable data property */
                         set_value(ctx, &p->prop[ic->e[1].prop_idx].u.value, sp[-1]);
+                    } else if (unlikely(p->class_id == JS_CLASS_ARRAY &&
+                                        atom == JS_ATOM_length)) {
+                        /* the length of an array, never cached: always
+                           its own first property */
+                        sf->cur_pc = pc;
+                        ret = set_array_length(ctx, p, sp[-1],
+                                               JS_PROP_THROW_STRICT);
+                        JS_FreeValue(ctx, obj);
+                        sp -= 2;
+                        if (unlikely(ret < 0))
+                            goto exception;
+                        BREAK;
                     } else if (!js_ic_put(ctx, ic, p, atom, sp[-1])) {
                         goto put_field_slow_path;
                     }
@@ -21254,7 +21312,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSValue val;
 
-                /* fast path: regular/typed array element by int index */
+                /* fast path: element of an array, a typed array or an
+                   arguments object by int index. The element must stay
+                   in registers: a variable whose address escapes lives
+                   in memory, written with two 8 byte stores and read
+                   with a 16 byte load, which defeats the store
+                   forwarding of the CPU, a stall of some ten cycles on
+                   every read. The other objects go to
+                   JS_GetPropertyValue() */
                 if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT &&
                            JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
@@ -21267,20 +21332,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp--;
                         BREAK;
                     }
-                    /* the typed arrays of numbers inline: their
-                       elements need no release */
-                    if (p->fast_array && idx < p->u.array.count &&
-                        js_typed_array_get_fast(p, idx, &val)) {
-                        JS_FreeValue(ctx, sp[-2]);
-                        sp[-2] = val;
-                        sp--;
-                        BREAK;
-                    }
-                    if (js_get_fast_array_element(ctx, p, idx, &val)) {
-                        JS_FreeValue(ctx, sp[-2]);
-                        sp[-2] = val;
-                        sp--;
-                        BREAK;
+                    if (p->fast_array && idx < p->u.array.count) {
+                        /* the typed arrays of numbers inline: their
+                           elements need no release */
+                        if (js_typed_array_get_fast(p, idx, &val) ||
+                            !JS_IsUninitialized(val =
+                                js_get_arguments_element(p, idx))) {
+                            JS_FreeValue(ctx, sp[-2]);
+                            sp[-2] = val;
+                            sp--;
+                            BREAK;
+                        }
                     }
                 }
                 sf->cur_pc = pc;
@@ -21302,17 +21364,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
+                    /* see OP_get_array_el */
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
                         sp[-1] = js_dup(p->u.array.u.values[idx]);
                         BREAK;
                     }
                     if (p->fast_array && idx < p->u.array.count &&
-                        js_typed_array_get_fast(p, idx, &val)) {
-                        sp[-1] = val;
-                        BREAK;
-                    }
-                    if (js_get_fast_array_element(ctx, p, idx, &val)) {
+                        (js_typed_array_get_fast(p, idx, &val) ||
+                         !JS_IsUninitialized(val =
+                             js_get_arguments_element(p, idx)))) {
                         sp[-1] = val;
                         BREAK;
                     }
@@ -48149,10 +48210,11 @@ static JSValue js_get_this(JSContext *ctx, JSValueConst this_val)
     return js_dup(this_val);
 }
 
-static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
-                                     JSValueConst len_val)
+/* The constructor ArraySpeciesCreate() calls for 'obj', or undefined
+   for the %Array% of the current realm */
+static JSValue JS_ArraySpeciesGetCtor(JSContext *ctx, JSValueConst obj)
 {
-    JSValue ctor, ret, species;
+    JSValue ctor, species;
     int res;
     JSContext *realm;
 
@@ -48160,7 +48222,7 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
     if (res < 0)
         return JS_EXCEPTION;
     if (!res)
-        return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
+        return JS_UNDEFINED;
     ctor = JS_GetProperty(ctx, obj, JS_ATOM_constructor);
     if (JS_IsException(ctor))
         return ctor;
@@ -48186,13 +48248,35 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
         if (JS_IsNull(ctor))
             ctor = JS_UNDEFINED;
     }
-    if (JS_IsUndefined(ctor)) {
-        return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
-    } else {
-        ret = JS_CallConstructor(ctx, ctor, 1, &len_val);
+    /* 'new Array(len)' of this realm is the same as js_array_constructor() */
+    if (JS_IsObject(ctor) && js_same_value(ctx, ctor, ctx->array_ctor)) {
         JS_FreeValue(ctx, ctor);
-        return ret;
+        ctor = JS_UNDEFINED;
     }
+    return ctor;
+}
+
+/* 'ctor' comes from JS_ArraySpeciesGetCtor() */
+static JSValue JS_ArrayCreateFromCtor(JSContext *ctx, JSValueConst ctor,
+                                      JSValueConst len_val)
+{
+    if (JS_IsUndefined(ctor))
+        return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
+    else
+        return JS_CallConstructor(ctx, ctor, 1, &len_val);
+}
+
+static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
+                                     JSValueConst len_val)
+{
+    JSValue ctor, ret;
+
+    ctor = JS_ArraySpeciesGetCtor(ctx, obj);
+    if (JS_IsException(ctor))
+        return ctor;
+    ret = JS_ArrayCreateFromCtor(ctx, ctor, len_val);
+    JS_FreeValue(ctx, ctor);
+    return ret;
 }
 
 static const JSCFunctionListEntry js_array_funcs[] = {
@@ -49314,7 +49398,7 @@ exception:
 static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int splice)
 {
-    JSValue obj, arr, val, len_val;
+    JSValue obj, arr, val, len_val, ctor;
     int64_t len, start, k, final, n, count, del_count, new_len;
     int kPresent;
     JSValue *arrp;
@@ -49354,39 +49438,53 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
         }
         count = max_int64(final - start, 0);
     }
-    len_val = js_int64(count);
-    arr = JS_ArraySpeciesCreate(ctx, obj, len_val);
-    JS_FreeValue(ctx, len_val);
-    if (JS_IsException(arr))
+    ctor = JS_ArraySpeciesGetCtor(ctx, obj);
+    if (JS_IsException(ctor))
         goto exception;
 
-    k = start;
     final = start + count;
-    n = 0;
-    /* The fast array test on arr ensures that
-       JS_CreateDataPropertyUint32() won't modify obj in case arr is
-       an exotic object */
-    /* Special case fast arrays */
-    if (js_get_fast_array(ctx, obj, &arrp, &count32) &&
-        js_is_fast_array(ctx, arr)) {
-        /* XXX: should share code with fast array constructor */
-        for (; k < final && k < count32; k++, n++) {
-            if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
-                goto exception;
-        }
-    }
-    /* Copy the remaining elements if any (handle case of inherited properties) */
-    for (; k < final; k++, n++) {
-        kPresent = JS_TryGetPropertyInt64(ctx, obj, k, &val);
-        if (kPresent < 0)
+    /* the getters of 'constructor' and Symbol.species may have changed
+       obj: its elements are looked at only now */
+    if (JS_IsUndefined(ctor) && count <= INT32_MAX &&
+        js_get_fast_array(ctx, obj, &arrp, &count32) && final <= count32) {
+        /* fast case: a plain array of the elements, nothing to observe */
+        arr = js_create_array(ctx, count, count > 0 ? vc(arrp + start) : NULL);
+        if (JS_IsException(arr))
             goto exception;
-        if (kPresent) {
-            if (JS_CreateDataPropertyUint32(ctx, arr, n, val, JS_PROP_THROW) < 0)
-                goto exception;
+    } else {
+        len_val = js_int64(count);
+        arr = JS_ArrayCreateFromCtor(ctx, ctor, len_val);
+        JS_FreeValue(ctx, len_val);
+        JS_FreeValue(ctx, ctor);
+        if (JS_IsException(arr))
+            goto exception;
+
+        k = start;
+        n = 0;
+        /* The fast array test on arr ensures that
+           JS_CreateDataPropertyUint32() won't modify obj in case arr is
+           an exotic object */
+        /* Special case fast arrays */
+        if (js_get_fast_array(ctx, obj, &arrp, &count32) &&
+            js_is_fast_array(ctx, arr)) {
+            for (; k < final && k < count32; k++, n++) {
+                if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
+                    goto exception;
+            }
         }
+        /* Copy the remaining elements if any (handle case of inherited properties) */
+        for (; k < final; k++, n++) {
+            kPresent = JS_TryGetPropertyInt64(ctx, obj, k, &val);
+            if (kPresent < 0)
+                goto exception;
+            if (kPresent) {
+                if (JS_CreateDataPropertyUint32(ctx, arr, n, val, JS_PROP_THROW) < 0)
+                    goto exception;
+            }
+        }
+        if (JS_SetProperty(ctx, arr, JS_ATOM_length, js_int64(n)) < 0)
+            goto exception;
     }
-    if (JS_SetProperty(ctx, arr, JS_ATOM_length, js_int64(n)) < 0)
-        goto exception;
 
     if (splice) {
         int ret = js_array_splice_fast(ctx, obj, len, start, del_count,
@@ -58432,11 +58530,12 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
     init_list_head(&s->records);
     s->is_weak = is_weak;
     JS_SetOpaqueInternal(obj, s);
-    s->hash_size = 1;
-    s->hash_table = js_malloc(ctx, sizeof(s->hash_table[0]) * s->hash_size);
+    s->hash_seed = ctx->hash_seed;
+    s->hash_bits = 1;
+    s->hash_size = 1U << s->hash_bits;
+    s->hash_table = js_mallocz(ctx, sizeof(s->hash_table[0]) * s->hash_size);
     if (!s->hash_table)
         goto fail;
-    init_list_head(&s->hash_table[0]);
     s->record_count_threshold = 4;
 
     arr = JS_UNDEFINED;
@@ -58537,26 +58636,23 @@ static JSValueConst map_normalize_key_const(JSContext *ctx, JSValueConst key)
     return safe_const(map_normalize_key(ctx, unsafe_unconst(key)));
 }
 
-/* Mix the bits of a raw hash so that every input bit affects the low
-   bits, which are the ones map_find_record() keeps after masking. Numbers
-   and pointers need this: a small integer converted to a double has zero in
-   the low bits of its high word and object pointers are 16-byte aligned, so
-   without mixing sequential integer keys or object keys all land in a
-   handful of buckets. (Low-bias 32-bit mixer by Chris Wellons.) */
-static inline uint32_t map_hash_mix(uint32_t h)
-{
-    h ^= h >> 16;
-    h *= 0x7feb352d;
-    h ^= h >> 15;
-    h *= 0x846ca68b;
-    h ^= h >> 16;
-    return h;
-}
+/* The bucket of 'key' in a table of 2^hash_bits entries.
 
-static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
+   The numbers and the pointers are hashed with the top bits of their
+   product by 2^64 / golden ratio (Knuth vol 3, section 6.4, as in the
+   Linux kernel and Bellard's a151ce1), which depend on every bit of
+   the key: a small integer converted to a double has only zero low
+   bits and object pointers are 16-byte aligned. One multiplication,
+   where a mixer of the low bits takes several.
+
+   The hashes of the strings and the bigints already mix their bits and
+   are only masked: the polynomial hash of strings such as "0" to "999"
+   spreads them more evenly over the low bits than a multiplicative
+   hash would, whose collisions are those of random keys. */
+static uint32_t map_hash_key(JSMapState *s, JSValueConst key, int hash_bits)
 {
     uint32_t tag = JS_VALUE_GET_NORM_TAG(key);
-    uint32_t h;
+    uint64_t h;
     double d;
     JSFloat64Union u;
     JSBigInt *r;
@@ -58564,16 +58660,22 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
     switch(tag) {
     case JS_TAG_BOOL:
         h = JS_VALUE_GET_INT(key);
-        break;
+        goto masked;
     case JS_TAG_STRING:
         h = hash_string(JS_VALUE_GET_STRING(key), 0);
-        break;
+        goto masked;
     case JS_TAG_STRING_ROPE:
         h = hash_string_rope(key, 0);
-        break;
+        /* the same bucket as the flat string */
+        tag = JS_TAG_STRING;
+        goto masked;
+    case JS_TAG_BIG_INT:
+        r = JS_VALUE_GET_PTR(key);
+        h = hash_string8((void *)r->tab, r->len * sizeof(*r->tab), 0);
+        goto masked;
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:
-        h = map_hash_mix((uintptr_t)JS_VALUE_GET_PTR(key));
+        h = (uintptr_t)JS_VALUE_GET_PTR(key);
         break;
     case JS_TAG_INT:
         d = JS_VALUE_GET_INT(key);
@@ -58581,10 +58683,6 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
     case JS_TAG_SHORT_BIG_INT:
         d = JS_VALUE_GET_SHORT_BIG_INT(key);
         goto hash_float64;
-    case JS_TAG_BIG_INT:
-        r = JS_VALUE_GET_PTR(key);
-        h = hash_string8((void *)r->tab, r->len * sizeof(*r->tab), 0);
-        break;
     case JS_TAG_FLOAT64:
         d = JS_VALUE_GET_FLOAT64(key);
         /* normalize the NaN */
@@ -58592,25 +58690,29 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
             d = NAN;
     hash_float64:
         u.d = d;
-        h = map_hash_mix(u.u32[0] ^ map_hash_mix(u.u32[1]));
+        h = u.u64;
         tag = JS_TAG_FLOAT64;
         break;
     default:
         h = 0;
-        break;
+        goto masked;
     }
-    return h ^ ctx->hash_seed ^ hash32(tag);
+    /* the tag in the upper half: the pointers and the doubles have
+       their low bits in the lower one */
+    h ^= ((uint64_t)tag << 32) ^ s->hash_seed;
+    return (h * UINT64_C(0x61C8864680B583EB)) >> (64 - hash_bits);
+ masked:
+    return ((uint32_t)h ^ s->hash_seed ^ hash32(tag)) &
+        ((1U << hash_bits) - 1);
 }
 
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
                                     JSValueConst key)
 {
-    struct list_head *el;
     JSMapRecord *mr;
     uint32_t h;
-    h = map_hash_key(ctx, key) & (s->hash_size - 1);
-    list_for_each(el, &s->hash_table[h]) {
-        mr = list_entry(el, JSMapRecord, hash_link);
+    h = map_hash_key(s, key, s->hash_bits);
+    for(mr = s->hash_table[h]; mr != NULL; mr = mr->hash_next) {
         if (js_same_value_zero(ctx, mr->key, key))
             return mr;
     }
@@ -58619,33 +58721,46 @@ static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
 
 static void map_hash_resize(JSContext *ctx, JSMapState *s)
 {
-    uint32_t new_hash_size, i, h;
-    struct list_head *new_hash_table, *el;
-    JSMapRecord *mr;
+    uint32_t new_hash_size, h;
+    int new_hash_bits;
+    struct list_head *el;
+    JSMapRecord *mr, **new_hash_table;
 
     /* XXX: no reporting of memory allocation failure */
-    if (s->hash_size == 1)
-        new_hash_size = 4;
-    else
-        new_hash_size = s->hash_size * 2;
+    new_hash_bits = min_int(s->hash_bits + 1, 31);
+    new_hash_size = 1U << new_hash_bits;
     new_hash_table = js_realloc(ctx, s->hash_table,
                                 sizeof(new_hash_table[0]) * new_hash_size);
     if (!new_hash_table)
         return;
 
-    for(i = 0; i < new_hash_size; i++)
-        init_list_head(&new_hash_table[i]);
+    memset(new_hash_table, 0, sizeof(new_hash_table[0]) * new_hash_size);
 
     list_for_each(el, &s->records) {
         mr = list_entry(el, JSMapRecord, link);
         if (!mr->empty) {
-            h = map_hash_key(ctx, mr->key) & (new_hash_size - 1);
-            list_add_tail(&mr->hash_link, &new_hash_table[h]);
+            h = map_hash_key(s, mr->key, new_hash_bits);
+            mr->hash_next = new_hash_table[h];
+            new_hash_table[h] = mr;
         }
     }
     s->hash_table = new_hash_table;
+    s->hash_bits = new_hash_bits;
     s->hash_size = new_hash_size;
     s->record_count_threshold = new_hash_size * 2;
+}
+
+/* Remove the record 'mr', which is not empty, from its hash chain */
+static void map_hash_unlink(JSMapState *s, JSMapRecord *mr)
+{
+    JSMapRecord **pmr;
+
+    pmr = &s->hash_table[map_hash_key(s, mr->key, s->hash_bits)];
+    while (*pmr != mr) {
+        assert(*pmr != NULL);
+        pmr = &(*pmr)->hash_next;
+    }
+    *pmr = mr->hash_next;
 }
 
 static JSWeakRefRecord **get_first_weak_ref(JSValueConst key)
@@ -58694,8 +58809,9 @@ static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
     } else {
         mr->key = js_dup(key);
     }
-    h = map_hash_key(ctx, key) & (s->hash_size - 1);
-    list_add_tail(&mr->hash_link, &s->hash_table[h]);
+    h = map_hash_key(s, key, s->hash_bits);
+    mr->hash_next = s->hash_table[h];
+    s->hash_table[h] = mr;
     list_add_tail(&mr->link, &s->records);
     s->record_count++;
     if (s->record_count >= s->record_count_threshold) {
@@ -58724,11 +58840,10 @@ static void delete_map_weak_ref(JSRuntime *rt, JSMapRecord *mr)
     js_free_rt(rt, wr);
 }
 
-static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
+/* the record, not empty, must have been removed from its hash chain */
+static void map_delete_record_unlinked(JSRuntime *rt, JSMapState *s,
+                                       JSMapRecord *mr)
 {
-    if (mr->empty)
-        return;
-    list_del(&mr->hash_link);
     if (s->is_weak) {
         delete_map_weak_ref(rt, mr);
     } else {
@@ -58745,6 +58860,14 @@ static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
         mr->value = JS_UNDEFINED;
     }
     s->record_count--;
+}
+
+static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
+{
+    if (mr->empty)
+        return;
+    map_hash_unlink(s, mr);
+    map_delete_record_unlinked(rt, s, mr);
 }
 
 static void map_decref_record(JSRuntime *rt, JSMapRecord *mr)
@@ -58861,16 +58984,24 @@ static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int magic)
 {
     JSMapState *s = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP + magic);
-    JSMapRecord *mr;
+    JSMapRecord *mr, **pmr;
     JSValueConst key;
 
     if (!s)
         return JS_EXCEPTION;
     key = map_normalize_key_const(ctx, argv[0]);
-    mr = map_find_record(ctx, s, key);
-    if (!mr)
-        return JS_FALSE;
-    map_delete_record(ctx->rt, s, mr);
+    /* find the record and its link in one walk of the chain */
+    pmr = &s->hash_table[map_hash_key(s, key, s->hash_bits)];
+    for(;;) {
+        mr = *pmr;
+        if (!mr)
+            return JS_FALSE;
+        if (js_same_value_zero(ctx, mr->key, key))
+            break;
+        pmr = &mr->hash_next;
+    }
+    *pmr = mr->hash_next;
+    map_delete_record_unlinked(ctx->rt, s, mr);
     return JS_TRUE;
 }
 
@@ -58883,9 +59014,11 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    memset(s->hash_table, 0, sizeof(s->hash_table[0]) * s->hash_size);
     list_for_each_safe(el, el1, &s->records) {
         mr = list_entry(el, JSMapRecord, link);
-        map_delete_record(ctx->rt, s, mr);
+        if (!mr->empty)
+            map_delete_record_unlinked(ctx->rt, s, mr);
     }
     return JS_UNDEFINED;
 }
@@ -68588,7 +68721,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
             s = mr->map;
             assert(s->is_weak);
             assert(!mr->empty); /* no iterator on WeakMap/WeakSet */
-            list_del(&mr->hash_link);
+            map_hash_unlink(s, mr);
             list_del(&mr->link);
             s->record_count--;
             break;
