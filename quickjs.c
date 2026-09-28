@@ -28465,6 +28465,10 @@ static __exception int js_parse_object_literal(JSParseState *s)
             }
             emit_u8(s, op_flags | OP_DEFINE_METHOD_ENUMERABLE);
         } else {
+            if (name == JS_ATOM_NULL) {
+                /* the key is converted before the value is evaluated */
+                emit_op(s, OP_to_propkey);
+            }
             if (js_parse_expect(s, ':'))
                 goto fail;
             if (js_parse_assign_expr(s))
