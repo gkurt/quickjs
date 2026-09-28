@@ -48,3 +48,46 @@ function makeAsyncIter(log) {
     order.push("after");
     assert(order.join(","), "return,resolved,after");
 }
+
+/* an error of next(), of the promise it returns or of its result is not
+   an abrupt completion of the loop body: return() is not called */
+{
+    const nexts = [
+        () => { throw new Error("next"); },
+        () => Promise.reject(new Error("rejected")),
+        () => Promise.resolve(1),
+        () => Promise.resolve({ get done() { throw new Error("done"); } }),
+        () => Promise.resolve({ done: false, get value() { throw new Error("value"); } }),
+    ];
+    for (const next of nexts) {
+        const log = { returned: 0 };
+        const it = { [Symbol.asyncIterator]() {
+            return { next, return() { log.returned++; return {}; } };
+        } };
+        let caught = false;
+        try {
+            for await (const x of it) {}
+        } catch (e) {
+            caught = true;
+        }
+        assert(caught, true);
+        assert(log.returned, 0);
+    }
+}
+
+/* the values of a sync iterator: a rejected promise closes the iterator */
+{
+    const log = { returned: 0 };
+    const it = { [Symbol.iterator]() { return {
+        next() { return { value: Promise.reject(new Error("value")), done: false }; },
+        return() { log.returned++; return {}; },
+    }; } };
+    let caught = false;
+    try {
+        for await (const x of it) {}
+    } catch (e) {
+        caught = e.message == "value";
+    }
+    assert(caught, true);
+    assert(log.returned, 1);
+}

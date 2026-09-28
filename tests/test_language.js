@@ -446,6 +446,84 @@ function test_destructuring()
     assert(x, void 0);
 }
 
+/* a var binding of a destructuring is resolved before its value is
+   read (with a 'with' scope, the HasBinding() comes first) */
+function test_destructuring_binding_order()
+{
+    var log = [];
+    var env = new Proxy({}, {
+        has(t, k) {
+            if (typeof k == "string")
+                log.push("has " + k);
+            return false;
+        }
+    });
+    var src = { get a() { log.push("get a"); return 1; }, b: 2 };
+    var it = {
+        [Symbol.iterator]() {
+            return {
+                next() { log.push("next"); return { value: 3, done: false }; },
+                return() { return {}; }
+            };
+        }
+    };
+    var x, a, r;
+    with (env) { var [x] = it; }
+    assert(log.join(), "has it,has x,next");
+    assert(x, 3);
+    log = [];
+    with (env) { var { a } = src; }
+    assert(log.join(), "has src,has a,get a");
+    assert(a, 1);
+    log = [];
+    with (env) { var { ...r } = src; }
+    assert(log.join(), "has src,has r,get a");
+    assert(r.b, 2);
+}
+
+/* the bindings of a 'with' object: SetMutableBinding() and
+   GetBindingValue() call HasProperty(), and a binding which disappears
+   is a ReferenceError in strict mode */
+function test_with_binding_has()
+{
+    function env(log) {
+        var n = 0;
+        return new Proxy({ p: 0 }, {
+            has(t, k) {
+                if (k != "p")
+                    return false;
+                log.push("has");
+                return n++ == 0;
+            },
+            set(t, k, v) { log.push("set"); t[k] = v; return true; },
+        });
+    }
+    var log = [], e;
+    with (env(log)) {
+        (function () {
+            "use strict";
+            try { p = 1; } catch (x) { e = x; }
+        })();
+    }
+    assert(log.join(), "has,has");
+    assert(e instanceof ReferenceError);
+    log = []; e = undefined;
+    with (env(log)) {
+        (function () {
+            "use strict";
+            try { for (p in { a: 1 }); } catch (x) { e = x; }
+        })();
+    }
+    assert(log.join(), "has,has");
+    assert(e instanceof ReferenceError);
+    log = [];
+    with (env(log)) { for (p in { a: 1 }); }
+    assert(log.join(), "has,has,set");
+    log = [];
+    with (env(log)) { p += 1; }
+    assert(log.join(), "has,has,has,set");
+}
+
 function test_spread()
 {
     var x;
@@ -533,6 +611,20 @@ function test_argument_scope()
         assert(probe(), 1)
     }
     f();
+
+    /* an argument scope without variables */
+    f = ({} = eval("c")) => c;
+    assert(f(), "global");
+    f = ([] = eval(...["c"])) => c;
+    assert(f(), "global");
+}
+
+function test_unicode_identifiers()
+{
+    /* the UTF-8 encoding of "\u00f5" is the Latin-1 string "\u00c3\u00b5" */
+    assert(eval("var \u00c3\u00b5 = 3; typeof \u00f5"), "undefined");
+    assert(eval("({ '\u00c3\u00a9': 1 }).\u00e9"), undefined);
+    assert(eval("var \u00e9t\u00e9 = 4; \u00e9t\u00e9"), 4);
 }
 
 function test_function_expr_name()
@@ -686,6 +778,33 @@ function test_syntax()
     assert_throws(SyntaxError, "if abc\\u0064");
     assert_throws(SyntaxError, "if \u0123");
     assert_throws(SyntaxError, "if \\u0123");
+
+    /* a destructuring assignment is not the operand of an operator */
+    assert_throws(SyntaxError, "var a; 1 + [a] = [2]");
+    assert_throws(SyntaxError, "var a; !{a} = {a: 1}");
+    assert_throws(SyntaxError, "var a; typeof [a] = [1]");
+    assert_throws(SyntaxError, "class C { #f; m() { #f in {} = 0 } }");
+    assert(eval("var a, b; b = [a] = [3]; a"), 3);
+    assert(eval("var a; 1 ? [a] = [4] : 0; a"), 4);
+
+    /* a setter has exactly one parameter, which is not a rest one */
+    assert_throws(SyntaxError, "({ set x(...a) {} })");
+    assert_throws(SyntaxError, "class C { set x(...a) {} }");
+    assert_throws(SyntaxError, "class C { static set x(...[a]) {} }");
+
+    /* only an arrow function has an expression body */
+    assert_throws(SyntaxError, "function f() => 1");
+    assert_throws(SyntaxError, "(function () => 1)");
+    assert_throws(SyntaxError, "async function f() => 1");
+    assert_throws(SyntaxError, "({ m() => 1 })");
+    assert_throws(SyntaxError, "({ get x() => 1 })");
+    assert(eval("(async () => 1) instanceof Function"), true);
+
+    /* a computed property name is an AssignmentExpression */
+    assert_throws(SyntaxError, "({[1, 2]: 3})");
+    assert_throws(SyntaxError, "class C { [1, 2]() {} }");
+    assert_throws(SyntaxError, "var {[1, 2]: a} = {}");
+    assert(eval("({[(1, 2)]: 3})[2]"), 3);
 }
 
 /* optional chaining tests not present in test262 */
@@ -711,6 +830,12 @@ function test_optional_chaining()
     assert((a?.b)().c, 42);
 
     assert((a?.["b"])().c, 42);
+
+    /* the callee of new cannot be an optional chain */
+    assert_throws(SyntaxError, "var a = { b: function() {} }; new a?.b()");
+    assert_throws(SyntaxError, "var a = { b: function() {} }; new a?.['b']()");
+    assert(eval("var a = { b: function() { this.c = 1 } }; new (a?.b)().c"), 1);
+    assert(eval("function F() { this.c = 2 } new F()?.c"), 2);
 }
 
 function test_parse_semicolon()
@@ -1098,9 +1223,12 @@ test_object_literal();
 test_regexp_skip();
 test_labels();
 test_destructuring();
+test_destructuring_binding_order();
+test_with_binding_has();
 test_spread();
 test_function_length();
 test_argument_scope();
+test_unicode_identifiers();
 test_function_expr_name();
 test_reserved_names();
 test_number_literals();

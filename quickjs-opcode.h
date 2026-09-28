@@ -148,6 +148,7 @@ DEF( put_private_field, 1, 3, 0, none) /* obj value prop -> */
 DEF(define_private_field, 1, 3, 1, none) /* obj prop value -> obj */
 DEF(   get_array_el, 1, 2, 1, none)
 DEF(  get_array_el2, 1, 2, 2, none) /* obj prop -> obj value */
+DEF(  get_array_el3, 1, 2, 3, none) /* obj prop -> obj prop1 value */
 DEF(   put_array_el, 1, 3, 0, none)
 DEF(get_super_value, 1, 3, 1, none) /* this obj prop -> value */
 DEF(put_super_value, 1, 4, 0, none) /* this obj prop value -> */
@@ -193,7 +194,6 @@ DEF(   check_object, 1, 1, 1, none)
 DEF(      to_object, 1, 1, 1, none)
 //DEF(      to_string, 1, 1, 1, none)
 DEF(     to_propkey, 1, 1, 1, none)
-DEF(    to_propkey2, 1, 2, 2, none)
 
 DEF(   with_get_var, 10, 1, 0, atom_label_u8)     /* must be in the same order as scope_xxx */
 DEF(   with_put_var, 10, 2, 1, atom_label_u8)     /* must be in the same order as scope_xxx */
@@ -212,7 +212,8 @@ DEF(   for_of_start, 1, 1, 3, none)
 DEF(for_await_of_start, 1, 1, 3, none)
 DEF(    for_in_next, 1, 1, 3, none)
 DEF(    for_of_next, 2, 3, 5, u8)
-DEF(iterator_get_value_done, 1, 1, 2, none)
+DEF(for_await_of_next, 1, 3, 4, none) /* iter next catch_offset -> iter next catch_offset obj */
+DEF(iterator_get_value_done, 1, 2, 3, none) /* catch_offset obj -> catch_offset value done */
 DEF( iterator_close, 1, 3, 0, none)
 DEF(  iterator_next, 1, 4, 4, none)
 DEF(  iterator_call, 2, 4, 5, u8)
@@ -374,7 +375,6 @@ DEF(   is_undefined, 1, 1, 1, none)
 DEF(        is_null, 1, 1, 1, none)
 DEF(typeof_is_undefined, 1, 1, 1, none)
 DEF( typeof_is_function, 1, 1, 1, none)
-DEF(to_propkey_cond, 1, 2, 2, none) /* to_propkey unless the object is null or undefined */
 DEF(       to_int32, 1, 1, 1, none) /* x | 0 */
 
 #undef DEF

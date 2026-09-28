@@ -347,6 +347,29 @@ function test_try_catch8()
     assert(s === "xafyaf");
 }
 
+function cyclic_labels()
+{
+    /* compiling this used to produce invalid bytecode */
+    for (;;) {
+        l: break l;
+        l: break l;
+        l: break l;
+    }
+}
+
+function test_cyclic_labels()
+{
+    var n = 0;
+    for (;;) {
+        l: break l;
+        l: break l;
+        l: break l;
+        if (++n == 3)
+            break;
+    }
+    assert(n, 3);
+}
+
 test_while();
 test_while_break();
 test_do_while();
@@ -365,3 +388,4 @@ test_try_catch5();
 test_try_catch6();
 test_try_catch7();
 test_try_catch8();
+test_cyclic_labels();

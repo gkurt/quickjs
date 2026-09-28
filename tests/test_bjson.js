@@ -270,6 +270,54 @@ function bjson_test_csum()
     }
 }
 
+/* a function whose sizes add up to more than 2 GB must be rejected: the
+   size of its allocation used to wrap around */
+function bjson_test_function_size()
+{
+    var o = std.evalScript(";(function f(){})", {compile_only: true});
+    var tab = new Uint8Array(bjson.write(o, bjson.WRITE_OBJ_BYTECODE));
+    var pos = 5, n, i, e;
+
+    function leb128() {
+        var v = 0, shift = 0, c;
+        do {
+            c = tab[pos++];
+            v += (c & 0x7f) * 2 ** shift;
+            shift += 7;
+        } while (c & 0x80);
+        return v;
+    }
+    n = leb128(); /* atoms */
+    for (i = 0; i < n; i++) {
+        var type = tab[pos++];
+        if (type & 0x80) {
+            if (type & 0x40)
+                leb128();
+        } else {
+            var len = leb128();
+            pos += (len >> 1) << (len & 1);
+        }
+    }
+    assert(tab[pos++], 12); /* BC_TAG_FUNCTION_BYTECODE */
+    pos += 3; /* flags, strict mode */
+    leb128(); /* name */
+    for (i = 0; i < 6; i++)
+        leb128(); /* arg_count ... closure_var_count */
+    var start = pos;
+    assert(leb128(), 1); /* cpool_count */
+    /* cpool_count = 0x10000000 */
+    tab = Uint8Array.from([...tab.subarray(0, start),
+                           0x80, 0x80, 0x80, 0x80, 0x01,
+                           ...tab.subarray(pos)]);
+    tab.fill(0xff, 1, 5); /* no checksum */
+    try {
+        bjson.read(tab.buffer, 0, tab.length, bjson.READ_OBJ_BYTECODE);
+    } catch (_e) {
+        e = _e;
+    }
+    assert(e instanceof InternalError);
+}
+
 function bjson_test_atom()
 {
     var o = {return:1, with:2, Map:3}; // Map tests LEB128 encoding
@@ -315,6 +363,7 @@ function bjson_test_all()
     bjson_test_bytecode();
     bjson_test_fuzz();
     bjson_test_csum();
+    bjson_test_function_size();
     bjson_test_atom();
 }
 
