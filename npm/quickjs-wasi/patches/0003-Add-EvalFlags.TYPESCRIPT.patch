@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 11:48:20 +0000
+Subject: [PATCH 3/8] Add EvalFlags.TYPESCRIPT
+
+The engine erases TypeScript syntax when evaluating with
+JS_EVAL_FLAG_TYPESCRIPT (1 << 8), but EvalFlags had no name for it, so
+callers hard-coded the number. The flag works with evalCode() and
+compile(), for scripts and modules; a build without TypeScript rejects
+it with a SyntaxError, which the tests accept.
+---
+ src/index.ts            |  8 +++++
+ test/typescript.test.ts | 69 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 77 insertions(+)
+ create mode 100644 test/typescript.test.ts
+
+diff --git a/src/index.ts b/src/index.ts
+index 0740e52..e99486c 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -103,6 +103,14 @@ export const EvalFlags = {
+    * Use together with `executePendingJobs()` and `resolvePromise()`.
+    */
+   ASYNC: (1 << 7) as 128,
++  /**
++   * Accept TypeScript syntax and erase it (types are not checked). Only
++   * erasable syntax is supported: enums, namespaces, parameter properties
++   * and `import x = require()` are rejected with a SyntaxError, as with
++   * Node's `--experimental-strip-types`. A build without TypeScript
++   * rejects the flag with a SyntaxError.
++   */
++  TYPESCRIPT: (1 << 8) as 256,
+ } as const;
+ 
+ /**
+diff --git a/test/typescript.test.ts b/test/typescript.test.ts
+new file mode 100644
+index 0000000..da51cf7
+--- /dev/null
++++ b/test/typescript.test.ts
+@@ -0,0 +1,69 @@
++import { describe, it, expect } from 'vitest';
++import { QuickJS, EvalFlags } from '../src/index.ts';
++import { wasmBytes } from './helpers.ts';
++
++const wasm = new WebAssembly.Module(wasmBytes);
++
++// The package can be built without TypeScript support (the engine's
++// QJS_DISABLE_TYPESCRIPT), which rejects the flag with a SyntaxError.
++const typescriptSupported = (() => {
++  const vm = QuickJS.createSync({ wasm });
++  try {
++    vm.evalCode('let x: number = 1', 'probe.ts', EvalFlags.TYPESCRIPT).dispose();
++    return true;
++  } catch (err) {
++    if (!/TypeScript is not supported/.test((err as Error).message)) throw err;
++    return false;
++  } finally {
++    vm.dispose();
++  }
++})();
++
++describe('EvalFlags.TYPESCRIPT', () => {
++  it('is the engine flag', () => {
++    expect(EvalFlags.TYPESCRIPT).toBe(1 << 8);
++  });
++
++  it('erases types in scripts and modules', async () => {
++    using vm = await QuickJS.create({ wasm });
++    const script = 'interface P { x: number } const p: P = { x: 40 }; (p.x as number) + 2';
++    if (!typescriptSupported) {
++      expect(() => vm.evalCode(script, 'x.ts', EvalFlags.TYPESCRIPT)).toThrow(/TypeScript is not supported/);
++      return;
++    }
++    expect(vm.evalCode(script, 'x.ts', EvalFlags.TYPESCRIPT).consume((h) => h.toNumber())).toBe(42);
++    const p = vm.evalCode(
++      'export function add<T extends number>(a: T, b: T): number { return a + b }',
++      'm.ts',
++      EvalFlags.TYPE_MODULE | EvalFlags.TYPESCRIPT,
++    );
++    vm.executePendingJobs();
++    const settled = await vm.resolvePromise(p);
++    p.dispose();
++    expect('value' in settled).toBe(true);
++    if ('value' in settled) {
++      using ns = settled.value;
++      using add = ns.getProp('add');
++      using r = vm.callFunction(add, vm.undefined, vm.newNumber(1), vm.newNumber(2));
++      expect(r.toNumber()).toBe(3);
++    }
++  });
++
++  it('is off without the flag, whatever the file name', async () => {
++    using vm = await QuickJS.create({ wasm });
++    let error: unknown;
++    try {
++      vm.evalCode('const n: number = 1', 'x.ts').dispose();
++    } catch (err) {
++      error = err;
++    }
++    expect((error as Error).name).toBe('SyntaxError');
++  });
++
++  it('compiles TypeScript to bytecode', async () => {
++    if (!typescriptSupported) return;
++    using vm = await QuickJS.create({ wasm });
++    const bytecode = vm.compile('const s: string = "ok"; s', 'c.ts', EvalFlags.TYPESCRIPT);
++    expect(vm.evalBytecode(bytecode).consume((h) => h.toString())).toBe('ok');
++  });
++});

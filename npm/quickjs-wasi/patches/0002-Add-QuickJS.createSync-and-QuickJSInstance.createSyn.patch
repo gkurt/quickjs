@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 11:47:35 +0000
+Subject: [PATCH 2/8] Add QuickJS.createSync() and QuickJSInstance.createSync()
+
+create() awaits nothing but WebAssembly.instantiate(), yet a host that
+must open a VM inside synchronous code (a paint, a synchronous plugin
+API) cannot use it.
+
+createSync() takes the options of create() and instantiates with
+new WebAssembly.Instance(). The WASM module, and the modules of the
+extensions, should be compiled WebAssembly.Modules; bytes are accepted
+and compiled with new WebAssembly.Module(), which browsers refuse on
+the main thread for large modules, as the documentation says.
+
+The WASI shim and the memory proxy handed to WASI overrides get the
+instance's memory as soon as it is instantiated, before _initialize and
+the first VM call into WASI (the runtime reads the clock while it is
+created); before that, and after dispose, they throw a clear error
+instead of dereferencing null. The memory proxy binds the memory's
+methods (grow()) to the memory.
+
+The extension loader is split in two: linkExtension() allocates the
+extension's memory and table space and builds its imports, and the
+caller instantiates it, asynchronously (loadExtension) or not
+(loadExtensionSync).
+---
+ src/extensions.ts        | 111 ++++++++++++++++++++++++++-------------
+ src/index.ts             |  76 ++++++++++++++++++++++++---
+ test/create-sync.test.ts |  89 +++++++++++++++++++++++++++++++
+ 3 files changed, 233 insertions(+), 43 deletions(-)
+ create mode 100644 test/create-sync.test.ts
+
+diff --git a/src/extensions.ts b/src/extensions.ts
+index c1b947a..c102f30 100644
+--- a/src/extensions.ts
++++ b/src/extensions.ts
+@@ -204,13 +204,47 @@ export async function loadExtension(
+   allocBase?: { memoryBase: number; tableBase: number }
+ ): Promise<LoadedExtension> {
+   // Compile the extension module
+-  let module: WebAssembly.Module;
+-  if (descriptor.wasm instanceof WebAssembly.Module) {
+-    module = descriptor.wasm;
+-  } else {
+-    module = await WebAssembly.compile(descriptor.wasm);
+-  }
++  const module = descriptor.wasm instanceof WebAssembly.Module
++    ? descriptor.wasm
++    : await WebAssembly.compile(descriptor.wasm);
++  const link = linkExtension(descriptor, module, mainExports, wasiBuiltins, wasiUserOverrides, memoryProxy, allocBase);
++  return link.finish(await WebAssembly.instantiate(module, link.imports));
++}
++
++/**
++ * Synchronous {@link loadExtension}: compiles bytes with
++ * `new WebAssembly.Module()` (which browsers refuse on the main thread
++ * for large modules; pass a compiled `WebAssembly.Module` there) and
++ * instantiates with `new WebAssembly.Instance()`.
++ */
++export function loadExtensionSync(
++  descriptor: ExtensionDescriptor,
++  mainExports: Record<string, WebAssembly.ExportValue>,
++  wasiBuiltins?: WasiImports,
++  wasiUserOverrides?: WasiImports,
++  memoryProxy?: WebAssembly.Memory,
++  allocBase?: { memoryBase: number; tableBase: number }
++): LoadedExtension {
++  const module = descriptor.wasm instanceof WebAssembly.Module
++    ? descriptor.wasm
++    : new WebAssembly.Module(descriptor.wasm);
++  const link = linkExtension(descriptor, module, mainExports, wasiBuiltins, wasiUserOverrides, memoryProxy, allocBase);
++  return link.finish(new WebAssembly.Instance(module, link.imports));
++}
+ 
++/**
++ * Allocate an extension's memory and table space and build its imports;
++ * `finish()` completes the link once the caller has instantiated it.
++ */
++function linkExtension(
++  descriptor: ExtensionDescriptor,
++  module: WebAssembly.Module,
++  mainExports: Record<string, WebAssembly.ExportValue>,
++  wasiBuiltins?: WasiImports,
++  wasiUserOverrides?: WasiImports,
++  memoryProxy?: WebAssembly.Memory,
++  allocBase?: { memoryBase: number; tableBase: number }
++): { imports: WebAssembly.Imports; finish(instance: WebAssembly.Instance): LoadedExtension } {
+   // Parse dylink.0 section
+   const dylink = parseDylink(module);
+   if (!dylink) {
+@@ -401,44 +435,47 @@ export async function loadExtension(
+     };
+   }
+ 
+-  const instance = await WebAssembly.instantiate(module, importObj);
+-  const extExports = instance.exports;
++  const finish = (instance: WebAssembly.Instance): LoadedExtension => {
++    const extExports = instance.exports;
+ 
+-  // Patch wrappers to point to the instance's own exports
+-  for (const name of selfResolvable) {
+-    const selfExport = extExports[name];
+-    if (typeof selfExport === 'function') {
+-      wrappers[name].target = selfExport;
++    // Patch wrappers to point to the instance's own exports
++    for (const name of selfResolvable) {
++      const selfExport = extExports[name];
++      if (typeof selfExport === 'function') {
++        wrappers[name].target = selfExport;
++      }
+     }
+-  }
+ 
+-  // Apply data relocations if the extension has them
+-  if (typeof extExports.__wasm_apply_data_relocs === 'function') {
+-    (extExports.__wasm_apply_data_relocs as Function)();
+-  }
++    // Apply data relocations if the extension has them
++    if (typeof extExports.__wasm_apply_data_relocs === 'function') {
++      (extExports.__wasm_apply_data_relocs as Function)();
++    }
+ 
+-  // Call constructors if present
+-  if (typeof extExports.__wasm_call_ctors === 'function') {
+-    (extExports.__wasm_call_ctors as Function)();
+-  }
++    // Call constructors if present
++    if (typeof extExports.__wasm_call_ctors === 'function') {
++      (extExports.__wasm_call_ctors as Function)();
++    }
+ 
+-  const initFn =
+-    descriptor.initFn ?? `qjs_ext_${descriptor.name.replace(/-/g, '_')}_init`;
+-
+-  const ext: LoadedExtension = {
+-    name: descriptor.name,
+-    module,
+-    instance,
+-    dylink,
+-    memoryBase,
+-    tableBase,
+-    initFn,
+-  };
++    const initFn =
++      descriptor.initFn ?? `qjs_ext_${descriptor.name.replace(/-/g, '_')}_init`;
++
++    const ext: LoadedExtension = {
++      name: descriptor.name,
++      module,
++      instance,
++      dylink,
++      memoryBase,
++      tableBase,
++      initFn,
++    };
+ 
+-  // Check for version reporting
+-  ext.versions = extractExtensionVersions(ext, memory);
++    // Check for version reporting
++    ext.versions = extractExtensionVersions(ext, memory);
++
++    return ext;
++  };
+ 
+-  return ext;
++  return { imports: importObj, finish };
+ }
+ 
+ /**
+diff --git a/src/index.ts b/src/index.ts
+index 88d8804..0740e52 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -10,6 +10,7 @@
+ import { createWasiShim, type WasiOptions } from './wasi-shim.js';
+ import {
+   loadExtension,
++  loadExtensionSync,
+   initExtension,
+   restoreExtensions,
+   type ExtensionDescriptor,
+@@ -706,6 +707,41 @@ export class QuickJSInstance {
+     return inst;
+   }
+ 
++  /**
++   * Synchronous {@link create}, for hosts that cannot await (e.g. a VM
++   * created during a synchronous paint). Instantiates with
++   * `new WebAssembly.Instance()`.
++   *
++   * `wasm` and the extensions' `wasm` should be compiled
++   * `WebAssembly.Module`s. Bytes are accepted too and compiled with
++   * `new WebAssembly.Module()`, which browsers refuse on the main thread
++   * for large modules (Chrome: over 8 MB); compile them ahead of time
++   * there, e.g. with `WebAssembly.compileStreaming()`.
++   */
++  static createSync(options: QuickJSInstanceOptions): QuickJSInstance {
++    return QuickJSInstance._createSync(options, false);
++  }
++
++  /** @internal */
++  static _createSync(options: QuickJSInstanceOptions, owned: boolean): QuickJSInstance {
++    const module = resolveModuleSync(options.wasm);
++    const inst = new QuickJSInstance(module, owned);
++    const imports = inst.createImports(options.wasi);
++    // attach() binds the memory the WASI shim and the memory proxy use,
++    // before _initialize and the first VM call into them.
++    inst.attach(new WebAssembly.Instance(module, imports));
++    inst._exports._initialize();
++    if (options.extensions) {
++      const mainExports = inst._exports as unknown as Record<string, WebAssembly.ExportValue>;
++      for (const desc of options.extensions) {
++        inst._loadedExtensions.push(
++          loadExtensionSync(desc, mainExports, inst._wasiBuiltins, inst._wasiUserOverrides, inst._memoryProxy),
++        );
++      }
++    }
++    return inst;
++  }
++
+   /** The number of live VMs of this instance. */
+   get vmCount(): number {
+     return this.vms.size;
+@@ -958,6 +994,12 @@ function validateVmOptions(opts: QuickJSVmOptions): void {
+   }
+ }
+ 
++const MISSING_WASM_MESSAGE =
++  'QuickJS: `wasm` option is required. Provide WASM bytes or a compiled ' +
++  '`WebAssembly.Module`. The binary is shipped at `quickjs-wasi/quickjs.wasm` ' +
++  'and can be loaded via your environment\'s preferred mechanism (e.g. ' +
++  "`fetch()`, `node:fs/promises`, or a bundler import like Vite's `?url`).";
++
+ async function resolveModule(wasmInput?: BufferSource | WebAssembly.Module): Promise<WebAssembly.Module> {
+   if (wasmInput instanceof WebAssembly.Module) {
+     return wasmInput;
+@@ -965,12 +1007,23 @@ async function resolveModule(wasmInput?: BufferSource | WebAssembly.Module): Pro
+   if (wasmInput) {
+     return WebAssembly.compile(wasmInput);
+   }
+-  throw new TypeError(
+-    'QuickJS: `wasm` option is required. Provide WASM bytes or a compiled ' +
+-    '`WebAssembly.Module`. The binary is shipped at `quickjs-wasi/quickjs.wasm` ' +
+-    'and can be loaded via your environment\'s preferred mechanism (e.g. ' +
+-    "`fetch()`, `node:fs/promises`, or a bundler import like Vite's `?url`).",
+-  );
++  throw new TypeError(MISSING_WASM_MESSAGE);
++}
++
++function resolveModuleSync(wasmInput?: BufferSource | WebAssembly.Module): WebAssembly.Module {
++  if (wasmInput instanceof WebAssembly.Module) {
++    return wasmInput;
++  }
++  if (!wasmInput) {
++    throw new TypeError(MISSING_WASM_MESSAGE);
++  }
++  if (!(wasmInput instanceof ArrayBuffer) && !ArrayBuffer.isView(wasmInput)) {
++    throw new TypeError(
++      'QuickJS.createSync: `wasm` must be a compiled WebAssembly.Module (or WASM bytes); ' +
++      `got ${typeof (wasmInput as unknown as PromiseLike<unknown>)?.then === 'function' ? 'a Promise' : typeof wasmInput}`,
++    );
++  }
++  return new WebAssembly.Module(wasmInput);
+ }
+ 
+ // ---- QuickJS VM ----
+@@ -1110,6 +1163,17 @@ export class QuickJS {
+     return inst._newVm(opts);
+   }
+ 
++  /**
++   * Synchronous {@link create}: the same options, with `wasm` (and the
++   * extensions' `wasm`) preferably a compiled `WebAssembly.Module`; see
++   * {@link QuickJSInstance.createSync} for bytes.
++   */
++  static createSync(options: QuickJSOptions | BufferSource | WebAssembly.Module): QuickJS {
++    const opts = QuickJS.normalizeOptions(options);
++    const inst = QuickJSInstance._createSync(opts, true);
++    return inst._newVm(opts);
++  }
++
+   /**
+    * Restore a QuickJS VM from a snapshot.
+    *
+diff --git a/test/create-sync.test.ts b/test/create-sync.test.ts
+new file mode 100644
+index 0000000..45e2dd2
+--- /dev/null
++++ b/test/create-sync.test.ts
+@@ -0,0 +1,89 @@
++import { describe, it, expect } from 'vitest';
++import { readFileSync } from 'node:fs';
++import { QuickJS, QuickJSInstance } from '../src/index.ts';
++import { wasmBytes } from './helpers.ts';
++
++const wasm = new WebAssembly.Module(wasmBytes);
++const encodingBytes = readFileSync(new URL('../extensions/encoding/encoding.so', import.meta.url));
++const urlBytes = readFileSync(new URL('../extensions/url/url.so', import.meta.url));
++
++describe('QuickJS.createSync', () => {
++  it('creates a VM without awaiting', () => {
++    const vm = QuickJS.createSync({ wasm });
++    expect(vm.evalCode('[1, 2, 3].map(x => x * 2).join()').consume((h) => h.toString())).toBe('2,4,6');
++    vm.dispose();
++  });
++
++  it('accepts a module directly, and bytes', () => {
++    using a = QuickJS.createSync(wasm);
++    using b = QuickJS.createSync({ wasm: wasmBytes });
++    expect(a.evalCode('1 + 1').consume((h) => h.toNumber())).toBe(2);
++    expect(b.evalCode('2 + 2').consume((h) => h.toNumber())).toBe(4);
++  });
++
++  it('applies the VM options', () => {
++    let deadline = Date.now() + 30;
++    using vm = QuickJS.createSync({ wasm, memoryLimit: 4 << 20, interruptHandler: () => Date.now() > deadline });
++    expect(() => vm.evalCode('while (true) {}')).toThrow(/interrupted/);
++    deadline = Infinity;
++    expect(vm.getMemoryUsage().mallocLimit).toBe(4 << 20);
++  });
++
++  it('binds the WASI memory before the module first calls into WASI', () => {
++    const seen: number[] = [];
++    using vm = QuickJS.createSync({
++      wasm,
++      // the memory proxy must work from the very first call: the runtime
++      // reads the clock while it is created
++      wasi: (memory) => ({
++        clock_time_get(_id: number, _precision: bigint, resultPtr: number) {
++          seen.push(memory.buffer.byteLength);
++          new DataView(memory.buffer).setBigUint64(resultPtr, 1_700_000_000_000n * 1_000_000n, true);
++          return 0;
++        },
++      }),
++    });
++    expect(seen.length).toBeGreaterThan(0);
++    expect(seen.every((n) => n > 0)).toBe(true);
++    expect(vm.evalCode('Date.now()').consume((h) => h.toNumber())).toBe(1_700_000_000_000);
++  });
++
++  it('loads extensions from compiled modules and from bytes', () => {
++    using vm = QuickJS.createSync({
++      wasm,
++      extensions: [
++        { name: 'encoding', wasm: new WebAssembly.Module(encodingBytes) },
++        { name: 'url', wasm: urlBytes },
++      ],
++    });
++    expect(vm.evalCode('new TextDecoder().decode(new TextEncoder().encode("héllo"))').consume((h) => h.toString())).toBe('héllo');
++    expect(vm.evalCode('new URL("../b?q=1", "https://x.test/a/c").href').consume((h) => h.toString())).toBe('https://x.test/b?q=1');
++  });
++
++  it('snapshots and restores like an async VM', async () => {
++    const vm = QuickJS.createSync({ wasm });
++    vm.evalCode('globalThis.n = 41').dispose();
++    const snapshot = vm.snapshot();
++    vm.dispose();
++    using restored = await QuickJS.restore(snapshot, { wasm });
++    expect(restored.evalCode('n + 1').consume((h) => h.toNumber())).toBe(42);
++  });
++
++  it('throws a clear error without a module', () => {
++    expect(() => QuickJS.createSync({ wasm: undefined } as any)).toThrow(/`wasm` option is required/);
++    expect(() => QuickJS.createSync({ wasm: Promise.resolve(wasm) as any })).toThrow(/must be a compiled WebAssembly.Module/);
++  });
++});
++
++describe('QuickJSInstance.createSync', () => {
++  it('creates an instance for several VMs without awaiting', () => {
++    using inst = QuickJSInstance.createSync({ wasm, extensions: [{ name: 'encoding', wasm: encodingBytes }] });
++    const a = inst.newVm();
++    const b = inst.newVm({ memoryLimit: 8 << 20 });
++    a.evalCode('globalThis.x = new TextEncoder().encode("ab").length').dispose();
++    expect(a.evalCode('x').consume((h) => h.toNumber())).toBe(2);
++    expect(b.evalCode('typeof x').consume((h) => h.toString())).toBe('undefined');
++    a.dispose();
++    b.dispose();
++  });
++});

@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 11:50:16 +0000
+Subject: [PATCH 4/8] Compile .ts, .mts and .cts modules as TypeScript
+
+The module loader compiled every loaded module as JavaScript, so an
+imported TypeScript module failed with a syntax error on its first type
+annotation.
+
+A module whose name ends in .ts, .mts or .cts is now compiled with
+JS_EVAL_FLAG_TYPESCRIPT. moduleLoader.load may return
+{ source, typescript? } instead of a string, to decide either way. The
+host tells the trampoline through a new out parameter of
+host_module_load. A build without TypeScript rejects such a module with
+the engine's "TypeScript is not supported in this build" SyntaxError.
+---
+ c/interface.c           | 17 +++++++---
+ src/index.ts            | 50 ++++++++++++++++++++++------
+ test/typescript.test.ts | 74 ++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 125 insertions(+), 16 deletions(-)
+
+diff --git a/c/interface.c b/c/interface.c
+index f8fd226..0374075 100644
+--- a/c/interface.c
++++ b/c/interface.c
+@@ -151,9 +151,11 @@ extern char *host_module_normalize(QJSVm *vm, const char *base_name, const char
+  * The host writes the source code into WASM memory and returns a pointer
+  * to a null-terminated source string (allocated with malloc).
+  * The caller frees it. Returns NULL on error.
++ * The host sets *out_typescript to 1 if the source is TypeScript, to be
++ * compiled with JS_EVAL_FLAG_TYPESCRIPT.
+  */
+ __attribute__((import_module("env"), import_name("host_module_load")))
+-extern char *host_module_load(QJSVm *vm, const char *module_name, size_t *out_len);
++extern char *host_module_load(QJSVm *vm, const char *module_name, size_t *out_len, int *out_typescript);
+ 
+ /*
+  * Module normalizer trampoline: dispatches to the host_module_normalize import.
+@@ -198,8 +200,9 @@ static JSModuleDef *module_loader_trampoline(JSContext *ctx,
+ {
+     (void)opaque;
+     size_t source_len = 0;
++    int typescript = 0;
+     QJSVm *saved = cur_vm;
+-    char *source = host_module_load(qjs_vm_of(ctx), module_name, &source_len);
++    char *source = host_module_load(qjs_vm_of(ctx), module_name, &source_len, &typescript);
+     qjs_activate(saved);
+     if (!source) {
+         /* The host may have already thrown a more specific error via
+@@ -210,9 +213,13 @@ static JSModuleDef *module_loader_trampoline(JSContext *ctx,
+         return NULL;
+     }
+ 
+-    /* Compile the module source (COMPILE_ONLY so it returns the module def) */
+-    JSValue func_val = JS_Eval(ctx, source, source_len, module_name,
+-                                JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
++    /* Compile the module source (COMPILE_ONLY so it returns the module
++       def). A build without TypeScript rejects the flag with a
++       SyntaxError. */
++    int eval_flags = JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY;
++    if (typescript)
++        eval_flags |= JS_EVAL_FLAG_TYPESCRIPT;
++    JSValue func_val = JS_Eval(ctx, source, source_len, module_name, eval_flags);
+     free(source);
+ 
+     if (JS_IsException(func_val)) {
+diff --git a/src/index.ts b/src/index.ts
+index e99486c..2b8d8dd 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -169,6 +169,22 @@ export const Intrinsics = {
+   ALL: 0xFFFFFFFF,
+ } as const;
+ 
++/** A module returned by `moduleLoader.load`. */
++export interface ModuleSource {
++  /** The module source code. */
++  source: string;
++  /**
++   * Compile the source as TypeScript (`EvalFlags.TYPESCRIPT`). Defaults to
++   * whether the module name ends in `.ts`, `.mts` or `.cts`.
++   */
++  typescript?: boolean;
++}
++
++/** Whether a module of this name is TypeScript by default. */
++function isTypeScriptModuleName(name: string): boolean {
++  return /\.[mc]?ts$/.test(name);
++}
++
+ /** Memory usage statistics from the QuickJS runtime. */
+ export interface MemoryUsage {
+   /** Total bytes allocated via malloc */
+@@ -307,10 +323,14 @@ export interface QuickJSOptions {
+     /**
+      * Load the source code for a module.
+      *
++     * A module whose name ends in `.ts`, `.mts` or `.cts` is TypeScript:
++     * it is compiled with `EvalFlags.TYPESCRIPT` (types are erased, not
++     * checked). Return `{ source, typescript }` to decide otherwise.
++     *
+      * @param moduleName - The normalized module name (from `normalize`, or the raw specifier)
+-     * @returns The module source code as a string
++     * @returns The module source code as a string, or a {@link ModuleSource}
+      */
+-    load: (moduleName: string) => string;
++    load: (moduleName: string) => string | ModuleSource;
+   };
+   /**
+    * Bitmask of `Intrinsics.*` flags controlling which built-in JavaScript
+@@ -596,13 +616,13 @@ export interface Deferred {
+ // callbacks. The WASM boundary is synchronous (a Promise cannot be
+ // awaited here), so fail with a clear error instead of coercing the
+ // Promise to source text.
+-function assertSyncString(value: unknown, callbackName: string): string {
++function assertSyncString(value: unknown, callbackName: string, alternatives = ''): string {
+   if (typeof value === 'string') return value;
+   const got = value !== null && typeof value === 'object' && typeof (value as PromiseLike<unknown>).then === 'function'
+     ? 'a Promise'
+     : `type ${typeof value}`;
+   throw new TypeError(
+-    `moduleLoader.${callbackName} must synchronously return a string (got ${got}). ` +
++    `moduleLoader.${callbackName} must synchronously return a string (got ${got})${alternatives}. ` +
+     `Async module loading is not supported. Pre-fetch module sources instead ` +
+     `(see the "ES Modules" section of the quickjs-wasi README).`
+   );
+@@ -979,8 +999,8 @@ export class QuickJSInstance {
+           vm._hostPromiseRejection(promisePtr, reasonPtr, isHandled)),
+         host_module_normalize: wrap((vm, baseNamePtr: number, namePtr: number) =>
+           vm._hostModuleNormalize(baseNamePtr, namePtr)),
+-        host_module_load: wrap((vm, namePtr: number, outLenPtr: number) =>
+-          vm._hostModuleLoad(namePtr, outLenPtr)),
++        host_module_load: wrap((vm, namePtr: number, outLenPtr: number, outTypeScriptPtr: number) =>
++          vm._hostModuleLoad(namePtr, outLenPtr, outTypeScriptPtr)),
+         host_get_timezone_offset: hostGetTimezoneOffset,
+       },
+       wasi_snapshot_preview1: wasiShim,
+@@ -1055,7 +1075,7 @@ export class QuickJS {
+   private interruptHandler: (() => boolean) | null = null;
+   private unhandledRejectionHandler: ((promise: JSValueHandle, reason: JSValueHandle, isHandled: boolean) => void) | null = null;
+   private moduleNormalizeHandler: ((baseName: string, specifier: string) => string) | null = null;
+-  private moduleLoadHandler: ((moduleName: string) => string) | null = null;
++  private moduleLoadHandler: ((moduleName: string) => string | ModuleSource) | null = null;
+   private timezoneOffsetHandler: ((timeSecs: number) => number) | null = null;
+ 
+   // Cached singleton handles
+@@ -1505,15 +1525,25 @@ export class QuickJS {
+   }
+ 
+   /** @internal host_module_load */
+-  _hostModuleLoad(namePtr: number, outLenPtr: number): number {
++  _hostModuleLoad(namePtr: number, outLenPtr: number, outTypeScriptPtr: number): number {
+     // Return source code for a module: a malloc'd string pointer, with
+-    // its length written to *outLenPtr.
++    // its length written to *outLenPtr and whether it is TypeScript to
++    // *outTypeScriptPtr.
+     if (!this.moduleLoadHandler) return 0;
+     const name = this.readCString(namePtr);
+     try {
+-      const source = assertSyncString(this.moduleLoadHandler(name), 'load');
++      const loaded = this.moduleLoadHandler(name);
++      let source: string;
++      let typescript = isTypeScriptModuleName(name);
++      if (typeof loaded === 'object' && loaded !== null && typeof (loaded as ModuleSource).source === 'string') {
++        source = loaded.source;
++        if (loaded.typescript !== undefined) typescript = !!loaded.typescript;
++      } else {
++        source = assertSyncString(loaded, 'load', ' or a { source, typescript? } object');
++      }
+       const { ptr, len } = this.writeString(source);
+       new Uint32Array(this.exports.memory.buffer, outLenPtr, 1)[0] = len;
++      new Int32Array(this.exports.memory.buffer, outTypeScriptPtr, 1)[0] = typescript ? 1 : 0;
+       return ptr;
+     } catch (err) {
+       this.throwIntoContext(err);
+diff --git a/test/typescript.test.ts b/test/typescript.test.ts
+index da51cf7..bc58724 100644
+--- a/test/typescript.test.ts
++++ b/test/typescript.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, it, expect } from 'vitest';
+-import { QuickJS, EvalFlags } from '../src/index.ts';
++import { QuickJS, EvalFlags, type ModuleSource } from '../src/index.ts';
+ import { wasmBytes } from './helpers.ts';
+ 
+ const wasm = new WebAssembly.Module(wasmBytes);
+@@ -67,3 +67,75 @@ describe('EvalFlags.TYPESCRIPT', () => {
+     expect(vm.evalBytecode(bytecode).consume((h) => h.toString())).toBe('ok');
+   });
+ });
++
++describe('TypeScript modules', () => {
++  const tsUtil = 'export function twice<T extends number>(n: T): number { return (n as number) * 2 }\nexport type Unused = { a: string };';
++  const sources: Record<string, string | ModuleSource> = {
++    'util.ts': tsUtil,
++    'util.mts': tsUtil,
++    'util.cts': tsUtil,
++    'typed.js': tsUtil,
++    'forced.js': { source: tsUtil, typescript: true },
++    'plain.ts': { source: 'export const v = 1 < 2 ? "js" : "?"', typescript: false },
++    'notreally.ts': { source: tsUtil, typescript: false },
++    'bad.ts': { source: 42 } as unknown as ModuleSource,
++  };
++  const makeVm = () => QuickJS.createSync({
++    wasm,
++    moduleLoader: {
++      load: (name) => {
++        if (!(name in sources)) throw new Error(`no module ${name}`);
++        return sources[name];
++      },
++    },
++  });
++
++  // Evaluate a module and return its `out` export, or throw its error
++  const importOut = async (vm: QuickJS, code: string): Promise<string> => {
++    const p = vm.evalCode(code, 'main.js', EvalFlags.TYPE_MODULE);
++    vm.executePendingJobs();
++    const settled = await vm.resolvePromise(p);
++    p.dispose();
++    if ('error' in settled) {
++      const message = settled.error.consume((h) => h.getProp('message').consume((m) => m.toString()));
++      throw new Error(message);
++    }
++    return settled.value.consume((ns) => ns.getProp('out').consume((h) => h.toString()));
++  };
++
++  it('compiles imported .ts, .mts and .cts modules as TypeScript', async () => {
++    using vm = makeVm();
++    for (const ext of ['ts', 'mts', 'cts']) {
++      const run = importOut(vm, `import { twice } from "util.${ext}"; export const out = String(twice(21));`);
++      if (typescriptSupported) {
++        expect(await run).toBe('42');
++      } else {
++        await expect(run).rejects.toThrow(/TypeScript is not supported/);
++      }
++    }
++  });
++
++  it('compiles other names as JavaScript', async () => {
++    using vm = makeVm();
++    await expect(importOut(vm, 'import { twice } from "typed.js"; export const out = "";')).rejects.toThrow(/./);
++  });
++
++  it('lets load() decide with { source, typescript }', async () => {
++    using vm = makeVm();
++    const forced = importOut(vm, 'import { twice } from "forced.js"; export const out = String(twice(2));');
++    if (typescriptSupported) {
++      expect(await forced).toBe('4');
++    } else {
++      await expect(forced).rejects.toThrow(/TypeScript is not supported/);
++    }
++    expect(await importOut(vm, 'import { v } from "plain.ts"; export const out = v;')).toBe('js');
++    await expect(importOut(vm, 'import { twice } from "notreally.ts"; export const out = "";')).rejects.toThrow(/./);
++  });
++
++  it('rejects a load() result that is neither a string nor a module source', async () => {
++    using vm = makeVm();
++    await expect(importOut(vm, 'import "bad.ts"; export const out = "";')).rejects.toThrow(
++      /must synchronously return a string \(got type object\) or a \{ source, typescript\? \} object/,
++    );
++  });
++});

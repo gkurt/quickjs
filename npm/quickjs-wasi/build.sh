@@ -5,6 +5,17 @@
 # a pinned commit, with the engine of this repository in place of the
 # quickjs-ng release quickjs-wasi ships with.
 #
+# The patches in patches/ are applied to that commit with `git am`, in order:
+# the changes this package makes to the wrapper and the C interface layer,
+# with their tests. A change of the patches (or of the pinned commit) checks
+# the commit out again and reapplies them. To change the series, commit on
+# top of the patched checkout in $WORK/quickjs-wasi (a detached HEAD), then
+# replace the patch files with
+#
+#   rm npm/quickjs-wasi/patches/*.patch
+#   git -C npm/quickjs-wasi/build/quickjs-wasi format-patch --no-signature \
+#       --zero-commit -o "$PWD/npm/quickjs-wasi/patches" <QUICKJS_WASI_SHA>
+#
 # The package is staged in $WORK/pkg, ready for `npm pack` or `npm publish`.
 # Used by .github/workflows/quickjs-wasi.yml and npm-publish.yml; it runs the
 # same locally:
@@ -60,26 +71,53 @@ fi
 
 # fetch only the pinned commit; its quickjs-ng submodule is not needed (the
 # engine comes from this repository, the extensions' dependencies are vendored)
-if [ "$(git -C "$upstream" rev-parse HEAD 2>/dev/null)" != "$QUICKJS_WASI_SHA" ]; then
+if ! git -C "$upstream" cat-file -e "$QUICKJS_WASI_SHA^{commit}" 2>/dev/null; then
     rm -rf "$upstream"
     git init -q "$upstream"
     git -C "$upstream" fetch -q --depth 1 "$QUICKJS_WASI_REPOSITORY" "$QUICKJS_WASI_SHA"
-    git -C "$upstream" checkout -q FETCH_HEAD
+fi
+
+# apply the patches, unless the checkout has this series applied already
+# (the stamp records the commit and a hash of the patches)
+patches=$(ls "$here"/patches/*.patch 2>/dev/null || true)
+# shellcheck disable=SC2086 # one word per patch file
+series="$QUICKJS_WASI_SHA $(cat /dev/null $patches | git hash-object --stdin)"
+stamp=$upstream/.git/quickjs-wasi-patches
+if [ "$(cat "$stamp" 2>/dev/null || true)" != "$series" ]; then
+    rm -f "$stamp"
+    git -C "$upstream" am --abort >/dev/null 2>&1 || true # a failed earlier run
+    git -C "$upstream" checkout -q -f --detach "$QUICKJS_WASI_SHA"
+    git -C "$upstream" clean -q -fd
+    if [ -n "$patches" ]; then
+        # shellcheck disable=SC2086
+        git -C "$upstream" -c user.name=build -c user.email=build@localhost \
+            am -q --committer-date-is-author-date $patches
+    fi
+    echo "$series" > "$stamp"
 fi
 
 cd "$upstream"
 corepack enable >/dev/null 2>&1 || true
 corepack pnpm install --frozen-lockfile
 
-# the Makefile has no hook for extra defines, so they ride on CC; clean first
-# because a change of OPT or TYPESCRIPT is invisible to make
+# what the engine is, for vm.versions and package.json: the commit of this
+# repository, and the hash of the engine's sources, which rust/rquickjs-sys
+# computes too (rquickjs_sys::ENGINE_SOURCE_HASH)
+engine_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
+engine_hash=$(node "$root/scripts/engine-source-hash.mjs" "$root")
+
+# the Makefile has no hook for extra defines of the engine, so they ride on
+# CC; the interface layer takes the engine's identity in INTERFACE_CFLAGS
+# (added by the patches). Clean first because a change of OPT, TYPESCRIPT or
+# the engine's identity is invisible to make
 cc="$WASI_SDK/bin/clang"
 if [ "$TYPESCRIPT" = 0 ]; then
     cc="$cc -DQJS_DISABLE_TYPESCRIPT"
 fi
 make clean >/dev/null
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-make -j "$jobs" WASI_SDK="$WASI_SDK" QJS_DIR="$root" OPT="$OPT" CC="$cc"
+make -j "$jobs" WASI_SDK="$WASI_SDK" QJS_DIR="$root" OPT="$OPT" CC="$cc" \
+    INTERFACE_CFLAGS="-DQJS_ENGINE_COMMIT=\\\"$engine_sha\\\" -DQJS_ENGINE_SOURCE_HASH=\\\"$engine_hash\\\""
 corepack pnpm run build:ts
 
 if [ "$RUN_TESTS" = 1 ]; then
@@ -109,9 +147,9 @@ cp "$here/README.md" "$pkg/"
     cat "$root/LICENSE"
 } > "$pkg/LICENSE"
 
-engine_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)
 OVERLAY="$here/package.json" UPSTREAM="$upstream/package.json" OUT="$pkg/package.json" \
-ENGINE_SHA="$engine_sha" WRAPPER_SHA="$QUICKJS_WASI_SHA" OPT="$OPT" TYPESCRIPT="$TYPESCRIPT" \
+ENGINE_SHA="$engine_sha" ENGINE_HASH="$engine_hash" WRAPPER_SHA="$QUICKJS_WASI_SHA" \
+PATCHES="$(for p in $patches; do basename "$p"; done)" OPT="$OPT" TYPESCRIPT="$TYPESCRIPT" \
 node -e '
 const fs = require("fs");
 const e = process.env;
@@ -122,8 +160,16 @@ const out = { ...ours };
 for (const k of pick) if (k in up) out[k] = up[k];
 // what the package was built from, for bug reports and snapshot compatibility
 out.build = {
-    "quickjs-wasi": { version: up.version, commit: e.WRAPPER_SHA },
-    engine: { repository: "https://github.com/gkurt/quickjs", commit: e.ENGINE_SHA },
+    "quickjs-wasi": {
+        version: up.version,
+        commit: e.WRAPPER_SHA,
+        patches: e.PATCHES.split("\n").filter(Boolean),
+    },
+    engine: {
+        repository: "https://github.com/gkurt/quickjs",
+        commit: e.ENGINE_SHA,
+        sourceHash: e.ENGINE_HASH,
+    },
     opt: e.OPT,
     typescript: e.TYPESCRIPT !== "0",
 };

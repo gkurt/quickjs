@@ -1,0 +1,257 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 11:52:37 +0000
+Subject: [PATCH 5/8] Consume the handle a host function returns
+
+handleHostCall() returned qjs_dup_value(result.ptr) and never freed the
+handle the callback returned, so each call of a host function leaked
+that handle: its box, and the reference it held (an object returned by
+a host function stayed alive). A plugin runtime making many host calls
+grew its memory by about 3 MB per 200k calls.
+
+The returned handle is now consumed: its box goes to the trampoline as
+is, which takes the value out and frees the box, and the handle reads as
+disposed (disposing it again, or the end of an enclosing scope, is a
+no-op). Handles the host keeps using are duplicated instead: the cached
+singletons (vm.undefined, vm.null, vm.true, vm.false, vm.global), the
+borrowed this/arguments of the call, and ephemeral functions, whose
+disposal unregisters their callback. A callback may return nothing,
+which returns undefined. Returning a disposed handle (a cached handle
+returned twice), a handle of another VM or a non-handle throws into the
+guest with a message saying what to do.
+
+HostFunction documents the rule. Deferred.settled throws a clear error
+if read after its promise handle was disposed or returned, instead of
+using the freed box.
+---
+ src/index.ts                      |  60 ++++++++++++++-
+ test/host-function-result.test.ts | 121 ++++++++++++++++++++++++++++++
+ 2 files changed, 178 insertions(+), 3 deletions(-)
+ create mode 100644 test/host-function-result.test.ts
+
+diff --git a/src/index.ts b/src/index.ts
+index 2b8d8dd..ac32e53 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -29,7 +29,19 @@ import { VERSION } from './version.js';
+  */
+ export const MAX_STACK_SIZE = 512 * 1024;
+ 
+-export type HostFunction = (this: JSValueHandle, ...args: JSValueHandle[]) => JSValueHandle;
++/**
++ * A host callback behind a QuickJS function (`vm.newFunction()`).
++ *
++ * The `this` and argument handles are borrowed: valid during the call
++ * only (`dup()` one to keep it). The returned handle is consumed: the
++ * function's result takes it over, and the handle reads as disposed
++ * afterwards. Returning a handle the host keeps using (a cached handle,
++ * say) needs `dup()`; singletons (`vm.undefined`, `vm.null`, `vm.true`,
++ * `vm.false`, `vm.global`), borrowed arguments and ephemeral functions
++ * (`newEphemeralFunction()`) are duplicated, not consumed. Returning
++ * nothing returns `undefined`.
++ */
++export type HostFunction = (this: JSValueHandle, ...args: JSValueHandle[]) => JSValueHandle | void;
+ 
+ /**
+  * A batch of handles created inside `vm.withScope()`, disposed together when
+@@ -1605,8 +1617,7 @@ export class QuickJS {
+     }
+ 
+     try {
+-      const result = callback.call(thisHandle, ...args);
+-      return this.exports.qjs_dup_value(result.ptr);
++      return this.hostResultPtr(callback.call(thisHandle, ...args), name);
+     } catch (err) {
+       // Throw an exception inside QuickJS and return NULL to signal
+       // to the C trampoline that an exception was thrown.
+@@ -1617,6 +1628,28 @@ export class QuickJS {
+     }
+   }
+ 
++  /**
++   * The box of a host function's result, for the trampoline, which takes
++   * the value out of it and frees it. See {@link HostFunction} for the
++   * ownership rules.
++   */
++  private hostResultPtr(result: JSValueHandle | void, name: string): number {
++    if (result === undefined) return this.exports.qjs_get_undefined();
++    if (!(result instanceof JSValueHandle)) {
++      throw new TypeError(`Host function "${name}" must return a JSValueHandle or undefined (got ${typeof result})`);
++    }
++    if (result.vm !== this) {
++      throw new Error(`Host function "${name}" returned a handle of another VM`);
++    }
++    if (result.disposed) {
++      throw new Error(
++        `Host function "${name}" returned a disposed handle (a returned handle is consumed: ` +
++          'return handle.dup() to keep using it)',
++      );
++    }
++    return result._transfer();
++  }
++
+   // ---- String helpers ----
+ 
+   /** Write a JS string into WASM memory, returning the pointer. Caller must free. */
+@@ -2193,6 +2226,12 @@ export class QuickJS {
+       handle: promiseHandle,
+       get settled(): Promise<void> {
+         if (!_settled) {
++          if (promiseHandle.disposed) {
++            throw new Error(
++              'Deferred.settled must be read before the promise handle is disposed ' +
++                '(a host function consumes the handle it returns)',
++            );
++          }
+           let settledResolve: () => void;
+           _settled = new Promise<void>((res) => {
+             settledResolve = res;
+@@ -3740,6 +3779,21 @@ export class JSValueHandle {
+     }
+   }
+ 
++  /**
++   * @internal Hand this handle's box over to the engine (a host function's
++   * result): the handle reads as disposed and its box is no longer freed
++   * by it, or by a scope. Handles the host keeps (singletons, borrowed
++   * arguments, ephemeral functions, whose disposal unregisters their
++   * callback) are duplicated instead.
++   */
++  _transfer(): number {
++    if (this.singleton || this.borrowed || this._onDispose) {
++      return this.vm._getExports().qjs_dup_value(this.ptr);
++    }
++    this.disposed_ = true;
++    return this.ptr;
++  }
++
+   /**
+    * Use this handle, then dispose it. Returns the callback's return value.
+    */
+diff --git a/test/host-function-result.test.ts b/test/host-function-result.test.ts
+new file mode 100644
+index 0000000..4aa5880
+--- /dev/null
++++ b/test/host-function-result.test.ts
+@@ -0,0 +1,121 @@
++import { describe, it, expect } from 'vitest';
++import { QuickJS, QuickJSInstance, type JSValueHandle } from '../src/index.ts';
++import { wasmBytes } from './helpers.ts';
++
++const wasm = new WebAssembly.Module(wasmBytes);
++
++const setFunction = (vm: QuickJS, name: string, fn: Parameters<QuickJS['newFunction']>[1]) =>
++  vm.newFunction(name, fn).consume((f) => vm.setProp(vm.global, name, f));
++
++describe('host function results', () => {
++  it('do not leak: 200k calls do not grow memory', async () => {
++    using vm = await QuickJS.create({ wasm });
++    setFunction(vm, 'num', (n) => vm.newNumber(n.toNumber() + 1));
++    setFunction(vm, 'str', (n) => vm.newString(`s${n.toNumber()}`));
++    setFunction(vm, 'obj', (n) => vm.hostToHandle({ n: n.toNumber() }));
++    const run = (count: number) =>
++      vm.evalCode(`(() => {
++        let t = 0;
++        for (let i = 0; i < ${count}; i++) t += num(i) + str(i).length + obj(i).n;
++        return t;
++      })()`).consume((h) => h.toNumber());
++
++    run(20000); // warm up: the allocators reach their working set
++    vm.runGC();
++    const memoryBefore = vm._getMemory().buffer.byteLength;
++    const usageBefore = vm.getMemoryUsage();
++    expect(run(200000)).toBeGreaterThan(0);
++    vm.runGC();
++    const usageAfter = vm.getMemoryUsage();
++    expect(vm._getMemory().buffer.byteLength).toBe(memoryBefore);
++    expect(usageAfter.objCount).toBe(usageBefore.objCount);
++    expect(usageAfter.mallocSize).toBeLessThan(usageBefore.mallocSize + 64 * 1024);
++  });
++
++  it('consume the returned handle', async () => {
++    using vm = await QuickJS.create({ wasm });
++    let returned: JSValueHandle | undefined;
++    setFunction(vm, 'make', () => (returned = vm.newObject()));
++    expect(vm.evalCode('typeof make()').consume((h) => h.toString())).toBe('object');
++    expect(returned!.disposed).toBe(true);
++    returned!.dispose(); // harmless
++  });
++
++  it('return a handle created inside an enclosing scope once', async () => {
++    using vm = await QuickJS.create({ wasm });
++    setFunction(vm, 'make', () => vm.newString('scoped'));
++    const out = vm.withScope(() => vm.evalCode('make() + "!"').toString());
++    expect(out).toBe('scoped!');
++    // the scope did not free the consumed handle a second time
++    expect(vm.evalCode('make()').consume((h) => h.toString())).toBe('scoped');
++  });
++
++  it('duplicate what the host keeps: singletons, the global, arguments', async () => {
++    using vm = await QuickJS.create({ wasm });
++    setFunction(vm, 'id', (x) => x);
++    setFunction(vm, 'self', function () { return this; });
++    setFunction(vm, 'getGlobal', () => vm.global);
++    setFunction(vm, 'nothing', () => vm.undefined);
++    setFunction(vm, 'yes', () => vm.true);
++    setFunction(vm, 'none', () => vm.null);
++    const r = vm.evalCode(`
++      const o = { k: 1 };
++      [id(o) === o, id(5), getGlobal() === globalThis, nothing(), yes(), none(),
++       self.call(o) === o].join()
++    `);
++    expect(r.consume((h) => h.toString())).toBe('true,5,true,,true,,true');
++    // the cached handles still work
++    expect(vm.global.getProp('o').consume((h) => h.isUndefined)).toBe(true);
++    expect(vm.true.toBoolean()).toBe(true);
++    for (let i = 0; i < 1000; i++) vm.evalCode('getGlobal(); yes(); id({})').dispose();
++    expect(vm.evalCode('typeof getGlobal().Object').consume((h) => h.toString())).toBe('function');
++  });
++
++  it('may be nothing', async () => {
++    using vm = await QuickJS.create({ wasm });
++    let called = 0;
++    setFunction(vm, 'sideEffect', () => { called++; });
++    expect(vm.evalCode('sideEffect() === undefined').consume((h) => h.toBoolean())).toBe(true);
++    expect(called).toBe(1);
++  });
++
++  it('keep ephemeral functions registered', async () => {
++    using vm = await QuickJS.create({ wasm });
++    const cb = vm.newEphemeralFunction(() => vm.newNumber(7));
++    setFunction(vm, 'getCb', () => cb);
++    expect(vm.evalCode('getCb()() + getCb()()').consume((h) => h.toNumber())).toBe(14);
++    expect(cb.disposed).toBe(false);
++    cb.dispose();
++    expect(() => vm.evalCode('getCb()')).toThrow(/disposed handle/);
++  });
++
++  it('reject a disposed handle, another VM\'s handle, and non-handles', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const vm = inst.newVm();
++    const other = inst.newVm();
++    const cached = vm.newString('once');
++    setFunction(vm, 'cached', () => cached);
++    setFunction(vm, 'foreign', () => other.newString('x'));
++    setFunction(vm, 'bogus', () => 42 as unknown as JSValueHandle);
++    expect(vm.evalCode('cached()').consume((h) => h.toString())).toBe('once');
++    const message = (code: string) =>
++      vm.evalCode(`try { ${code}; "no error" } catch (e) { e.message }`).consume((h) => h.toString());
++    expect(message('cached()')).toMatch(/returned a disposed handle .*dup\(\)/);
++    expect(message('foreign()')).toMatch(/returned a handle of another VM/);
++    expect(message('bogus()')).toMatch(/must return a JSValueHandle or undefined \(got number\)/);
++  });
++
++  it('keep a returned promise usable through its deferred', async () => {
++    using vm = await QuickJS.create({ wasm });
++    let deferred: ReturnType<QuickJS['newPromise']> | undefined;
++    setFunction(vm, 'later', () => {
++      deferred = vm.newPromise();
++      return deferred.handle;
++    });
++    vm.evalCode('globalThis.out = "pending"; later().then(v => { out = v })').dispose();
++    expect(() => deferred!.settled).toThrow(/before the promise handle is disposed/);
++    deferred!.resolve(vm.newString('done'));
++    vm.executePendingJobs();
++    expect(vm.evalCode('out').consume((h) => h.toString())).toBe('done');
++  });
++});

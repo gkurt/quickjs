@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 12:04:38 +0000
+Subject: [PATCH 8/8] Report the engine's commit and source hash in vm.versions
+
+A build of quickjs-wasi with another engine (a fork, say) cannot tell
+which engine it contains, and a host that also embeds the same engine
+natively has nothing to compare.
+
+The build may pass the engine's identity to the interface layer through
+the new INTERFACE_CFLAGS make variable:
+-DQJS_ENGINE_COMMIT="<commit>" and -DQJS_ENGINE_SOURCE_HASH="<hash>".
+qjs_get_engine_commit() and qjs_get_engine_source_hash() return them
+(empty strings when not given), and vm.versions includes them as
+engineCommit and engineSourceHash when they are known.
+---
+ Makefile              |  6 +++++-
+ c/interface.c         | 23 +++++++++++++++++++++++
+ src/index.ts          | 15 ++++++++++++---
+ test/versions.test.ts | 12 ++++++++++--
+ 4 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index fc3d1eb..ecbb38f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -22,6 +22,10 @@ QJS_SRCS = \
+ 
+ INTERFACE_SRC = c/interface.c
+ 
++# Extra flags for the interface layer only, e.g. the engine's identity:
++#   make INTERFACE_CFLAGS='-DQJS_ENGINE_COMMIT=\"<sha>\" -DQJS_ENGINE_SOURCE_HASH=\"<hash>\"'
++INTERFACE_CFLAGS ?=
++
+ # Output
+ BUILD_DIR = build
+ OUTPUT = quickjs.wasm
+@@ -391,7 +395,7 @@ $(BUILD_DIR)/%.o: $(QJS_DIR)/%.c | $(BUILD_DIR)
+ 	$(CC) $(CFLAGS) -c -o $@ $<
+ 
+ $(BUILD_DIR)/interface.o: $(INTERFACE_SRC) | $(BUILD_DIR)
+-	$(CC) $(CFLAGS) -c -o $@ $<
++	$(CC) $(CFLAGS) $(INTERFACE_CFLAGS) -c -o $@ $<
+ 
+ # URL extension: compile C source
+ $(EXT_URL_DIR)/url.o: $(EXT_URL_DIR)/url.c
+diff --git a/c/interface.c b/c/interface.c
+index 0cb051f..e69cb51 100644
+--- a/c/interface.c
++++ b/c/interface.c
+@@ -356,6 +356,29 @@ const char *qjs_get_quickjs_version(void) {
+     return JS_GetVersion();
+ }
+ 
++/*
++ * What the engine was built from, when the build says (INTERFACE_CFLAGS,
++ * e.g. -DQJS_ENGINE_COMMIT='"<sha>"'): the commit of its repository, and
++ * a hash of its sources that other builds of the same engine (a native
++ * crate, say) can compare. Empty strings when unknown.
++ */
++#ifndef QJS_ENGINE_COMMIT
++#define QJS_ENGINE_COMMIT ""
++#endif
++#ifndef QJS_ENGINE_SOURCE_HASH
++#define QJS_ENGINE_SOURCE_HASH ""
++#endif
++
++__attribute__((export_name("qjs_get_engine_commit")))
++const char *qjs_get_engine_commit(void) {
++    return QJS_ENGINE_COMMIT;
++}
++
++__attribute__((export_name("qjs_get_engine_source_hash")))
++const char *qjs_get_engine_source_hash(void) {
++    return QJS_ENGINE_SOURCE_HASH;
++}
++
+ /* ---- Lifecycle ---- */
+ 
+ /* Intrinsic bitmask flags; must match the TypeScript Intrinsics constants */
+diff --git a/src/index.ts b/src/index.ts
+index ba6baf5..63c1bf0 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -440,6 +440,8 @@ interface QuickJSExports {
+ 
+   // Version
+   qjs_get_quickjs_version(): number;
++  qjs_get_engine_commit(): number;
++  qjs_get_engine_source_hash(): number;
+ 
+   // Lifecycle
+   qjs_init(): number;
+@@ -673,7 +675,7 @@ function assertSyncString(value: unknown, callbackName: string, alternatives = '
+  * of the instance, so a VM of a shared instance selects itself first.
+  */
+ const VM_INDEPENDENT_EXPORTS = new Set([
+-  'qjs_get_quickjs_version',
++  'qjs_get_quickjs_version', 'qjs_get_engine_commit', 'qjs_get_engine_source_hash',
+   'qjs_vm_new', 'qjs_vm_select', 'qjs_vm_current', 'qjs_vm_free',
+   'qjs_typeof', 'qjs_is_exception', 'qjs_is_undefined', 'qjs_is_null',
+   'qjs_is_bool', 'qjs_is_number', 'qjs_is_string', 'qjs_is_object',
+@@ -1154,8 +1156,11 @@ export class QuickJS {
+   /**
+    * Version information for the runtime and loaded native libraries.
+    * Always includes `"quickjs-wasi"` (the npm package version) and
+-   * `"quickjs"` (the QuickJS engine version). Extensions may contribute
+-   * additional entries for their native dependencies (e.g. `"ada"`, `"mbedtls"`).
++   * `"quickjs"` (the QuickJS engine version). When the build recorded
++   * them, `"engineCommit"` is the commit of the engine's repository and
++   * `"engineSourceHash"` a hash of its sources, which other builds of the
++   * same engine can compare. Extensions may contribute additional entries
++   * for their native dependencies (e.g. `"ada"`, `"mbedtls"`).
+    */
+   get versions(): Record<string, string> {
+     this.assertNotDisposed();
+@@ -1164,6 +1169,10 @@ export class QuickJS {
+         'quickjs-wasi': VERSION,
+         quickjs: this.readCString(this.exports.qjs_get_quickjs_version()),
+       };
++      const engineCommit = this.readCString(this.exports.qjs_get_engine_commit());
++      const engineSourceHash = this.readCString(this.exports.qjs_get_engine_source_hash());
++      if (engineCommit) result.engineCommit = engineCommit;
++      if (engineSourceHash) result.engineSourceHash = engineSourceHash;
+       for (const ext of this.loadedExtensions) {
+         if (ext.versions) {
+           Object.assign(result, ext.versions);
+diff --git a/test/versions.test.ts b/test/versions.test.ts
+index 36c12a5..da1f8b7 100644
+--- a/test/versions.test.ts
++++ b/test/versions.test.ts
+@@ -25,9 +25,17 @@ describe('vm.versions', () => {
+     expect(vm.versions.quickjs).toMatch(/^\d+\.\d+\.\d+/);
+   });
+ 
+-  it('should only have quickjs-wasi and quickjs with no extensions', async () => {
++  it('should only have quickjs-wasi and quickjs (and the engine build) with no extensions', async () => {
+     using vm = await QuickJS.create(wasmBytes);
+-    expect(Object.keys(vm.versions).sort()).toEqual(['quickjs', 'quickjs-wasi']);
++    const keys = Object.keys(vm.versions).filter((k) => k !== 'engineCommit' && k !== 'engineSourceHash');
++    expect(keys.sort()).toEqual(['quickjs', 'quickjs-wasi']);
++  });
++
++  it('should report the engine build when it was recorded', async () => {
++    using vm = await QuickJS.create(wasmBytes);
++    const { engineCommit, engineSourceHash } = vm.versions;
++    if (engineCommit !== undefined) expect(engineCommit).toMatch(/^([0-9a-f]{7,64}|unknown)$/);
++    if (engineSourceHash !== undefined) expect(engineSourceHash).toMatch(/^[0-9a-f]{16}$/);
+   });
+ 
+   it('should return the same object on repeated access (cached)', async () => {

@@ -1,0 +1,363 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 12:02:22 +0000
+Subject: [PATCH 7/8] Link a 2 MiB stack and allow a 1 MiB stack limit
+
+The binary was linked with a 1 MiB stack and MAX_STACK_SIZE reserved
+half of it, so no VM could recurse deeper than 512 KiB of stack. Worse,
+the engine's default limit (JS_DEFAULT_STACK_SIZE, 1 MiB) is ignored
+when the stack is not larger than it, so a VM created without
+maxStackSize had no stack check at all: deep recursion ran off the
+bottom of the stack or overflowed the host's native stack, and in both
+cases the call failed outside the VM and left it unusable.
+
+The stack is now 2 MiB and MAX_STACK_SIZE 1 MiB. A VM gets
+DEFAULT_STACK_SIZE (512 KiB) when maxStackSize is not given: the host
+engine runs the WASM code on its own native stack, which recursion
+fills a little faster than the WASM stack, and 512 KiB is what fits
+before a 1 MiB native stack (Node.js's main thread) overflows, for
+every recursion pattern the tests try. 1 MiB fits a native stack of
+about 2 MiB or more (JavaScriptCore, a Node.js worker). A restored VM
+keeps the limit of its snapshot unless given one.
+
+The VMs of an instance share its stack, and a runtime measures its
+limit from where it was created, so a VM created deep in the stack (from
+the host function of another VM) could get a limit below the bottom of
+the stack. interface.c keeps every VM's limit at least 64 KiB above the
+bottom of the stack (__stack_low); a test that creates a VM at the
+bottom of another VM's recursion trapped with "memory access out of
+bounds" without it.
+
+The new tests check that each recursion pattern stops with "Maximum
+call stack size exceeded" and leaves the VM usable, at the default on
+the test's own thread, at 1 MiB in a worker with a 4 MiB stack (which
+loads the built package from dist/), and from nested VMs.
+---
+ Makefile                   |   2 +-
+ c/interface.c              |  33 +++++++++-
+ src/index.ts               |  40 ++++++++++--
+ test/memory-growth.test.ts |   7 +-
+ test/stack.test.ts         | 130 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 201 insertions(+), 11 deletions(-)
+ create mode 100644 test/stack.test.ts
+
+diff --git a/Makefile b/Makefile
+index f09b77b..fc3d1eb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -92,7 +92,7 @@ LDFLAGS = \
+ 	-Wl,--wrap=__secs_to_zone \
+ 	-Wl,--export-dynamic \
+ 	-Wl,--export=__stack_pointer \
+-	-Wl,-z,stack-size=1048576 \
++	-Wl,-z,stack-size=2097152 \
+ 	-Wl,--export=__indirect_function_table \
+ 	-Wl,--growable-table \
+ 	-Wl,--export=malloc \
+diff --git a/c/interface.c b/c/interface.c
+index 0374075..0cb051f 100644
+--- a/c/interface.c
++++ b/c/interface.c
+@@ -41,6 +41,7 @@ typedef struct QJSVm {
+     size_t mem_limit;   /* 0 = unlimited */
+     size_t mem_used;    /* sum of malloc_usable_size of live allocs */
+     int mem_in_oom;     /* a refusal happened; headroom is open */
++    uintptr_t stack_top; /* the stack pointer where the VM was created */
+     QJSBox boxes;       /* head of the list of live boxes */
+ } QJSVm;
+ 
+@@ -550,6 +551,32 @@ static JSContext *qjs_new_context(JSRuntime *rt, unsigned int intrinsics) {
+     return ctx;
+ }
+ 
++/* ---- Stack ----
++ *
++ * The instance has one stack (linked with -z stack-size=2097152), shared
++ * by its VMs: a VM running from the host function of another VM runs
++ * deeper in the same stack. A runtime measures its stack limit
++ * (JS_SetMaxStackSize) from the stack pointer at its creation, which is
++ * near the top of the stack for a VM created by the host at top level,
++ * but deeper for one created from a host function. Keep the limit of
++ * every VM above the bottom of the stack, with QJS_STACK_MARGIN of room
++ * for the frames that throw the "Maximum call stack size exceeded"
++ * error: a limit below the bottom would let the stack overflow into the
++ * data below it (and the engine ignores a limit larger than the stack
++ * top, which would disable the check).
++ */
++
++#define QJS_STACK_MARGIN (64 * 1024)
++
++extern unsigned char __stack_low; /* the bottom of the stack (wasm-ld) */
++
++static size_t qjs_clamp_stack_size(QJSVm *vm, size_t size) {
++    uintptr_t low = (uintptr_t)&__stack_low + QJS_STACK_MARGIN;
++    size_t room = vm->stack_top > low ? vm->stack_top - low : 1;
++    if (size == 0) return 0; /* the host disabled the check */
++    return size < room ? size : room;
++}
++
+ /*
+  * Create a VM: a runtime with a context (see qjs_new_context for the
+  * intrinsics). Does not change the current VM. Returns NULL on failure.
+@@ -560,12 +587,14 @@ QJSVm *qjs_vm_new(unsigned int intrinsics) {
+     if (!vm) return NULL;
+     vm->boxes.prev = vm->boxes.next = &vm->boxes;
+ 
++    vm->stack_top = (uintptr_t)__builtin_frame_address(0);
+     vm->rt = JS_NewRuntime2(&qjs_wasi_malloc_funcs, vm);
+     if (!vm->rt) {
+         free(vm);
+         return NULL;
+     }
+     JS_SetRuntimeOpaque(vm->rt, vm);
++    JS_SetMaxStackSize(vm->rt, qjs_clamp_stack_size(vm, JS_DEFAULT_STACK_SIZE));
+ 
+     vm->ctx = qjs_new_context(vm->rt, intrinsics);
+     if (!vm->ctx) {
+@@ -681,9 +710,11 @@ void qjs_set_memory_limit(size_t limit) {
+     if (rt) JS_SetMemoryLimit(rt, 0);
+ }
+ 
++/* Set the stack limit of the current VM, within the stack (see
++   qjs_clamp_stack_size); 0 disables the check. */
+ __attribute__((export_name("qjs_set_max_stack_size")))
+ void qjs_set_max_stack_size(size_t size) {
+-    if (rt) JS_SetMaxStackSize(rt, size);
++    if (cur_vm) JS_SetMaxStackSize(rt, qjs_clamp_stack_size(cur_vm, size));
+ }
+ 
+ __attribute__((export_name("qjs_run_gc")))
+diff --git a/src/index.ts b/src/index.ts
+index 4721726..ba6baf5 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -24,10 +24,28 @@ import { VERSION } from './version.js';
+ /**
+  * Largest supported QuickJS native stack limit for the shipped WASM binary.
+  *
+- * The binary has a 1 MiB linker-defined stack; reserving half of it leaves
++ * The binary has a 2 MiB linker-defined stack; reserving half of it leaves
+  * headroom for native frames and stack-overflow exception handling.
++ *
++ * The host engine runs the WASM code on its own native stack, which must
++ * hold the recursion too: each level of guest recursion takes somewhat
++ * more of the host's native stack than of the WASM stack. A limit of
++ * 1 MiB needs about 2 MiB of native stack or more, as on JavaScriptCore,
++ * or in a Node.js worker (4 MiB by default); on a smaller one (Node.js's
++ * main thread has about 1 MiB) deep recursion overflows the host's stack
++ * first, which throws a host `RangeError` out of the call and leaves the
++ * VM unusable. The default, {@link DEFAULT_STACK_SIZE}, fits a 1 MiB
++ * native stack.
+  */
+-export const MAX_STACK_SIZE = 512 * 1024;
++export const MAX_STACK_SIZE = 1024 * 1024;
++
++/**
++ * The QuickJS stack limit a VM gets when `maxStackSize` is not given,
++ * small enough for recursion to hit QuickJS's "Maximum call stack size
++ * exceeded" before a 1 MiB host native stack overflows. Raise it up to
++ * {@link MAX_STACK_SIZE} on hosts with a larger native stack.
++ */
++export const DEFAULT_STACK_SIZE = 512 * 1024;
+ 
+ /**
+  * A host callback behind a QuickJS function (`vm.newFunction()`).
+@@ -275,8 +293,15 @@ export interface QuickJSOptions {
+   memoryLimit?: number;
+   /**
+    * Maximum native stack space QuickJS may consume, in bytes.
+-   * Must be an integer between 0 and {@link MAX_STACK_SIZE}. Set to 0 to
+-   * disable the QuickJS stack guard.
++   * Must be an integer between 0 and {@link MAX_STACK_SIZE}; defaults to
++   * {@link DEFAULT_STACK_SIZE} (see {@link MAX_STACK_SIZE} for the host's
++   * own stack). Set to 0 to disable the QuickJS stack guard.
++   *
++   * The VMs of a {@link QuickJSInstance} share its one stack: a VM
++   * running from the host function of another VM starts deeper in it,
++   * where only the room the other VM left is available. The limit is
++   * measured from where the VM was created, and capped to keep 64 KiB
++   * above the bottom of the stack.
+    */
+   maxStackSize?: number;
+   /**
+@@ -1272,7 +1297,7 @@ export class QuickJS {
+     inst._current = vm;
+ 
+     // Apply runtime limits
+-    QuickJS._applyLimits(vm, opts);
++    QuickJS._applyLimits(vm, opts, true);
+ 
+     return vm;
+   }
+@@ -1442,12 +1467,15 @@ export class QuickJS {
+   }
+ 
+   /** @internal */
+-  static _applyLimits(vm: QuickJS, opts: QuickJSVmOptions): void {
++  static _applyLimits(vm: QuickJS, opts: QuickJSVmOptions, restored = false): void {
+     if (opts.memoryLimit !== undefined) {
+       vm.exports.qjs_set_memory_limit(opts.memoryLimit);
+     }
+     if (opts.maxStackSize !== undefined) {
+       vm.exports.qjs_set_max_stack_size(opts.maxStackSize);
++    } else if (!restored) {
++      // A restored VM keeps the limit of its snapshot
++      vm.exports.qjs_set_max_stack_size(DEFAULT_STACK_SIZE);
+     }
+     if (opts.interruptHandler) {
+       vm.interruptHandler = opts.interruptHandler;
+diff --git a/test/memory-growth.test.ts b/test/memory-growth.test.ts
+index f8e079e..6a4d1b5 100644
+--- a/test/memory-growth.test.ts
++++ b/test/memory-growth.test.ts
+@@ -13,10 +13,11 @@ describe('WASM memory growth', () => {
+   it('should start with a small initial memory', async () => {
+     using vm = await QuickJS.create(wasmBytes);
+     const pages = getPageCount(vm);
+-    // After init, memory should be relatively small (under 2 MB = 32 pages).
+-    // The exact initial size depends on the WASM binary but should be modest.
++    // After init, memory should be relatively small: the 2 MiB stack
++    // (32 pages) plus under 1 MB (16 pages). The exact initial size
++    // depends on the WASM binary but should be modest.
+     expect(pages).toBeGreaterThan(0);
+-    expect(pages).toBeLessThan(32);
++    expect(pages).toBeLessThan(48);
+   });
+ 
+   it('should grow WASM memory when JS code allocates large data', async () => {
+diff --git a/test/stack.test.ts b/test/stack.test.ts
+new file mode 100644
+index 0000000..fee2568
+--- /dev/null
++++ b/test/stack.test.ts
+@@ -0,0 +1,130 @@
++import { describe, it, expect } from 'vitest';
++import { existsSync } from 'node:fs';
++import { Worker } from 'node:worker_threads';
++import { QuickJS, QuickJSInstance, MAX_STACK_SIZE, DEFAULT_STACK_SIZE } from '../src/index.ts';
++import { wasmBytes } from './helpers.ts';
++
++const wasm = new WebAssembly.Module(wasmBytes);
++
++// Recursion through different engine paths: each takes a different
++// share of the WASM stack and of the host's native stack per level.
++const PATTERNS: Record<string, string> = {
++  plain: 'function r() { d++; return r() } r()',
++  map: 'function r() { d++; return [0].map(r) } r()',
++  getter: 'const o = { get x() { d++; return this.x } }; o.x',
++  apply: 'function r() { d++; return Reflect.apply(r, null, []) } r()',
++  json: 'const o = { toJSON() { d++; return JSON.stringify(o) } }; JSON.stringify(o)',
++  proxy: 'const p = new Proxy({}, { get(t, k) { d++; return p[k] } }); p.x',
++  tostring: 'const o = { toString() { d++; return String(o) } }; String(o)',
++  generator: 'function* g() { d++; yield* g() } [...g()]',
++};
++const overflow = (code: string) =>
++  `(() => { let d = 0; try { ${code}; return 'no overflow' } catch (e) { return e.name + ': ' + e.message + ' @' + d } })()`;
++
++// The patterns, run where the host's native stack is `stackSizeMb`: in a
++// worker, which loads the built package (dist/, built before the tests).
++const dist = new URL('../dist/index.js', import.meta.url);
++const runInWorker = (script: string, stackSizeMb: number): Promise<Record<string, string>> =>
++  new Promise((resolve, reject) => {
++    const code = `
++      import { workerData, parentPort } from 'node:worker_threads';
++      const { QuickJS, QuickJSInstance, MAX_STACK_SIZE } = await import(workerData.dist);
++      const wasm = new WebAssembly.Module(workerData.wasmBytes);
++      const out = {};
++      ${script}
++      parentPort.postMessage(out);
++    `;
++    const worker = new Worker(new URL(`data:text/javascript,${encodeURIComponent(code)}`), {
++      workerData: { dist: dist.href, wasmBytes, patterns: PATTERNS, overflow: overflow('CODE') },
++      resourceLimits: { stackSizeMb },
++    });
++    worker.once('message', resolve);
++    worker.once('error', reject);
++  });
++
++describe('stack limits', () => {
++  it('allows up to 1 MiB, and defaults to 512 KiB', async () => {
++    expect(MAX_STACK_SIZE).toBe(1024 * 1024);
++    expect(DEFAULT_STACK_SIZE).toBe(512 * 1024);
++    using vm = await QuickJS.create({ wasm, maxStackSize: MAX_STACK_SIZE });
++    expect(vm.evalCode('1 + 1').consume((h) => h.toNumber())).toBe(2);
++    await expect(QuickJS.create({ wasm, maxStackSize: MAX_STACK_SIZE + 1 })).rejects.toThrow(/maxStackSize/);
++  });
++
++  it('stops recursion cleanly at the default limit, within a 1 MiB host stack', async () => {
++    using vm = await QuickJS.create({ wasm });
++    for (const [name, code] of Object.entries(PATTERNS)) {
++      const result = vm.evalCode(overflow(code)).consume((h) => h.toString());
++      expect(`${name}: ${result}`).toMatch(/: RangeError: Maximum call stack size exceeded @\d+$/);
++      expect(vm.evalCode('1 + 2').consume((h) => h.toNumber())).toBe(3);
++    }
++  });
++
++  it('stops recursion from nested VMs cleanly: they share the stack', async () => {
++    using inst = await QuickJSInstance.create({ wasm });
++    const a = inst.newVm();
++    const b = inst.newVm();
++    a.newFunction('inB', () => a.newString(b.evalCode(overflow(PATTERNS.plain)).consume((h) => h.toString())))
++      .consume((f) => a.setProp(a.global, 'inB', f));
++    // b runs from deep in a's recursion, with the room a left
++    const result = a.evalCode(`
++      function down(n) { return n === 0 ? inB() : down(n - 1) }
++      down(700)
++    `).consume((h) => h.toString());
++    expect(result).toMatch(/^RangeError: Maximum call stack size exceeded @\d+$/);
++    const nestedDepth = Number(result.split('@')[1]);
++    const topDepth = Number(b.evalCode(overflow(PATTERNS.plain)).consume((h) => h.toString()).split('@')[1]);
++    expect(nestedDepth).toBeLessThan(topDepth);
++    expect(a.evalCode(overflow(PATTERNS.plain)).consume((h) => h.toString())).toMatch(/RangeError/);
++  });
++
++  it.skipIf(!existsSync(dist))('stops recursion cleanly at 1 MiB, within a larger host stack', async () => {
++    const out = await runInWorker(`
++      const vm = QuickJS.createSync({ wasm, maxStackSize: MAX_STACK_SIZE });
++      for (const [name, code] of Object.entries(workerData.patterns)) {
++        out[name] = vm.evalCode(workerData.overflow.replace('CODE', code)).consume((h) => h.toString());
++        out[name + ':after'] = vm.evalCode('1 + 2').consume((h) => h.toNumber());
++      }
++      const small = QuickJS.createSync({ wasm });
++      out.defaultPlain = small.evalCode(workerData.overflow.replace('CODE', workerData.patterns.plain)).consume((h) => h.toString());
++    `, 4);
++    for (const name of Object.keys(PATTERNS)) {
++      expect(`${name}: ${out[name]}`).toMatch(/: RangeError: Maximum call stack size exceeded @\d+$/);
++      expect(out[`${name}:after`]).toBe(3);
++    }
++    // twice the recursion depth of the default
++    const depth = (s: string) => Number(s.split('@')[1]);
++    expect(depth(out.plain)).toBeGreaterThan(1.8 * depth(out.defaultPlain));
++  });
++
++  it.skipIf(!existsSync(dist))('keeps a VM created deep in the stack within it', async () => {
++    const out = await runInWorker(`
++      const inst = QuickJSInstance.createSync({ wasm });
++      const a = inst.newVm({ maxStackSize: MAX_STACK_SIZE });
++      // at the bottom of a's recursion, create a VM that asks for the
++      // largest limit, and recurse in it
++      a.newFunction('deep', () => {
++        const c = inst.newVm({ maxStackSize: MAX_STACK_SIZE });
++        try {
++          return a.newString(c.evalCode(workerData.overflow.replace('CODE', workerData.patterns.plain)).consume((h) => h.toString()));
++        } finally {
++          c.dispose();
++        }
++      }).consume((f) => a.setProp(a.global, 'deep', f));
++      out.result = a.evalCode(\`
++        (() => {
++          let result;
++          function down() { try { down() } catch (e) { if (result === undefined) { try { result = deep() } catch (e2) {} } } }
++          down();
++          return result;
++        })()
++      \`).consume((h) => h.toString());
++      out.after = a.evalCode('1 + 2').consume((h) => h.toNumber());
++      const b = inst.newVm();
++      out.fresh = b.evalCode('40 + 2').consume((h) => h.toNumber());
++    `, 4);
++    expect(out.result).toMatch(/^RangeError: Maximum call stack size exceeded @\d+$/);
++    expect(out.after).toBe(3);
++    expect(out.fresh).toBe(42);
++  });
++});
