@@ -721,6 +721,12 @@ function test_syntax()
     assert_throws(SyntaxError, "({ m() => 1 })");
     assert_throws(SyntaxError, "({ get x() => 1 })");
     assert(eval("(async () => 1) instanceof Function"), true);
+
+    /* a computed property name is an AssignmentExpression */
+    assert_throws(SyntaxError, "({[1, 2]: 3})");
+    assert_throws(SyntaxError, "class C { [1, 2]() {} }");
+    assert_throws(SyntaxError, "var {[1, 2]: a} = {}");
+    assert(eval("({[(1, 2)]: 3})[2]"), 3);
 }
 
 /* optional chaining tests not present in test262 */
