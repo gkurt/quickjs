@@ -4075,12 +4075,14 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
             if (c == '0' && len == 2)
                 goto minus_zero;
         }
-        /* XXX: should test NaN, but the tests do not check it */
         if (!is_num(c)) {
             /* XXX: String should be normalized, therefore 8-bit only */
             const uint16_t nfinity16[7] = { 'n', 'f', 'i', 'n', 'i', 't', 'y' };
+            const uint16_t nan16[3] = { 'N', 'a', 'N' };
             if (!(c =='I' && (r_end - r) == 8 &&
-                  !memcmp(r + 1, nfinity16, sizeof(nfinity16))))
+                  !memcmp(r + 1, nfinity16, sizeof(nfinity16))) &&
+                !(c == 'N' && (r_end - r) == 3 &&
+                  !memcmp(r, nan16, sizeof(nan16))))
                 return JS_UNDEFINED;
         }
     } else {
@@ -4100,8 +4102,10 @@ static JSValue JS_AtomIsNumericIndex1(JSContext *ctx, JSAtom atom)
             }
         }
         if (!is_num(c)) {
+            /* "NaN" is canonical too; "-NaN" is not, as checked below */
             if (!(c =='I' && (r_end - r) == 8 &&
-                  !memcmp(r + 1, "nfinity", 7)))
+                  !memcmp(r + 1, "nfinity", 7)) &&
+                !(c == 'N' && (r_end - r) == 3 && !memcmp(r, "NaN", 3)))
                 return JS_UNDEFINED;
         }
     }
