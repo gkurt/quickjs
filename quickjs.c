@@ -18319,6 +18319,25 @@ static __exception int js_op_using_check(JSContext *ctx, JSValueConst val,
     return 0;
 }
 
+/* iter next catch_offset -> iter next catch_offset obj: call the next
+   method of a for await loop */
+static __exception int js_for_await_of_next(JSContext *ctx, JSValue *sp)
+{
+    JSValue obj, iter, next;
+
+    /* disable the catch offset: an exception of next(), of the promise
+       it returns or of the result does not close the iterator */
+    sp[-1] = JS_UNDEFINED;
+    iter = sp[-3];
+    next = sp[-2];
+    obj = JS_Call(ctx, next, iter, 0, NULL);
+    if (JS_IsException(obj))
+        return -1;
+    sp[0] = obj;
+    return 0;
+}
+
+/* catch_offset obj -> catch_offset value done */
 static __exception int js_iterator_get_value_done(JSContext *ctx, JSValue *sp)
 {
     JSValue obj, value;
@@ -18332,6 +18351,9 @@ static __exception int js_iterator_get_value_done(JSContext *ctx, JSValue *sp)
     if (JS_IsException(value))
         return -1;
     JS_FreeValue(ctx, obj);
+    /* put the catch offset back so that the exceptions of the loop
+       body close the iterator */
+    sp[-2] = JS_NewCatchOffset(ctx, 0);
     sp[-1] = value;
     sp[0] = js_bool(done);
     if (done) {
@@ -20561,6 +20583,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto exception;
             sp += 1;
             *sp++ = JS_NewCatchOffset(ctx, 0);
+            BREAK;
+        CASE(OP_for_await_of_next):
+            sf->cur_pc = pc;
+            if (js_for_await_of_next(ctx, sp))
+                goto exception;
+            sp++;
             BREAK;
         CASE(OP_iterator_get_value_done):
             sf->cur_pc = pc;
@@ -32804,10 +32832,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
         if (is_async) {
             /* call the next method */
             /* stack: iter_obj next catch_offset */
-            emit_op(s, OP_dup3);
-            emit_op(s, OP_drop);
-            emit_op(s, OP_call_method);
-            emit_u16(s, 0);
+            emit_op(s, OP_for_await_of_next);
             /* get the result of the promise */
             emit_op(s, OP_await);
             /* unwrap the value and done values */
@@ -43208,7 +43233,7 @@ typedef enum BCTagEnum {
     BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 33
+#define BC_VERSION 34
 
 typedef struct BCWriterState {
     JSContext *ctx;
@@ -61638,6 +61663,25 @@ static JSValue js_async_from_sync_iterator_unwrap_func_create(JSContext *ctx,
                                1, 0, 1, func_data);
 }
 
+/* the onRejected of the value of the result of next() or throw(): an
+   iterator which yields a rejected promise is closed */
+static JSValue js_async_from_sync_iterator_close_wrap(JSContext *ctx,
+                                                      JSValueConst this_val,
+                                                      int argc, JSValueConst *argv,
+                                                      int magic, JSValueConst *func_data)
+{
+    JS_Throw(ctx, js_dup(argv[0]));
+    JS_IteratorClose(ctx, func_data[0], true);
+    return JS_EXCEPTION;
+}
+
+static JSValue js_async_from_sync_iterator_close_wrap_func_create(JSContext *ctx,
+                                                                  JSValueConst sync_iter)
+{
+    return JS_NewCFunctionData(ctx, js_async_from_sync_iterator_close_wrap,
+                               1, 0, 1, &sync_iter);
+}
+
 /* AsyncIteratorPrototype */
 
 static const JSCFunctionListEntry js_async_iterator_proto_funcs[] = {
@@ -61777,6 +61821,9 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
                                                    1, vc(&value), 0);
         if (JS_IsException(value_wrapper_promise)) {
             JS_FreeValue(ctx, value);
+            /* closeOnRejection: next() and throw() close the iterator */
+            if (magic != GEN_MAGIC_RETURN && !done)
+                JS_IteratorClose(ctx, s->sync_iter, true);
             goto reject;
         }
 
@@ -61786,13 +61833,24 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
             JS_FreeValue(ctx, value_wrapper_promise);
             goto fail;
         }
+        if (done || magic == GEN_MAGIC_RETURN) {
+            resolve_reject[1] = JS_UNDEFINED;
+        } else {
+            resolve_reject[1] =
+                js_async_from_sync_iterator_close_wrap_func_create(ctx, s->sync_iter);
+            if (JS_IsException(resolve_reject[1])) {
+                JS_FreeValue(ctx, value_wrapper_promise);
+                JS_FreeValue(ctx, resolve_reject[0]);
+                goto fail;
+            }
+        }
         JS_FreeValue(ctx, value);
-        resolve_reject[1] = JS_UNDEFINED;
 
         res = perform_promise_then(ctx, value_wrapper_promise,
                                    vc(resolve_reject),
                                    vc(resolving_funcs));
         JS_FreeValue(ctx, resolve_reject[0]);
+        JS_FreeValue(ctx, resolve_reject[1]);
         JS_FreeValue(ctx, value_wrapper_promise);
         JS_FreeValue(ctx, resolving_funcs[0]);
         JS_FreeValue(ctx, resolving_funcs[1]);
