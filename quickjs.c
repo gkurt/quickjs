@@ -53974,8 +53974,18 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
         obj = js_create_from_ctor(ctx, ctor, JS_CLASS_REGEXP);
         if (JS_IsException(obj))
             goto fail;
-        JS_DefinePropertyValue(ctx, obj, JS_ATOM_lastIndex, prop.u.value,
-                               JS_PROP_WRITABLE);
+        p = JS_VALUE_GET_OBJ(obj);
+        re = &p->u.regexp;
+        re->pattern = JS_VALUE_GET_STRING(pattern);
+        re->bytecode = JS_VALUE_GET_STRING(bc);
+        /* lastIndex must be the first property, see
+           js_regexp_get_lastIndex() */
+        if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_lastIndex, prop.u.value,
+                                   JS_PROP_WRITABLE) < 0) {
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+        return obj;
     }
     p = JS_VALUE_GET_OBJ(obj);
     re = &p->u.regexp;
@@ -54384,19 +54394,52 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/* lastIndex is the first own property of a RegExp object: it is defined
+   first when the object is created and cannot be deleted (it is not
+   configurable). this_val must be of class JS_CLASS_REGEXP. */
+static force_inline int js_regexp_get_lastIndex(JSContext *ctx,
+                                                int64_t *plast_index,
+                                                JSValueConst this_val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(this_val);
+
+    if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT)) {
+        *plast_index = max_int(JS_VALUE_GET_INT(p->prop[0].u.value), 0);
+        return 0;
+    }
+    return JS_ToLengthFree(ctx, plast_index, js_dup(p->prop[0].u.value));
+}
+
+/* this_val must be of class JS_CLASS_REGEXP */
+static force_inline int js_regexp_set_lastIndex(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int last_index)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(this_val);
+
+    if (likely(JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT &&
+               (get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE))) {
+        p->prop[0].u.value = js_int32(last_index);
+        return 0;
+    }
+    return JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
+                          js_int32(last_index));
+}
+
 static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
     int rc, capture_count, alloc_count, shift, index, i, re_flags, prop_flags;
     JSRegExp *re = js_get_regexp(ctx, this_val, true);
     JSString *str;
-    JSValue t, ret, str_val, obj, val, groups;
+    JSValue t, ret, str_val, obj, groups;
     JSValue indices, indices_groups;
     uint8_t *re_bytecode;
     uint8_t **capture, *str_buf;
     int64_t last_index;
     const char *group_name_ptr;
     JSAtom group_name;
+    JSObject *p_obj;
     JSProperty props[4]; // length, index, input, groups, in that order
 
     if (!re)
@@ -54414,8 +54457,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
     group_name = JS_ATOM_NULL;
     capture = NULL;
 
-    val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
-    if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
+    if (js_regexp_get_lastIndex(ctx, &last_index, this_val))
         goto fail;
 
     re_bytecode = str8(re->bytecode);
@@ -54448,8 +54490,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
     if (rc != 1) {
         if (rc >= 0) {
             if (rc == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
-                if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                                   js_int32(0)) < 0)
+                if (js_regexp_set_lastIndex(ctx, this_val, 0) < 0)
                     goto fail;
             }
         } else {
@@ -54470,8 +54511,8 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
         }
     } else {
         if (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) {
-            if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                               js_int32((capture[1] - str_buf) >> shift)) < 0)
+            if (js_regexp_set_lastIndex(ctx, this_val,
+                                        (capture[1] - str_buf) >> shift) < 0)
                 goto fail;
         }
         group_name_ptr = lre_get_groupnames(re_bytecode);
@@ -54499,6 +54540,11 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
         obj = JS_NewObjectFromShape(ctx, js_dup_shape(ctx->regexp_result_shape),
                                     JS_CLASS_ARRAY, props);
         if (JS_IsException(obj))
+            goto fail;
+        /* the elements are stored directly in the fast array: its length
+           is already capture_count */
+        p_obj = JS_VALUE_GET_OBJ(obj);
+        if (expand_fast_array(ctx, p_obj, capture_count))
             goto fail;
         prop_flags = JS_PROP_C_W_E | JS_PROP_THROW;
         for(i = 0; i < capture_count; i++) {
@@ -54583,8 +54629,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                 group_name = JS_ATOM_NULL;
             }
 
-            if (JS_DefinePropertyValueUint32(ctx, obj, i, val, prop_flags) < 0)
-                goto fail;
+            p_obj->u.array.u.values[p_obj->u.array.count++] = val;
         }
 
         if (!JS_IsUndefined(indices)) {
