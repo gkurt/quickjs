@@ -42235,6 +42235,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                 }
             }
             if (s->token.val == TOK_ELLIPSIS) {
+                if (func_type == JS_PARSE_FUNC_SETTER)
+                    goto fail_accessor;
                 fd->has_simple_parameter_list = false;
                 rest = true;
                 if (next_token(s))
@@ -42359,6 +42361,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         }
         if ((func_type == JS_PARSE_FUNC_GETTER && fd->arg_count != 0) ||
             (func_type == JS_PARSE_FUNC_SETTER && fd->arg_count != 1)) {
+        fail_accessor:
             js_parse_error(s, "invalid number of arguments for getter or setter");
             goto fail;
         }

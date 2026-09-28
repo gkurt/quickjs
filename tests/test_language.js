@@ -708,6 +708,11 @@ function test_syntax()
     assert_throws(SyntaxError, "class C { #f; m() { #f in {} = 0 } }");
     assert(eval("var a, b; b = [a] = [3]; a"), 3);
     assert(eval("var a; 1 ? [a] = [4] : 0; a"), 4);
+
+    /* a setter has exactly one parameter, which is not a rest one */
+    assert_throws(SyntaxError, "({ set x(...a) {} })");
+    assert_throws(SyntaxError, "class C { set x(...a) {} }");
+    assert_throws(SyntaxError, "class C { static set x(...[a]) {} }");
 }
 
 /* optional chaining tests not present in test262 */
