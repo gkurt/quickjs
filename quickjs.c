@@ -63133,11 +63133,12 @@ static bool js_date_parse_otherstring(const uint8_t *sp,
                     *is_local = false;
                 }
             } else {
-                if (p - p_start > 2) {
+                /* a single year */
+                if (p - p_start > 2 && !has_year) {
                     fields[0] = val;
                     has_year = true;
                 } else
-                if (val < 1 || val > 31) {
+                if ((val < 1 || val > 31) && !has_year) {
                     fields[0] = val + (val < 100) * 1900 + (val < 50) * 100;
                     has_year = true;
                 } else {

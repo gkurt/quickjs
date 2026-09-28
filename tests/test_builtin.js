@@ -1118,6 +1118,9 @@ function test_date()
     assert(Date.parse("1997-03-08 11:19:10 -0700"), 857845150000);
     assert(Date.parse("1997-03-08 11:19-0700"), 857845140000);
     assert(Date.parse("1997-03-08 11:19:10+0530"), 857800150000);
+    /* a single year */
+    assert(Date.parse("Mar 8 1997 2020"), NaN);
+    assert(Date.parse("8 Mar 1997 50"), NaN);
     //assert(Date.parse("2000-01-01T00:00:00+00:30"), 946686600000);
     var d = new Date("2000T00:00");  // Jan 1st 2000, 0:00:00 local time
     assert(typeof d === 'object' && d.toString() != 'Invalid Date');
