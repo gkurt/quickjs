@@ -10812,6 +10812,22 @@ static force_inline bool js_typed_array_get_fast(JSObject *p, uint32_t idx,
     }
 }
 
+/* The element 'idx' < p->u.array.count of the fast array 'p' if it is
+   an arguments object, JS_UNINITIALIZED otherwise. Not inlined, to keep
+   the registers of the interpreter, and returned by value: the element
+   stays in registers */
+static no_inline JSValue js_get_arguments_element(JSObject *p, uint32_t idx)
+{
+    switch(p->class_id) {
+    case JS_CLASS_ARGUMENTS:
+        return js_dup(p->u.array.u.values[idx]);
+    case JS_CLASS_MAPPED_ARGUMENTS:
+        return js_dup(*p->u.array.u.var_refs[idx]->pvalue);
+    default:
+        return JS_UNINITIALIZED;
+    }
+}
+
 /* Store the number 'val' at the index 'idx' < p->u.array.count of the
    typed array 'p' when no conversion that could call user code is needed.
    Return false if the generic JS_SetPropertyValue() must be used */
@@ -21139,18 +21155,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSValue val;
 
-                /* fast path: regular/typed array element by int index.
-                   js_get_fast_array_element() returns its element in
-                   'elt' rather than 'val': a variable whose address
-                   escapes lives in memory, and the two 8 byte stores of
-                   the element followed by the 16 byte load that copies
-                   it to the stack defeat the store forwarding of the
-                   CPU, a stall of some ten cycles on every read */
+                /* fast path: element of an array, a typed array or an
+                   arguments object by int index. The element must stay
+                   in registers: a variable whose address escapes lives
+                   in memory, written with two 8 byte stores and read
+                   with a 16 byte load, which defeats the store
+                   forwarding of the CPU, a stall of some ten cycles on
+                   every read. The other objects go to
+                   JS_GetPropertyValue() */
                 if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT &&
                            JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
-                    JSValue elt;
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
                         val = js_dup(p->u.array.u.values[idx]);
@@ -21159,20 +21175,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp--;
                         BREAK;
                     }
-                    /* the typed arrays of numbers inline: their
-                       elements need no release */
-                    if (p->fast_array && idx < p->u.array.count &&
-                        js_typed_array_get_fast(p, idx, &val)) {
-                        JS_FreeValue(ctx, sp[-2]);
-                        sp[-2] = val;
-                        sp--;
-                        BREAK;
-                    }
-                    if (js_get_fast_array_element(ctx, p, idx, &elt)) {
-                        JS_FreeValue(ctx, sp[-2]);
-                        sp[-2] = elt;
-                        sp--;
-                        BREAK;
+                    if (p->fast_array && idx < p->u.array.count) {
+                        /* the typed arrays of numbers inline: their
+                           elements need no release */
+                        if (js_typed_array_get_fast(p, idx, &val) ||
+                            !JS_IsUninitialized(val =
+                                js_get_arguments_element(p, idx))) {
+                            JS_FreeValue(ctx, sp[-2]);
+                            sp[-2] = val;
+                            sp--;
+                            BREAK;
+                        }
                     }
                 }
                 sf->cur_pc = pc;
@@ -21194,19 +21207,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
-                    JSValue elt; /* not 'val': see OP_get_array_el */
+                    /* see OP_get_array_el */
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
                         sp[-1] = js_dup(p->u.array.u.values[idx]);
                         BREAK;
                     }
                     if (p->fast_array && idx < p->u.array.count &&
-                        js_typed_array_get_fast(p, idx, &val)) {
+                        (js_typed_array_get_fast(p, idx, &val) ||
+                         !JS_IsUninitialized(val =
+                             js_get_arguments_element(p, idx)))) {
                         sp[-1] = val;
-                        BREAK;
-                    }
-                    if (js_get_fast_array_element(ctx, p, idx, &elt)) {
-                        sp[-1] = elt;
                         BREAK;
                     }
                 }
