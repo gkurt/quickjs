@@ -47917,10 +47917,11 @@ static JSValue js_get_this(JSContext *ctx, JSValueConst this_val)
     return js_dup(this_val);
 }
 
-static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
-                                     JSValueConst len_val)
+/* The constructor ArraySpeciesCreate() calls for 'obj', or undefined
+   for the %Array% of the current realm */
+static JSValue JS_ArraySpeciesGetCtor(JSContext *ctx, JSValueConst obj)
 {
-    JSValue ctor, ret, species;
+    JSValue ctor, species;
     int res;
     JSContext *realm;
 
@@ -47928,7 +47929,7 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
     if (res < 0)
         return JS_EXCEPTION;
     if (!res)
-        return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
+        return JS_UNDEFINED;
     ctor = JS_GetProperty(ctx, obj, JS_ATOM_constructor);
     if (JS_IsException(ctor))
         return ctor;
@@ -47954,13 +47955,35 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
         if (JS_IsNull(ctor))
             ctor = JS_UNDEFINED;
     }
-    if (JS_IsUndefined(ctor)) {
-        return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
-    } else {
-        ret = JS_CallConstructor(ctx, ctor, 1, &len_val);
+    /* 'new Array(len)' of this realm is the same as js_array_constructor() */
+    if (JS_IsObject(ctor) && js_same_value(ctx, ctor, ctx->array_ctor)) {
         JS_FreeValue(ctx, ctor);
-        return ret;
+        ctor = JS_UNDEFINED;
     }
+    return ctor;
+}
+
+/* 'ctor' comes from JS_ArraySpeciesGetCtor() */
+static JSValue JS_ArrayCreateFromCtor(JSContext *ctx, JSValueConst ctor,
+                                      JSValueConst len_val)
+{
+    if (JS_IsUndefined(ctor))
+        return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
+    else
+        return JS_CallConstructor(ctx, ctor, 1, &len_val);
+}
+
+static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
+                                     JSValueConst len_val)
+{
+    JSValue ctor, ret;
+
+    ctor = JS_ArraySpeciesGetCtor(ctx, obj);
+    if (JS_IsException(ctor))
+        return ctor;
+    ret = JS_ArrayCreateFromCtor(ctx, ctor, len_val);
+    JS_FreeValue(ctx, ctor);
+    return ret;
 }
 
 static const JSCFunctionListEntry js_array_funcs[] = {
@@ -49086,7 +49109,7 @@ exception:
 static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv, int splice)
 {
-    JSValue obj, arr, val, len_val;
+    JSValue obj, arr, val, len_val, ctor;
     int64_t len, start, k, final, n, count, del_count, new_len;
     int kPresent;
     JSValue *arrp;
@@ -49126,39 +49149,53 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
         }
         count = max_int64(final - start, 0);
     }
-    len_val = js_int64(count);
-    arr = JS_ArraySpeciesCreate(ctx, obj, len_val);
-    JS_FreeValue(ctx, len_val);
-    if (JS_IsException(arr))
+    ctor = JS_ArraySpeciesGetCtor(ctx, obj);
+    if (JS_IsException(ctor))
         goto exception;
 
-    k = start;
     final = start + count;
-    n = 0;
-    /* The fast array test on arr ensures that
-       JS_CreateDataPropertyUint32() won't modify obj in case arr is
-       an exotic object */
-    /* Special case fast arrays */
-    if (js_get_fast_array(ctx, obj, &arrp, &count32) &&
-        js_is_fast_array(ctx, arr)) {
-        /* XXX: should share code with fast array constructor */
-        for (; k < final && k < count32; k++, n++) {
-            if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
-                goto exception;
-        }
-    }
-    /* Copy the remaining elements if any (handle case of inherited properties) */
-    for (; k < final; k++, n++) {
-        kPresent = JS_TryGetPropertyInt64(ctx, obj, k, &val);
-        if (kPresent < 0)
+    /* the getters of 'constructor' and Symbol.species may have changed
+       obj: its elements are looked at only now */
+    if (JS_IsUndefined(ctor) && count <= INT32_MAX &&
+        js_get_fast_array(ctx, obj, &arrp, &count32) && final <= count32) {
+        /* fast case: a plain array of the elements, nothing to observe */
+        arr = js_create_array(ctx, count, count > 0 ? vc(arrp + start) : NULL);
+        if (JS_IsException(arr))
             goto exception;
-        if (kPresent) {
-            if (JS_CreateDataPropertyUint32(ctx, arr, n, val, JS_PROP_THROW) < 0)
-                goto exception;
+    } else {
+        len_val = js_int64(count);
+        arr = JS_ArrayCreateFromCtor(ctx, ctor, len_val);
+        JS_FreeValue(ctx, len_val);
+        JS_FreeValue(ctx, ctor);
+        if (JS_IsException(arr))
+            goto exception;
+
+        k = start;
+        n = 0;
+        /* The fast array test on arr ensures that
+           JS_CreateDataPropertyUint32() won't modify obj in case arr is
+           an exotic object */
+        /* Special case fast arrays */
+        if (js_get_fast_array(ctx, obj, &arrp, &count32) &&
+            js_is_fast_array(ctx, arr)) {
+            for (; k < final && k < count32; k++, n++) {
+                if (JS_CreateDataPropertyUint32Const(ctx, arr, n, arrp[k], JS_PROP_THROW) < 0)
+                    goto exception;
+            }
         }
+        /* Copy the remaining elements if any (handle case of inherited properties) */
+        for (; k < final; k++, n++) {
+            kPresent = JS_TryGetPropertyInt64(ctx, obj, k, &val);
+            if (kPresent < 0)
+                goto exception;
+            if (kPresent) {
+                if (JS_CreateDataPropertyUint32(ctx, arr, n, val, JS_PROP_THROW) < 0)
+                    goto exception;
+            }
+        }
+        if (JS_SetProperty(ctx, arr, JS_ATOM_length, js_int64(n)) < 0)
+            goto exception;
     }
-    if (JS_SetProperty(ctx, arr, JS_ATOM_length, js_int64(n)) < 0)
-        goto exception;
 
     if (splice) {
         int ret = js_array_splice_fast(ctx, obj, len, start, del_count,
