@@ -2301,6 +2301,24 @@ static inline void js_dbuf_init(JSContext *ctx, DynBuf *s)
     dbuf_init2(s, ctx, js_dbuf_realloc);
 }
 
+/* The bytecode generators assume that bytecode offsets fit in a signed
+   32 bit integer: the bytecode of a function is limited to 1 GB, which
+   leaves some slack against overflows. */
+static void *js_realloc_bytecode(void *opaque, void *ptr, size_t size)
+{
+    JSContext *ctx = opaque;
+    if (size > INT32_MAX / 2) {
+        JS_ThrowSyntaxError(ctx, "function too large");
+        return NULL;
+    }
+    return js_realloc(ctx, ptr, size);
+}
+
+static inline void js_dbuf_bytecode_init(JSContext *ctx, DynBuf *s)
+{
+    dbuf_init2(s, ctx, js_realloc_bytecode);
+}
+
 static inline int is_digit(int c) {
     return c >= '0' && c <= '9';
 }
@@ -37196,7 +37214,7 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
 
     fd->is_eval = is_eval;
     fd->is_func_expr = is_func_expr;
-    js_dbuf_init(ctx, &fd->byte_code);
+    js_dbuf_bytecode_init(ctx, &fd->byte_code);
     fd->last_opcode_pos = -1;
     fd->func_name = JS_ATOM_NULL;
     fd->var_object_idx = -1;
@@ -39365,10 +39383,17 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
         JS_ThrowSyntaxError(ctx, "too many scopes in function");
         return -1;
     }
+    /* the bytecode is truncated: js_realloc_bytecode() has thrown an
+       exception */
+    if (dbuf_error(&s->byte_code)) {
+        if (!JS_HasException(ctx))
+            JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
 
     cc.bc_buf = bc_buf = s->byte_code.buf;
     cc.bc_len = bc_len = s->byte_code.size;
-    js_dbuf_init(ctx, &bc_out);
+    js_dbuf_bytecode_init(ctx, &bc_out);
 
     /* first pass for runtime checks (must be done before the
        variables are created) */
@@ -39756,7 +39781,9 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
     dbuf_free(&s->byte_code);
     s->byte_code = bc_out;
     if (dbuf_error(&s->byte_code)) {
-        JS_ThrowOutOfMemory(ctx);
+        /* js_realloc_bytecode() has thrown an exception */
+        if (!JS_HasException(ctx))
+            JS_ThrowOutOfMemory(ctx);
         return -1;
     }
     return 0;
@@ -40251,7 +40278,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 
     cc.bc_buf = bc_buf = s->byte_code.buf;
     cc.bc_len = bc_len = s->byte_code.size;
-    js_dbuf_init(ctx, &bc_out);
+    js_dbuf_bytecode_init(ctx, &bc_out);
 
     if (s->jump_size) {
         s->jump_slots = js_mallocz(s->ctx, sizeof(*s->jump_slots) * s->jump_size);
@@ -41191,7 +41218,9 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     s->byte_code = bc_out;
     s->use_short_opcodes = true;
     if (dbuf_error(&s->byte_code)) {
-        JS_ThrowOutOfMemory(ctx);
+        /* js_realloc_bytecode() has thrown an exception */
+        if (!JS_HasException(ctx))
+            JS_ThrowOutOfMemory(ctx);
         return -1;
     }
     return 0;
