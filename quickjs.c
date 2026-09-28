@@ -21450,14 +21450,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *pv = js_float64(d1 + d2);
                     JS_X87_FPCW_RESTORE(fpcw);
                     sp--;
-                } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
+                } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING &&
+                           JS_VALUE_GET_TAG(sp[-1]) != JS_TAG_OBJECT) {
+                    /* a primitive right operand converts to a string
+                       without running JS code, so the local still
+                       holds the string read before it. An object goes
+                       to js_add_slow() below: its conversion may
+                       reassign the local, and the sum must use the
+                       value the local had before it. */
                     JSValue op1;
                     op1 = sp[-1];
                     sp--;
                     sf->cur_pc = pc;
-                    op1 = JS_ToPrimitiveFree(ctx, op1, HINT_NONE);
-                    if (JS_IsException(op1))
-                        goto exception;
                     if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING &&
                         JS_VALUE_GET_STRING(op1)->len <= JS_STRING_ROPE_SHORT_LEN &&
                         JS_VALUE_GET_STRING(*pv)->len <= JS_STRING_ROPE_SHORT2_LEN) {

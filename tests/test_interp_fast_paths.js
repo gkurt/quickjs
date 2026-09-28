@@ -74,6 +74,27 @@ same(r[7], 3n);
 same(r[8], 2.5);
 assertThrows(TypeError, () => { var b = 1.5; b += 1n; });
 
+// 's += x' on a local string whose conversion of x reassigns the local:
+// the sum uses the value the local had before x was converted
+function addReassign(v, method) {
+    let s = "a";
+    const o = { [method]() { s = v; return "b"; } };
+    s += o;
+    return s;
+}
+for (const method of ["toString", "valueOf", Symbol.toPrimitive]) {
+    for (const v of [12345, 1.5, true, null, undefined, 10n, 2n ** 200n,
+                     Symbol("desc"), {}, "zz", "z".repeat(100)])
+        same(addReassign(v, method), "ab", String(method));
+}
+function addReassignLoop() {
+    let s = "";
+    for (let i = 0; i < 100; i++)
+        s += { toString() { s = i; return "x"; } };
+    return s;
+}
+same(addReassignLoop(), "x".repeat(100));
+
 // stores into typed arrays
 var i8 = new Int8Array(4);
 i8[0] = 200; i8[1] = -129; i8[2] = 1.9; i8[3] = "5";
