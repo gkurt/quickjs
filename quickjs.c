@@ -62916,9 +62916,14 @@ static bool string_get_tzoffset(const uint8_t *sp, int *pp, int *tzp, bool stric
             hh = hh / 100;
         } else {
             mm = 0;
-            if (string_skip_char(sp, &p, ':')  /* optional separator */
-            &&  !string_get_digits(sp, &p, &mm, 2, 2))
-                return false;
+            if (string_skip_char(sp, &p, ':')) {
+                /* optional separator */
+                if (!string_get_digits(sp, &p, &mm, 2, 2))
+                    return false;
+            } else {
+                if (strict)
+                    return false; /* [+-]HH is not accepted in strict mode */
+            }
         }
         if (hh > 23 || mm > 59)
             return false;
@@ -63118,9 +63123,15 @@ static bool js_date_parse_otherstring(const uint8_t *sp,
                         return false;
                     string_get_milliseconds(sp, &p, &fields[6]);
                 } else
-                if (sp[p] != '\0' && sp[p] != ' ')
+                if (sp[p] != '\0' && sp[p] != ' ' &&
+                    sp[p] != '+' && sp[p] != '-')
                     return false;
                 has_time = true;
+                /* a time zone offset right after the time */
+                if ((sp[p] == '+' || sp[p] == '-') &&
+                    string_get_tzoffset(sp, &p, &fields[8], false)) {
+                    *is_local = false;
+                }
             } else {
                 if (p - p_start > 2) {
                     fields[0] = val;
