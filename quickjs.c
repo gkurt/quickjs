@@ -32728,6 +32728,22 @@ static void set_eval_ret_undefined(JSParseState *s)
     }
 }
 
+/* A branch of an if statement. A function declaration there (Annex
+   B.3.4, sloppy mode) is in a block of its own, for `let f; if (1)
+   function f() {}`; other statements need no scope, and pushing one for
+   every if statement ran out of the 65536 scopes of a function. */
+static __exception int js_parse_if_branch(JSParseState *s, int mask)
+{
+    int ret;
+
+    if (!(mask & DECL_MASK_FUNC) || s->token.val != TOK_FUNCTION)
+        return js_parse_statement_or_decl(s, mask);
+    push_scope(s);
+    ret = js_parse_statement_or_decl(s, mask);
+    pop_scope(s);
+    return ret;
+}
+
 static __exception int js_parse_statement_or_decl(JSParseState *s,
                                                   int decl_mask)
 {
@@ -32881,8 +32897,6 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             int label1, label2, mask;
             if (next_token(s))
                 goto fail;
-            /* create a new scope for `let f;if(1) function f(){}` */
-            push_scope(s);
             set_eval_ret_undefined(s);
             if (js_parse_expr_paren(s))
                 goto fail;
@@ -32892,7 +32906,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
             else
                 mask = DECL_MASK_FUNC; /* Annex B.3.4 */
 
-            if (js_parse_statement_or_decl(s, mask))
+            if (js_parse_if_branch(s, mask))
                 goto fail;
 
             if (s->token.val == TOK_ELSE) {
@@ -32901,13 +32915,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                     goto fail;
 
                 emit_label(s, label1);
-                if (js_parse_statement_or_decl(s, mask))
+                if (js_parse_if_branch(s, mask))
                     goto fail;
 
                 label1 = label2;
             }
             emit_label(s, label1);
-            pop_scope(s);
         }
         break;
     case TOK_WHILE:
@@ -39340,6 +39353,12 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
     DynBuf bc_out;
     CodeContext cc;
     int scope;
+
+    /* the scope operands of the phase 1 opcodes are 16 bits */
+    if (s->scope_count > 65536) {
+        JS_ThrowSyntaxError(ctx, "too many scopes in function");
+        return -1;
+    }
 
     cc.bc_buf = bc_buf = s->byte_code.buf;
     cc.bc_len = bc_len = s->byte_code.size;
