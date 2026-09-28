@@ -16,40 +16,77 @@ function test_computed_store_order()
     });
     const val = (v) => { log.push("val"); return v; };
 
-    // object base: the key is converted before the value is evaluated
+    // the key is converted after the value is evaluated (PutValue)
     let o = {};
     o[key("a", "p")] = val(1);
-    assert(log.join(), "key a,val");
+    assert(log.join(), "val,key a");
     assert(o.p, 1);
 
-    // null and undefined base: the value first, then the key, then the error
+    // null and undefined base: the value, then the error of ToObject(),
+    // without converting the key
     for (const base of [null, undefined]) {
         log = [];
         let b = base;
         assertThrows(TypeError, () => { b[key("b", "p")] = val(2); });
-        assert(log.join(), "val,key b");
+        assert(log.join(), "val");
     }
 
-    // the conversion of the key throws: with an object base the value
-    // is not evaluated, with a null base it is
+    // the conversion of the key throws: after the value is evaluated,
+    // and not with a null base
     const bad = { toString() { throw new RangeError("key"); } };
     log = [];
     assertThrows(RangeError, () => { o[bad] = val(3); });
-    assert(log.join(), "");
+    assert(log.join(), "val");
     log = [];
     let n = null;
-    assertThrows(RangeError, () => { n[bad] = val(3); });
+    assertThrows(TypeError, () => { n[bad] = val(3); });
     assert(log.join(), "val");
 
-    // the conversion of the key modifies the variable stored
+    // the variable stored is read before the key is converted
     let v = 1;
     const k = { toString() { v = 2; return "q"; } };
     o[k] = v;
-    assert(o.q, 2);
+    assert(o.q, 1);
+    assert(v, 2);
     let w = 1;
     const k2 = { toString() { w = 3; return "r"; } };
     (function () { o[k2] = w; })();
-    assert(o.r, 3);
+    assert(o.r, 1);
+
+    // compound assignments: ToObject(), then the key is converted once,
+    // before the value is evaluated
+    log = [];
+    o.t = 1;
+    o[key("c", "t")] += val(2);
+    assert(log.join(), "key c,val");
+    assert(o.t, 3);
+    log = [];
+    o[key("d", "t")]++;
+    assert(log.join(), "key d");
+    assert(o.t, 4);
+    log = [];
+    o[key("e", "t")] ||= val(5);
+    assert(log.join(), "key e");
+    log = [];
+    o[key("f", "u")] ??= val(6);
+    assert(log.join(), "key f,val");
+    assert(o.u, 6);
+    for (const base of [null, undefined]) {
+        log = [];
+        let b = base;
+        assertThrows(TypeError, () => { b[key("g", "t")] += val(7); });
+        assertThrows(TypeError, () => { b[key("h", "t")]++; });
+        assert(log.join(), "");
+    }
+    const arr2 = [1, 2, 3];
+    arr2[1] += 10;
+    arr2[2]++;
+    assert(arr2.join(), "1,12,4");
+    const ta2 = new Float64Array([1.5, 2]);
+    ta2[0] *= 2;
+    assert(ta2[0], 3);
+    const str = "abc";
+    assert(str[1] + str[key("i", "length")], "b3");
 
     // constant values and literal keys
     const k3 = { toString() { log.push("k3"); return "s"; } };

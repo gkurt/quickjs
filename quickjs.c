@@ -11920,8 +11920,25 @@ int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         return true;
     } else {
         JSAtom atom;
-        int ret;
+        int ret, tag;
     slow_path:
+        tag = JS_VALUE_GET_TAG(this_obj);
+        if (unlikely(tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)) {
+            /* ToObject() is done before ToPropertyKey(): the key is
+               only named in the message, without side effects */
+            atom = JS_ValueToAtomInternal(ctx, prop,
+                                          JS_TO_STRING_NO_SIDE_EFFECTS);
+            JS_FreeValue(ctx, prop);
+            JS_FreeValue(ctx, val);
+            if (unlikely(atom == JS_ATOM_NULL))
+                return -1;
+            if (tag == JS_TAG_NULL)
+                JS_ThrowTypeErrorAtom(ctx, "cannot set property '%s' of null", atom);
+            else
+                JS_ThrowTypeErrorAtom(ctx, "cannot set property '%s' of undefined", atom);
+            JS_FreeAtom(ctx, atom);
+            return -1;
+        }
         atom = JS_ValueToAtom(ctx, prop);
         JS_FreeValue(ctx, prop);
         if (unlikely(atom == JS_ATOM_NULL)) {
@@ -21241,6 +21258,57 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        CASE(OP_get_array_el3):
+            {
+                /* obj prop -> obj prop1 value: the reference of
+                   'obj[prop] op= v', whose key is converted once, after
+                   ToObject(obj), and stored as prop1 */
+                JSValue val;
+
+                if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT &&
+                           JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
+                    JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
+                    uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
+                    if (likely(p->class_id == JS_CLASS_ARRAY &&
+                               idx < p->u.array.count)) {
+                        *sp++ = js_dup(p->u.array.u.values[idx]);
+                        BREAK;
+                    }
+                    if (p->fast_array && idx < p->u.array.count &&
+                        js_typed_array_get_fast(p, idx, &val)) {
+                        *sp++ = val;
+                        BREAK;
+                    }
+                    if (js_get_fast_array_element(ctx, p, idx, &val)) {
+                        *sp++ = val;
+                        BREAK;
+                    }
+                }
+                sf->cur_pc = pc;
+                switch (JS_VALUE_GET_TAG(sp[-1])) {
+                case JS_TAG_INT:
+                case JS_TAG_STRING:
+                case JS_TAG_SYMBOL:
+                    break;
+                default:
+                    /* JS_GetPropertyValue() throws for a null or
+                       undefined obj without converting the key */
+                    if (JS_IsUndefined(sp[-2]) || JS_IsNull(sp[-2]))
+                        break;
+                    ret_val = JS_ToPropertyKey(ctx, sp[-1]);
+                    if (JS_IsException(ret_val))
+                        goto exception;
+                    JS_FreeValue(ctx, sp[-1]);
+                    sp[-1] = ret_val;
+                    break;
+                }
+                val = JS_GetPropertyValue(ctx, sp[-2], js_dup(sp[-1]));
+                if (unlikely(JS_IsException(val)))
+                    goto exception;
+                *sp++ = val;
+            }
+            BREAK;
+
         CASE(OP_get_ref_value):
             {
                 JSValue val;
@@ -22245,48 +22313,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
-        CASE(OP_to_propkey_cond):
-            /* obj key -> obj key: the key of 'obj[key] = val' is
-               converted before val unless obj is null or undefined */
-            switch (JS_VALUE_GET_TAG(sp[-1])) {
-            case JS_TAG_INT:
-            case JS_TAG_STRING:
-            case JS_TAG_SYMBOL:
-                break;
-            default:
-                if (JS_IsUndefined(sp[-2]) || JS_IsNull(sp[-2]))
-                    break;
-                sf->cur_pc = pc;
-                ret_val = JS_ToPropertyKey(ctx, sp[-1]);
-                if (JS_IsException(ret_val))
-                    goto exception;
-                JS_FreeValue(ctx, sp[-1]);
-                sp[-1] = ret_val;
-                break;
-            }
-            BREAK;
-
-        CASE(OP_to_propkey2):
-            /* must be tested first */
-            if (unlikely(JS_IsUndefined(sp[-2]) || JS_IsNull(sp[-2]))) {
-                JS_ThrowTypeError(ctx, "value has no property");
-                goto exception;
-            }
-            switch (JS_VALUE_GET_TAG(sp[-1])) {
-            case JS_TAG_INT:
-            case JS_TAG_STRING:
-            case JS_TAG_SYMBOL:
-                break;
-            default:
-                sf->cur_pc = pc;
-                ret_val = JS_ToPropertyKey(ctx, sp[-1]);
-                if (JS_IsException(ret_val))
-                    goto exception;
-                JS_FreeValue(ctx, sp[-1]);
-                sp[-1] = ret_val;
-                break;
-            }
-            BREAK;
         CASE(OP_with_get_var):
         CASE(OP_with_put_var):
         CASE(OP_with_delete_var):
@@ -29574,10 +29600,7 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
             emit_u16(s, scope);
             break;
         case OP_get_array_el:
-            /* XXX: replace by a single opcode ? */
-            emit_op(s, OP_to_propkey2);
-            emit_op(s, OP_dup2);
-            emit_op(s, OP_get_array_el);
+            emit_op(s, OP_get_array_el3);
             break;
         case OP_get_super_value:
             emit_op(s, OP_to_propkey);
@@ -29602,11 +29625,10 @@ static __exception int get_lvalue(JSParseState *s, int *popcode, int *pscope,
                 opcode = OP_get_ref_value;
             }
             break;
-        case OP_get_array_el:
-            emit_op(s, OP_to_propkey2);
-            break;
-        case OP_get_super_value:
-            emit_op(s, OP_to_propkey);
+        default:
+            /* the key of 'obj[key] = val' is converted by
+               OP_put_array_el or OP_put_super_value, after val is
+               evaluated */
             break;
         }
     }
@@ -30024,7 +30046,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     continue;
                 }
                 if (prop_name == JS_ATOM_NULL) {
-                    emit_op(s, OP_to_propkey2);
+                    emit_op(s, OP_to_propkey);
                     if (has_ellipsis) {
                         /* define the property in excludeList */
                         emit_op(s, OP_perm3);
@@ -31823,19 +31845,6 @@ static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags)
             return -1;
         if (get_lvalue(s, &opcode, &scope, &name, &label, NULL, (op != '='), op) < 0)
             return -1;
-
-        // comply with rather obtuse evaluation order of computed properties:
-        // obj[key]=val evaluates val->obj->key when obj is null/undefined
-        // but key->obj->val when an object. OP_to_propkey_cond converts
-        // the key before val when obj is an object; otherwise
-        // OP_put_array_el converts it after val, then throws.
-        if (op == '=' && opcode == OP_get_array_el) {
-            JSFunctionDef *fd = s->cur_func;
-            assert(OP_to_propkey2 == fd->byte_code.buf[fd->last_opcode_pos]);
-            fd->byte_code.size = fd->last_opcode_pos;
-            fd->last_opcode_pos = -1;
-            emit_op(s, OP_to_propkey_cond);
-        }
 
         if (js_parse_assign_expr2(s, parse_flags)) {
             JS_FreeAtom(s->ctx, name);
@@ -39065,15 +39074,6 @@ typedef struct CodeContext {
 #define M3(op1, op2, op3)       ((uint32_t)(op1) | ((uint32_t)(op2) << 8) | ((uint32_t)(op3) << 16))
 #define M4(op1, op2, op3, op4)  ((uint32_t)(op1) | ((uint32_t)(op2) << 8) | ((uint32_t)(op3) << 16) | ((uint32_t)(op4) << 24))
 
-/* the literal at 'pos_next' - 1 is the key of 'obj[key] = val': the
-   OP_to_propkey_cond right after it has no effect */
-static void skip_to_propkey_cond(CodeContext *s, const uint8_t *bc_buf,
-                                 int *ppos_next)
-{
-    if (*ppos_next < s->bc_len && bc_buf[*ppos_next] == OP_to_propkey_cond)
-        *ppos_next += 1;
-}
-
 static bool code_match(CodeContext *s, int pos, ...)
 {
     const uint8_t *tab = s->bc_buf;
@@ -40689,8 +40689,6 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             goto no_change;
 
         case OP_push_i32:
-            /* a literal key is already a property key */
-            skip_to_propkey_cond(&cc, bc_buf, &pos_next);
             val = get_i32(bc_buf + pos + 1);
             /* transform i32(0) or -> to_int32, the 'x | 0' of asm.js
                style code */
@@ -40759,10 +40757,6 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_fclosure:
             {
                 int idx = get_u32(bc_buf + pos + 1);
-                /* a literal key (number, string, bigint) needs no
-                   conversion with a visible effect */
-                if (op == OP_push_const)
-                    skip_to_propkey_cond(&cc, bc_buf, &pos_next);
                 if (idx < 256) {
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     dbuf_putc(&bc_out, OP_push_const8 + op - OP_push_const);
@@ -40796,7 +40790,6 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_push_atom_value:
             {
                 JSAtom atom = get_u32(bc_buf + pos + 1);
-                skip_to_propkey_cond(&cc, bc_buf, &pos_next);
                 /* remove push/drop pairs generated by the parser */
                 if (code_match(&cc, pos_next, OP_drop, -1)) {
                     JS_FreeAtom(ctx, atom);
@@ -40814,19 +40807,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             }
             goto no_change;
 
-        case OP_to_propkey_cond:
-            /* the key of 'obj[key] = val' may be converted after val
-               when val is a constant. Not after the load of a
-               variable: the conversion of the key may modify it */
-            if (code_match(&cc, pos_next, M3(OP_push_i32, OP_push_const, OP_push_atom_value), OP_put_array_el, -1)
-            ||  code_match(&cc, pos_next, M4(OP_undefined, OP_null, OP_push_true, OP_push_false), OP_put_array_el, -1)) {
-                break;
-            }
-            goto no_change;
-
         case OP_to_propkey:
-        case OP_to_propkey2:
-            /* remove redundant to_propkey/to_propkey2 opcodes when storing simple data */
+            /* remove redundant to_propkey opcodes when storing simple data */
             if (code_match(&cc, pos_next, M3(OP_get_loc, OP_get_arg, OP_get_var_ref), -1, OP_put_array_el, -1)
             ||  code_match(&cc, pos_next, M3(OP_push_i32, OP_push_const, OP_push_atom_value), OP_put_array_el, -1)
             ||  code_match(&cc, pos_next, M4(OP_undefined, OP_null, OP_push_true, OP_push_false), OP_put_array_el, -1)) {
@@ -43182,7 +43164,7 @@ typedef enum BCTagEnum {
     BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 32
+#define BC_VERSION 33
 
 typedef struct BCWriterState {
     JSContext *ctx;
