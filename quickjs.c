@@ -30616,6 +30616,15 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             if (next_token(s))
                 return -1;
             has_optional_chain = true;
+            if (ts_enabled(s) && s->token.val == '<' && accept_lparen) {
+                /* optional call with type arguments: f?.<T>(x) */
+                int ret = ts_try_type_args(s);
+                if (ret < 0)
+                    return -1;
+                if (!ret || s->token.val != '(')
+                    return js_parse_error(s, "expecting '(' after type arguments of an optional call");
+                goto parse_func_call;
+            }
             if (s->token.val == '(' && accept_lparen) {
                 goto parse_func_call;
             } else if (s->token.val == '[') {

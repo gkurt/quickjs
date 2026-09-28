@@ -591,6 +591,8 @@ assert(expr, 3);
 let chain = { a: { b: [1] } };
 assert(chain!.a!.b![0]!, 1);
 assert(chain?.a?.b?.[0]!, 1);
+assert(objm.f1?.<number>(8), 8);
+assert((objm as any).nope?.<number>(1), undefined);
 assert((chain as { a: { b: number[] } }).a.b.length, 1);
 assert((chain satisfies object) === chain, true);
 assert(typeof (n as unknown), "number");
