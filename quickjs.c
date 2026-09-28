@@ -44367,8 +44367,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     uint16_t v16;
     uint8_t v8;
     int idx, i, local_count, has_debug_info;
-    int function_size, cpool_offset, byte_code_offset;
+    int cpool_offset, byte_code_offset;
     int closure_var_offset, vardefs_offset;
+    uint64_t function_size;
 
     memset(&bc, 0, sizeof(bc));
     //bc.gc_header.mark = 0;
@@ -44411,15 +44412,22 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     if (bc_get_leb128_int(s, &local_count))
         goto fail;
 
+    /* the counts are unsigned 32 bit values: the sizes cannot
+       overflow 64 bits */
     function_size = sizeof(*b);
     cpool_offset = (function_size + 7) & ~7;
-    function_size = cpool_offset + bc.cpool_count * sizeof(*bc.cpool);
+    function_size = cpool_offset +
+        (uint64_t)(uint32_t)bc.cpool_count * sizeof(*bc.cpool);
     vardefs_offset = function_size;
-    function_size += local_count * sizeof(*bc.vardefs);
+    function_size += (uint64_t)(uint32_t)local_count * sizeof(*bc.vardefs);
     closure_var_offset = function_size;
-    function_size += bc.closure_var_count * sizeof(*bc.closure_var);
+    function_size += (uint64_t)bc.closure_var_count * sizeof(*bc.closure_var);
     byte_code_offset = function_size;
-    function_size += bc.byte_code_len;
+    function_size += (uint32_t)bc.byte_code_len;
+    if (function_size > INT32_MAX) {
+        JS_ThrowOutOfMemory(ctx);
+        goto fail;
+    }
 
     b = js_mallocz(ctx, function_size);
     if (!b)
