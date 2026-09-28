@@ -156,8 +156,9 @@ export function runSandboxed(code, input, { timeoutMs = 100, memoryLimit = 16 <<
 }
 ```
 
-The engine polls the interrupt handler on backward jumps (loops), so it is
-cheap; straight line code between two polls always runs to completion. Deep
+The engine polls the interrupt handler on backward jumps (loops) and on
+function calls, so it is cheap; straight line code between two polls, which
+is bounded by the length of one function, always runs to completion. Deep
 recursion stops at `maxStackSize` with a `RangeError` (see [Stack](#stack)).
 A script cannot reach another VM of the instance: they share memory at the
 WASM level only, not values. They are not isolated from each other the way
