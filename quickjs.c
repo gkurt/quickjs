@@ -52222,41 +52222,46 @@ static JSValue js_string_match(JSContext *ctx, JSValueConst this_val,
     return result;
 }
 
-static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val,
-                                           int argc, JSValueConst *argv)
+/* GetSubstitution(matched, str, position, captures, namedCaptures, rep):
+   append the replacement of the match at 'position' in 'sp' to 'b'. If
+   'captures' is not NULL, the match and its captures are these positions
+   in 'sp' of lre_exec() ('captures_len' of them) and 'matched',
+   'captures_val' and 'namedCaptures' are not used (the latter must be
+   undefined). Otherwise 'captures_val' is undefined or an array of the
+   captures. */
+static int js_string_GetSubstitution(JSContext *ctx, StringBuffer *b,
+                                     JSValueConst matched, JSString *sp,
+                                     uint32_t position,
+                                     JSValueConst captures_val,
+                                     JSValueConst namedCaptures,
+                                     JSValueConst rep,
+                                     uint8_t **captures,
+                                     uint32_t captures_len)
 {
-    // GetSubstitution(matched, str, position, captures, namedCaptures, rep)
-    JSValueConst matched, str, captures, namedCaptures, rep;
     JSValue capture, name, s;
-    uint32_t position, len, matched_len, captures_len;
-    int i, j, j0, k, k1;
+    uint32_t len, matched_len;
+    int i, j, j0, k, k1, shift;
     int c, c1;
-    StringBuffer b_s, *b = &b_s;
-    JSString *sp, *rp;
+    JSString *rp;
 
-    matched = argv[0];
-    str = argv[1];
-    captures = argv[3];
-    namedCaptures = argv[4];
-    rep = argv[5];
-
-    if (!JS_IsString(rep) || !JS_IsString(str))
-        return JS_ThrowTypeError(ctx, "not a string");
-
-    sp = JS_VALUE_GET_STRING(str);
-    rp = JS_VALUE_GET_STRING(rep);
-
-    string_buffer_init(ctx, b, 0);
-
-    captures_len = 0;
-    if (!JS_IsUndefined(captures)) {
-        if (js_get_length32(ctx, &captures_len, captures))
-            goto exception;
+    if (!JS_IsString(rep)) {
+        JS_ThrowTypeError(ctx, "not a string");
+        return -1;
     }
-    if (js_get_length32(ctx, &matched_len, matched))
-        goto exception;
-    if (JS_ToUint32(ctx, &position, argv[2]) < 0)
-        goto exception;
+    rp = JS_VALUE_GET_STRING(rep);
+    shift = sp->is_wide_char;
+
+    if (captures) {
+        matched_len = (captures[1] - captures[0]) >> shift;
+    } else {
+        captures_len = 0;
+        if (!JS_IsUndefined(captures_val)) {
+            if (js_get_length32(ctx, &captures_len, captures_val))
+                return -1;
+        }
+        if (js_get_length32(ctx, &matched_len, matched))
+            return -1;
+    }
 
     len = rp->len;
     i = 0;
@@ -52270,8 +52275,12 @@ static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val
         if (c == '$') {
             string_buffer_putc8(b, '$');
         } else if (c == '&') {
-            if (string_buffer_concat_value(b, matched))
-                goto exception;
+            if (captures) {
+                string_buffer_concat(b, sp, position, position + matched_len);
+            } else {
+                if (string_buffer_concat_value(b, matched))
+                    return -1;
+            }
         } else if (c == '`') {
             string_buffer_concat(b, sp, 0, position);
         } else if (c == '\'') {
@@ -52292,12 +52301,21 @@ static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val
                 }
             }
             if (k >= 1 && k < captures_len) {
-                s = JS_GetPropertyInt64(ctx, captures, k);
-                if (JS_IsException(s))
-                    goto exception;
-                if (!JS_IsUndefined(s)) {
-                    if (string_buffer_concat_value_free(b, s))
-                        goto exception;
+                if (captures) {
+                    /* an unmatched capture is replaced by nothing */
+                    if (captures[2 * k] && captures[2 * k + 1]) {
+                        string_buffer_concat(b, sp,
+                                             (captures[2 * k] - str8(sp)) >> shift,
+                                             (captures[2 * k + 1] - str8(sp)) >> shift);
+                    }
+                } else {
+                    s = JS_GetPropertyInt64(ctx, captures_val, k);
+                    if (JS_IsException(s))
+                        return -1;
+                    if (!JS_IsUndefined(s)) {
+                        if (string_buffer_concat_value_free(b, s))
+                            return -1;
+                    }
                 }
             } else {
                 goto norep;
@@ -52308,13 +52326,13 @@ static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val
                 goto norep;
             name = js_sub_string(ctx, rp, j, k);
             if (JS_IsException(name))
-                goto exception;
+                return -1;
             capture = JS_GetPropertyValue(ctx, namedCaptures, name);
             if (JS_IsException(capture))
-                goto exception;
+                return -1;
             if (!JS_IsUndefined(capture)) {
                 if (string_buffer_concat_value_free(b, capture))
-                    goto exception;
+                    return -1;
             }
             j = k + 1;
         } else {
@@ -52324,10 +52342,7 @@ static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val
         i = j;
     }
     string_buffer_concat(b, rp, i, rp->len);
-    return string_buffer_end(b);
-exception:
-    string_buffer_free(b);
-    return JS_EXCEPTION;
+    return 0;
 }
 
 static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
@@ -52336,7 +52351,7 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
 {
     // replace(rx, rep)
     JSValueConst O = this_val, searchValue = argv[0], replaceValue = argv[1];
-    JSValueConst args[6];
+    JSValueConst args[3];
     JSValue str, search_str, replaceValue_str, repl_str;
     JSString *sp, *searchp;
     StringBuffer b_s, *b = &b_s;
@@ -52405,25 +52420,22 @@ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
                 break;
             }
         }
+        string_buffer_concat(b, sp, endOfLastMatch, pos);
         if (functionalReplace) {
             args[0] = search_str;
             args[1] = js_int32(pos);
             args[2] = str;
             repl_str = JS_ToStringFree(ctx, JS_Call(ctx, replaceValue, JS_UNDEFINED, 3, args));
+            if (JS_IsException(repl_str))
+                goto exception;
+            string_buffer_concat_value_free(b, repl_str);
         } else {
-            args[0] = search_str;
-            args[1] = str;
-            args[2] = js_int32(pos);
-            args[3] = JS_UNDEFINED;
-            args[4] = JS_UNDEFINED;
-            args[5] = replaceValue_str;
-            repl_str = js_string___GetSubstitution(ctx, JS_UNDEFINED, 6, args);
+            /* the replacement is appended directly */
+            if (js_string_GetSubstitution(ctx, b, search_str, sp, pos,
+                                          JS_UNDEFINED, JS_UNDEFINED,
+                                          replaceValue_str, NULL, 0))
+                goto exception;
         }
-        if (JS_IsException(repl_str))
-            goto exception;
-
-        string_buffer_concat(b, sp, endOfLastMatch, pos);
-        string_buffer_concat_value_free(b, repl_str);
         endOfLastMatch = pos + searchp->len;
         is_first = false;
         if (!is_replaceAll)
@@ -55108,7 +55120,7 @@ static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
 {
     // [Symbol.replace](str, rep)
     JSValueConst rx = this_val, rep = argv[1];
-    JSValueConst args[6];
+    JSValueConst args[2];
     JSValue flags, str, rep_val, matched, tab, rep_str, namedCaptures, res;
     JSString *p, *sp, *rp;
     StringBuffer b_s, *b = &b_s;
@@ -55250,6 +55262,9 @@ static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
             rep_str = JS_ToStringFree(ctx, js_function_apply(ctx, rep, 2, args, 0));
         } else {
             JSValue namedCaptures1;
+            StringBuffer b1_s, *b1 = &b1_s;
+            int ret;
+
             if (!JS_IsUndefined(namedCaptures)) {
                 namedCaptures1 = JS_ToObject(ctx, namedCaptures);
                 if (JS_IsException(namedCaptures1))
@@ -55257,15 +55272,25 @@ static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
             } else {
                 namedCaptures1 = JS_UNDEFINED;
             }
-            args[0] = matched;
-            args[1] = str;
-            args[2] = js_int32(position);
-            args[3] = tab;
-            args[4] = namedCaptures1;
-            args[5] = rep_val;
-            JS_FreeValue(ctx, rep_str);
-            rep_str = js_string___GetSubstitution(ctx, JS_UNDEFINED, 6, args);
+            /* the substitution is computed even if it is not used, its
+               accesses to namedCaptures are observable */
+            if (position >= nextSourcePosition) {
+                string_buffer_concat(b, sp, nextSourcePosition, position);
+                ret = js_string_GetSubstitution(ctx, b, matched, sp, position,
+                                                tab, namedCaptures1, rep_val,
+                                                NULL, 0);
+                nextSourcePosition = position + JS_VALUE_GET_STRING(matched)->len;
+            } else {
+                string_buffer_init(ctx, b1, 0);
+                ret = js_string_GetSubstitution(ctx, b1, matched, sp, position,
+                                                tab, namedCaptures1, rep_val,
+                                                NULL, 0);
+                string_buffer_free(b1);
+            }
             JS_FreeValue(ctx, namedCaptures1);
+            if (ret)
+                goto exception;
+            continue;
         }
         if (JS_IsException(rep_str))
             goto exception;
