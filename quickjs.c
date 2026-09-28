@@ -667,17 +667,19 @@ typedef struct JSMapRecord {
     bool empty; /* true if the record is deleted */
     struct JSMapState *map;
     struct list_head link;
-    struct list_head hash_link;
+    struct JSMapRecord *hash_next; /* next record of the hash chain */
     JSValue key;
     JSValue value;
 } JSMapRecord;
 
 typedef struct JSMapState {
     bool is_weak; /* true if WeakSet/WeakMap */
+    uint8_t hash_bits; /* 1 <= hash_bits <= 31 */
+    uint32_t hash_seed;
     struct list_head records; /* list of JSMapRecord.link */
     uint32_t record_count;
-    struct list_head *hash_table;
-    uint32_t hash_size; /* must be a power of two */
+    JSMapRecord **hash_table;
+    uint32_t hash_size; /* = 1 << hash_bits */
     uint32_t record_count_threshold; /* count at which a hash table
                                         resize is needed */
 } JSMapState;
@@ -58163,11 +58165,12 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
     init_list_head(&s->records);
     s->is_weak = is_weak;
     JS_SetOpaqueInternal(obj, s);
-    s->hash_size = 1;
-    s->hash_table = js_malloc(ctx, sizeof(s->hash_table[0]) * s->hash_size);
+    s->hash_seed = ctx->hash_seed;
+    s->hash_bits = 1;
+    s->hash_size = 1U << s->hash_bits;
+    s->hash_table = js_mallocz(ctx, sizeof(s->hash_table[0]) * s->hash_size);
     if (!s->hash_table)
         goto fail;
-    init_list_head(&s->hash_table[0]);
     s->record_count_threshold = 4;
 
     arr = JS_UNDEFINED;
@@ -58268,26 +58271,23 @@ static JSValueConst map_normalize_key_const(JSContext *ctx, JSValueConst key)
     return safe_const(map_normalize_key(ctx, unsafe_unconst(key)));
 }
 
-/* Mix the bits of a raw hash so that every input bit affects the low
-   bits, which are the ones map_find_record() keeps after masking. Numbers
-   and pointers need this: a small integer converted to a double has zero in
-   the low bits of its high word and object pointers are 16-byte aligned, so
-   without mixing sequential integer keys or object keys all land in a
-   handful of buckets. (Low-bias 32-bit mixer by Chris Wellons.) */
-static inline uint32_t map_hash_mix(uint32_t h)
-{
-    h ^= h >> 16;
-    h *= 0x7feb352d;
-    h ^= h >> 15;
-    h *= 0x846ca68b;
-    h ^= h >> 16;
-    return h;
-}
+/* The bucket of 'key' in a table of 2^hash_bits entries.
 
-static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
+   The numbers and the pointers are hashed with the top bits of their
+   product by 2^64 / golden ratio (Knuth vol 3, section 6.4, as in the
+   Linux kernel and Bellard's a151ce1), which depend on every bit of
+   the key: a small integer converted to a double has only zero low
+   bits and object pointers are 16-byte aligned. One multiplication,
+   where a mixer of the low bits takes several.
+
+   The hashes of the strings and the bigints already mix their bits and
+   are only masked: the polynomial hash of strings such as "0" to "999"
+   spreads them more evenly over the low bits than a multiplicative
+   hash would, whose collisions are those of random keys. */
+static uint32_t map_hash_key(JSMapState *s, JSValueConst key, int hash_bits)
 {
     uint32_t tag = JS_VALUE_GET_NORM_TAG(key);
-    uint32_t h;
+    uint64_t h;
     double d;
     JSFloat64Union u;
     JSBigInt *r;
@@ -58295,18 +58295,22 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
     switch(tag) {
     case JS_TAG_BOOL:
         h = JS_VALUE_GET_INT(key);
-        break;
+        goto masked;
     case JS_TAG_STRING:
         h = hash_string(JS_VALUE_GET_STRING(key), 0);
-        break;
+        goto masked;
     case JS_TAG_STRING_ROPE:
         h = hash_string_rope(key, 0);
         /* the same bucket as the flat string */
         tag = JS_TAG_STRING;
-        break;
+        goto masked;
+    case JS_TAG_BIG_INT:
+        r = JS_VALUE_GET_PTR(key);
+        h = hash_string8((void *)r->tab, r->len * sizeof(*r->tab), 0);
+        goto masked;
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:
-        h = map_hash_mix((uintptr_t)JS_VALUE_GET_PTR(key));
+        h = (uintptr_t)JS_VALUE_GET_PTR(key);
         break;
     case JS_TAG_INT:
         d = JS_VALUE_GET_INT(key);
@@ -58314,10 +58318,6 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
     case JS_TAG_SHORT_BIG_INT:
         d = JS_VALUE_GET_SHORT_BIG_INT(key);
         goto hash_float64;
-    case JS_TAG_BIG_INT:
-        r = JS_VALUE_GET_PTR(key);
-        h = hash_string8((void *)r->tab, r->len * sizeof(*r->tab), 0);
-        break;
     case JS_TAG_FLOAT64:
         d = JS_VALUE_GET_FLOAT64(key);
         /* normalize the NaN */
@@ -58325,25 +58325,29 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
             d = NAN;
     hash_float64:
         u.d = d;
-        h = map_hash_mix(u.u32[0] ^ map_hash_mix(u.u32[1]));
+        h = u.u64;
         tag = JS_TAG_FLOAT64;
         break;
     default:
         h = 0;
-        break;
+        goto masked;
     }
-    return h ^ ctx->hash_seed ^ hash32(tag);
+    /* the tag in the upper half: the pointers and the doubles have
+       their low bits in the lower one */
+    h ^= ((uint64_t)tag << 32) ^ s->hash_seed;
+    return (h * UINT64_C(0x61C8864680B583EB)) >> (64 - hash_bits);
+ masked:
+    return ((uint32_t)h ^ s->hash_seed ^ hash32(tag)) &
+        ((1U << hash_bits) - 1);
 }
 
 static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
                                     JSValueConst key)
 {
-    struct list_head *el;
     JSMapRecord *mr;
     uint32_t h;
-    h = map_hash_key(ctx, key) & (s->hash_size - 1);
-    list_for_each(el, &s->hash_table[h]) {
-        mr = list_entry(el, JSMapRecord, hash_link);
+    h = map_hash_key(s, key, s->hash_bits);
+    for(mr = s->hash_table[h]; mr != NULL; mr = mr->hash_next) {
         if (js_same_value_zero(ctx, mr->key, key))
             return mr;
     }
@@ -58352,33 +58356,46 @@ static JSMapRecord *map_find_record(JSContext *ctx, JSMapState *s,
 
 static void map_hash_resize(JSContext *ctx, JSMapState *s)
 {
-    uint32_t new_hash_size, i, h;
-    struct list_head *new_hash_table, *el;
-    JSMapRecord *mr;
+    uint32_t new_hash_size, h;
+    int new_hash_bits;
+    struct list_head *el;
+    JSMapRecord *mr, **new_hash_table;
 
     /* XXX: no reporting of memory allocation failure */
-    if (s->hash_size == 1)
-        new_hash_size = 4;
-    else
-        new_hash_size = s->hash_size * 2;
+    new_hash_bits = min_int(s->hash_bits + 1, 31);
+    new_hash_size = 1U << new_hash_bits;
     new_hash_table = js_realloc(ctx, s->hash_table,
                                 sizeof(new_hash_table[0]) * new_hash_size);
     if (!new_hash_table)
         return;
 
-    for(i = 0; i < new_hash_size; i++)
-        init_list_head(&new_hash_table[i]);
+    memset(new_hash_table, 0, sizeof(new_hash_table[0]) * new_hash_size);
 
     list_for_each(el, &s->records) {
         mr = list_entry(el, JSMapRecord, link);
         if (!mr->empty) {
-            h = map_hash_key(ctx, mr->key) & (new_hash_size - 1);
-            list_add_tail(&mr->hash_link, &new_hash_table[h]);
+            h = map_hash_key(s, mr->key, new_hash_bits);
+            mr->hash_next = new_hash_table[h];
+            new_hash_table[h] = mr;
         }
     }
     s->hash_table = new_hash_table;
+    s->hash_bits = new_hash_bits;
     s->hash_size = new_hash_size;
     s->record_count_threshold = new_hash_size * 2;
+}
+
+/* Remove the record 'mr', which is not empty, from its hash chain */
+static void map_hash_unlink(JSMapState *s, JSMapRecord *mr)
+{
+    JSMapRecord **pmr;
+
+    pmr = &s->hash_table[map_hash_key(s, mr->key, s->hash_bits)];
+    while (*pmr != mr) {
+        assert(*pmr != NULL);
+        pmr = &(*pmr)->hash_next;
+    }
+    *pmr = mr->hash_next;
 }
 
 static JSWeakRefRecord **get_first_weak_ref(JSValueConst key)
@@ -58427,8 +58444,9 @@ static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
     } else {
         mr->key = js_dup(key);
     }
-    h = map_hash_key(ctx, key) & (s->hash_size - 1);
-    list_add_tail(&mr->hash_link, &s->hash_table[h]);
+    h = map_hash_key(s, key, s->hash_bits);
+    mr->hash_next = s->hash_table[h];
+    s->hash_table[h] = mr;
     list_add_tail(&mr->link, &s->records);
     s->record_count++;
     if (s->record_count >= s->record_count_threshold) {
@@ -58457,11 +58475,10 @@ static void delete_map_weak_ref(JSRuntime *rt, JSMapRecord *mr)
     js_free_rt(rt, wr);
 }
 
-static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
+/* the record, not empty, must have been removed from its hash chain */
+static void map_delete_record_unlinked(JSRuntime *rt, JSMapState *s,
+                                       JSMapRecord *mr)
 {
-    if (mr->empty)
-        return;
-    list_del(&mr->hash_link);
     if (s->is_weak) {
         delete_map_weak_ref(rt, mr);
     } else {
@@ -58478,6 +58495,14 @@ static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
         mr->value = JS_UNDEFINED;
     }
     s->record_count--;
+}
+
+static void map_delete_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
+{
+    if (mr->empty)
+        return;
+    map_hash_unlink(s, mr);
+    map_delete_record_unlinked(rt, s, mr);
 }
 
 static void map_decref_record(JSRuntime *rt, JSMapRecord *mr)
@@ -58594,16 +58619,24 @@ static JSValue js_map_delete(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int magic)
 {
     JSMapState *s = JS_GetOpaque2(ctx, this_val, JS_CLASS_MAP + magic);
-    JSMapRecord *mr;
+    JSMapRecord *mr, **pmr;
     JSValueConst key;
 
     if (!s)
         return JS_EXCEPTION;
     key = map_normalize_key_const(ctx, argv[0]);
-    mr = map_find_record(ctx, s, key);
-    if (!mr)
-        return JS_FALSE;
-    map_delete_record(ctx->rt, s, mr);
+    /* find the record and its link in one walk of the chain */
+    pmr = &s->hash_table[map_hash_key(s, key, s->hash_bits)];
+    for(;;) {
+        mr = *pmr;
+        if (!mr)
+            return JS_FALSE;
+        if (js_same_value_zero(ctx, mr->key, key))
+            break;
+        pmr = &mr->hash_next;
+    }
+    *pmr = mr->hash_next;
+    map_delete_record_unlinked(ctx->rt, s, mr);
     return JS_TRUE;
 }
 
@@ -58616,9 +58649,11 @@ static JSValue js_map_clear(JSContext *ctx, JSValueConst this_val,
 
     if (!s)
         return JS_EXCEPTION;
+    memset(s->hash_table, 0, sizeof(s->hash_table[0]) * s->hash_size);
     list_for_each_safe(el, el1, &s->records) {
         mr = list_entry(el, JSMapRecord, link);
-        map_delete_record(ctx->rt, s, mr);
+        if (!mr->empty)
+            map_delete_record_unlinked(ctx->rt, s, mr);
     }
     return JS_UNDEFINED;
 }
@@ -68280,7 +68315,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
             s = mr->map;
             assert(s->is_weak);
             assert(!mr->empty); /* no iterator on WeakMap/WeakSet */
-            list_del(&mr->hash_link);
+            map_hash_unlink(s, mr);
             list_del(&mr->link);
             s->record_count--;
             break;
