@@ -66437,7 +66437,7 @@ static JSValue js_TA_get_float64(JSContext *ctx, const void *a) {
 struct TA_sort_context {
     JSContext *ctx;
     int exception;
-    JSValueConst arr;
+    uint8_t *array; /* copy of the elements */
     JSValueConst cmp;
     JSValue (*getfun)(JSContext *ctx, const void *a);
     int elt_size;
@@ -66449,22 +66449,15 @@ static int js_TA_cmp_generic(const void *a, const void *b, void *opaque) {
     uint32_t a_idx, b_idx;
     JSValue argv[2];
     JSValue res;
-    JSObject *p;
     int cmp;
-
-    p = JS_VALUE_GET_OBJ(psc->arr);
-    if (typed_array_is_oob(p))
-        return 0;
 
     cmp = 0;
     if (!psc->exception) {
         a_idx = *(uint32_t *)a;
         b_idx = *(uint32_t *)b;
-        if (a_idx >= p->u.array.count || b_idx >= p->u.array.count)
-            return 0;
-        argv[0] = psc->getfun(ctx, (char *)p->u.array.u.ptr +
+        argv[0] = psc->getfun(ctx, psc->array +
                               a_idx * (size_t)psc->elt_size);
-        argv[1] = psc->getfun(ctx, (char *)p->u.array.u.ptr +
+        argv[1] = psc->getfun(ctx, psc->array +
                               b_idx * (size_t)(psc->elt_size));
         res = JS_Call(ctx, psc->cmp, JS_UNDEFINED, 2, vc(argv));
         if (JS_IsException(res)) {
@@ -66513,7 +66506,6 @@ static JSValue js_typed_array_sort(JSContext *ctx, JSValueConst this_val,
 
     tsc.ctx = ctx;
     tsc.exception = 0;
-    tsc.arr = this_val;
     tsc.cmp = argv[0];
 
     if (!JS_IsUndefined(tsc.cmp) && check_function(ctx, tsc.cmp))
@@ -66576,65 +66568,66 @@ static JSValue js_typed_array_sort(JSContext *ctx, JSValueConst this_val,
             void *array_tmp;
             size_t i, j;
 
-            /* XXX: a stable sort would use less memory */
-            array_idx = js_calloc(ctx, len, sizeof(array_idx[0]));
-            if (!array_idx)
+            /* the comparison function may modify, resize or detach the
+               array: as in SortIndexedProperties(), the elements are
+               read before the sort, compared and written back */
+            array_tmp = js_malloc(ctx, len * elt_size);
+            if (!array_tmp)
                 return JS_EXCEPTION;
+            memcpy(array_tmp, p->u.array.u.ptr, len * elt_size);
+            /* array_idx makes the sort stable */
+            array_idx = js_malloc(ctx, len * sizeof(array_idx[0]));
+            if (!array_idx) {
+                js_free(ctx, array_tmp);
+                return JS_EXCEPTION;
+            }
             for(i = 0; i < len; i++)
                 array_idx[i] = i;
             tsc.elt_size = elt_size;
+            tsc.array = array_tmp;
             rqsort(array_idx, len, sizeof(array_idx[0]),
                    js_TA_cmp_generic, &tsc);
-            if (tsc.exception)
-                goto fail;
+            if (tsc.exception) {
+                js_free(ctx, array_idx);
+                js_free(ctx, array_tmp);
+                return JS_EXCEPTION;
+            }
             // per spec: typed array can be detached mid-iteration
             if (typed_array_is_oob(p))
                 goto done;
+            /* the elements past the end of a shrunk array are dropped */
             len = min_int(len, p->u.array.count);
-            if (len == 0)
-                goto done;
-            array_tmp = js_malloc(ctx, len * elt_size);
-            if (!array_tmp) {
-            fail:
-                js_free(ctx, array_idx);
-                return JS_EXCEPTION;
-            }
-            memcpy(array_tmp, p->u.array.u.ptr, len * elt_size);
             switch(elt_size) {
             case 1:
                 for(i = 0; i < len; i++) {
                     j = array_idx[i];
-                    if (j < len)
-                        p->u.array.u.uint8_ptr[i] = ((uint8_t *)array_tmp)[j];
+                    p->u.array.u.uint8_ptr[i] = ((uint8_t *)array_tmp)[j];
                 }
                 break;
             case 2:
                 for(i = 0; i < len; i++) {
                     j = array_idx[i];
-                    if (j < len)
-                        p->u.array.u.uint16_ptr[i] = ((uint16_t *)array_tmp)[j];
+                    p->u.array.u.uint16_ptr[i] = ((uint16_t *)array_tmp)[j];
                 }
                 break;
             case 4:
                 for(i = 0; i < len; i++) {
                     j = array_idx[i];
-                    if (j < len)
-                        p->u.array.u.uint32_ptr[i] = ((uint32_t *)array_tmp)[j];
+                    p->u.array.u.uint32_ptr[i] = ((uint32_t *)array_tmp)[j];
                 }
                 break;
             case 8:
                 for(i = 0; i < len; i++) {
                     j = array_idx[i];
-                    if (j < len)
-                        p->u.array.u.uint64_ptr[i] = ((uint64_t *)array_tmp)[j];
+                    p->u.array.u.uint64_ptr[i] = ((uint64_t *)array_tmp)[j];
                 }
                 break;
             default:
                 abort();
             }
-            js_free(ctx, array_tmp);
         done:
             js_free(ctx, array_idx);
+            js_free(ctx, array_tmp);
         } else {
             rqsort(p->u.array.u.ptr, len, elt_size, cmpfun, &tsc);
             if (tsc.exception)
