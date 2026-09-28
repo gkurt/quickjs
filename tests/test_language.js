@@ -481,6 +481,49 @@ function test_destructuring_binding_order()
     assert(r.b, 2);
 }
 
+/* the bindings of a 'with' object: SetMutableBinding() and
+   GetBindingValue() call HasProperty(), and a binding which disappears
+   is a ReferenceError in strict mode */
+function test_with_binding_has()
+{
+    function env(log) {
+        var n = 0;
+        return new Proxy({ p: 0 }, {
+            has(t, k) {
+                if (k != "p")
+                    return false;
+                log.push("has");
+                return n++ == 0;
+            },
+            set(t, k, v) { log.push("set"); t[k] = v; return true; },
+        });
+    }
+    var log = [], e;
+    with (env(log)) {
+        (function () {
+            "use strict";
+            try { p = 1; } catch (x) { e = x; }
+        })();
+    }
+    assert(log.join(), "has,has");
+    assert(e instanceof ReferenceError);
+    log = []; e = undefined;
+    with (env(log)) {
+        (function () {
+            "use strict";
+            try { for (p in { a: 1 }); } catch (x) { e = x; }
+        })();
+    }
+    assert(log.join(), "has,has");
+    assert(e instanceof ReferenceError);
+    log = [];
+    with (env(log)) { for (p in { a: 1 }); }
+    assert(log.join(), "has,has,set");
+    log = [];
+    with (env(log)) { p += 1; }
+    assert(log.join(), "has,has,has,set");
+}
+
 function test_spread()
 {
     var x;
@@ -1181,6 +1224,7 @@ test_regexp_skip();
 test_labels();
 test_destructuring();
 test_destructuring_binding_order();
+test_with_binding_has();
 test_spread();
 test_function_length();
 test_argument_scope();
