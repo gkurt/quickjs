@@ -713,6 +713,14 @@ function test_syntax()
     assert_throws(SyntaxError, "({ set x(...a) {} })");
     assert_throws(SyntaxError, "class C { set x(...a) {} }");
     assert_throws(SyntaxError, "class C { static set x(...[a]) {} }");
+
+    /* only an arrow function has an expression body */
+    assert_throws(SyntaxError, "function f() => 1");
+    assert_throws(SyntaxError, "(function () => 1)");
+    assert_throws(SyntaxError, "async function f() => 1");
+    assert_throws(SyntaxError, "({ m() => 1 })");
+    assert_throws(SyntaxError, "({ get x() => 1 })");
+    assert(eval("(async () => 1) instanceof Function"), true);
 }
 
 /* optional chaining tests not present in test262 */
