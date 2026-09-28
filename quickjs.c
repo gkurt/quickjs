@@ -3334,23 +3334,35 @@ static inline bool is_num_string(uint32_t *pval, JSString *p)
 }
 
 /* XXX: could use faster version ? */
-static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
+static inline uint32_t hash_string8_poly(const uint8_t *str, size_t len,
+                                         uint32_t h)
 {
     size_t i;
 
     for(i = 0; i < len; i++)
         h = h * 263 + str[i];
-    return h ^ hash32(len);
+    return h;
+}
+
+static inline uint32_t hash_string16_poly(const uint16_t *str,
+                                          size_t len, uint32_t h)
+{
+    size_t i;
+
+    for(i = 0; i < len; i++)
+        h = h * 263 + str[i];
+    return h;
+}
+
+static inline uint32_t hash_string8(const uint8_t *str, size_t len, uint32_t h)
+{
+    return hash_string8_poly(str, len, h) ^ hash32(len);
 }
 
 static inline uint32_t hash_string16(const uint16_t *str,
                                      size_t len, uint32_t h)
 {
-    size_t i;
-
-    for(i = 0; i < len; i++)
-        h = h * 263 + str[i];
-    return h ^ hash32(len);
+    return hash_string16_poly(str, len, h) ^ hash32(len);
 }
 
 static uint32_t hash_string(JSString *str, uint32_t h)
@@ -3362,14 +3374,30 @@ static uint32_t hash_string(JSString *str, uint32_t h)
     return h;
 }
 
+static uint32_t hash_string_rope_poly(JSValueConst val, uint32_t h)
+{
+    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
+        JSString *p = JS_VALUE_GET_STRING(val);
+        if (p->is_wide_char)
+            return hash_string16_poly(str16(p), p->len, h);
+        else
+            return hash_string8_poly(str8(p), p->len, h);
+    } else {
+        JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
+        h = hash_string_rope_poly(r->left, h);
+        return hash_string_rope_poly(r->right, h);
+    }
+}
+
+/* the hash_string() of the flattened string: the length is mixed in
+   once, at the end */
 static uint32_t hash_string_rope(JSValueConst val, uint32_t h)
 {
     if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
         return hash_string(JS_VALUE_GET_STRING(val), h);
     } else {
         JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
-        h = hash_string_rope(r->left, h);
-        return hash_string_rope(r->right, h);
+        return hash_string_rope_poly(val, h) ^ hash32(r->len);
     }
 }
 
@@ -58273,6 +58301,8 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
         break;
     case JS_TAG_STRING_ROPE:
         h = hash_string_rope(key, 0);
+        /* the same bucket as the flat string */
+        tag = JS_TAG_STRING;
         break;
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:
