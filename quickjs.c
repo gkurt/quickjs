@@ -21127,11 +21127,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSValue val;
 
-                /* fast path: regular/typed array element by int index */
+                /* fast path: regular/typed array element by int index.
+                   js_get_fast_array_element() returns its element in
+                   'elt' rather than 'val': a variable whose address
+                   escapes lives in memory, and the two 8 byte stores of
+                   the element followed by the 16 byte load that copies
+                   it to the stack defeat the store forwarding of the
+                   CPU, a stall of some ten cycles on every read */
                 if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT &&
                            JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
+                    JSValue elt;
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
                         val = js_dup(p->u.array.u.values[idx]);
@@ -21149,9 +21156,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp--;
                         BREAK;
                     }
-                    if (js_get_fast_array_element(ctx, p, idx, &val)) {
+                    if (js_get_fast_array_element(ctx, p, idx, &elt)) {
                         JS_FreeValue(ctx, sp[-2]);
-                        sp[-2] = val;
+                        sp[-2] = elt;
                         sp--;
                         BREAK;
                     }
@@ -21175,6 +21182,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
                     JSObject *p = JS_VALUE_GET_OBJ(sp[-2]);
                     uint32_t idx = JS_VALUE_GET_INT(sp[-1]);
+                    JSValue elt; /* not 'val': see OP_get_array_el */
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count)) {
                         sp[-1] = js_dup(p->u.array.u.values[idx]);
@@ -21185,8 +21193,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         sp[-1] = val;
                         BREAK;
                     }
-                    if (js_get_fast_array_element(ctx, p, idx, &val)) {
-                        sp[-1] = val;
+                    if (js_get_fast_array_element(ctx, p, idx, &elt)) {
+                        sp[-1] = elt;
                         BREAK;
                     }
                 }
