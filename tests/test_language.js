@@ -700,6 +700,14 @@ function test_syntax()
     assert_throws(SyntaxError, "if abc\\u0064");
     assert_throws(SyntaxError, "if \u0123");
     assert_throws(SyntaxError, "if \\u0123");
+
+    /* a destructuring assignment is not the operand of an operator */
+    assert_throws(SyntaxError, "var a; 1 + [a] = [2]");
+    assert_throws(SyntaxError, "var a; !{a} = {a: 1}");
+    assert_throws(SyntaxError, "var a; typeof [a] = [1]");
+    assert_throws(SyntaxError, "class C { #f; m() { #f in {} = 0 } }");
+    assert(eval("var a, b; b = [a] = [3]; a"), 3);
+    assert(eval("var a; 1 ? [a] = [4] : 0; a"), 4);
 }
 
 /* optional chaining tests not present in test262 */
