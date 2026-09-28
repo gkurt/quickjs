@@ -2859,8 +2859,12 @@ static no_inline int stack_realloc(REExecContext *s, size_t n)
 }
 
 /* return 1 if match, 0 if not match or < 0 if error. */
-/* as the DIRECT_DISPATCH of quickjs.c */
-#if defined(EMSCRIPTEN) || defined(_MSC_VER) || defined(DUMP_EXEC)
+/* as the DIRECT_DISPATCH of quickjs.c, and not in WebAssembly either:
+   it has no indirect jump, so the compiler turns each jump through the
+   table into a jump to a switch on the index of the label, a second
+   dispatch next to the one of the switch below, and the matcher runs
+   1.5 to 1.8 times slower than with the plain switch. */
+#if defined(EMSCRIPTEN) || defined(__wasm__) || defined(_MSC_VER) || defined(DUMP_EXEC)
 #define RE_DIRECT_DISPATCH 0
 #else
 #define RE_DIRECT_DISPATCH 1
