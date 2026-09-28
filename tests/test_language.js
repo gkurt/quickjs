@@ -533,6 +533,12 @@ function test_argument_scope()
         assert(probe(), 1)
     }
     f();
+
+    /* an argument scope without variables */
+    f = ({} = eval("c")) => c;
+    assert(f(), "global");
+    f = ([] = eval(...["c"])) => c;
+    assert(f(), "global");
 }
 
 function test_function_expr_name()
