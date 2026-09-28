@@ -20877,6 +20877,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         /* second receiver shape, always a cached own
                            writable data property */
                         set_value(ctx, &p->prop[ic->e[1].prop_idx].u.value, sp[-1]);
+                    } else if (unlikely(p->class_id == JS_CLASS_ARRAY &&
+                                        atom == JS_ATOM_length)) {
+                        /* the length of an array, never cached: always
+                           its own first property */
+                        sf->cur_pc = pc;
+                        ret = set_array_length(ctx, p, sp[-1],
+                                               JS_PROP_THROW_STRICT);
+                        JS_FreeValue(ctx, obj);
+                        sp -= 2;
+                        if (unlikely(ret < 0))
+                            goto exception;
+                        BREAK;
                     } else if (!js_ic_put(ctx, ic, p, atom, sp[-1])) {
                         goto put_field_slow_path;
                     }
