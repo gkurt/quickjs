@@ -29885,6 +29885,25 @@ duplicate:
     return js_parse_error(s, "Duplicate parameter name not allowed in this context");
 }
 
+/* tok = TOK_VAR, TOK_LET or TOK_CONST. Return whether a reference
+   must be taken to the variable for proper 'with' or global variable
+   evaluation: the binding is resolved before the value is computed */
+/* Note: this function is needed only because variable references are
+   not yet optimized in destructuring */
+static bool need_var_reference(JSParseState *s, int tok)
+{
+    JSFunctionDef *fd = s->cur_func;
+    if (tok != TOK_VAR)
+        return false; /* no reference for let/const */
+    if (fd->is_strict_mode) {
+        if (!fd->is_global_var)
+            return false; /* local definitions in strict mode in function or direct eval */
+        if (s->is_module)
+            return false; /* in a module global variables are like closure variables */
+    }
+    return true;
+}
+
 static JSAtom js_parse_destructuring_var(JSParseState *s, int tok, bool is_arg)
 {
     JSAtom name;
@@ -29973,6 +29992,14 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     var_name = js_parse_destructuring_var(s, tok, is_arg);
                     if (var_name == JS_ATOM_NULL)
                         return -1;
+                    if (need_var_reference(s, tok)) {
+                        /* Must make a reference for proper `with` semantics */
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, var_name);
+                        emit_u16(s, s->cur_func->scope_level);
+                        JS_FreeAtom(s->ctx, var_name);
+                        goto lvalue0;
+                    }
                     opcode = OP_scope_get_var;
                     scope = s->cur_func->scope_level;
                     label_lvalue = -1;
@@ -29980,7 +30007,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                 } else {
                     if (js_parse_left_hand_side_expr(s))
                         return -1;
-
+                lvalue0:
                     if (get_lvalue(s, &opcode, &scope, &var_name,
                                    &label_lvalue, &depth_lvalue, false, '{'))
                         return -1;
@@ -30073,6 +30100,14 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     var_name = js_parse_destructuring_var(s, tok, is_arg);
                     if (var_name == JS_ATOM_NULL)
                         goto prop_error;
+                    if (need_var_reference(s, tok)) {
+                        /* Must make a reference for proper `with` semantics */
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, var_name);
+                        emit_u16(s, s->cur_func->scope_level);
+                        JS_FreeAtom(s->ctx, var_name);
+                        goto lvalue;
+                    }
                 } else {
                     if (js_parse_left_hand_side_expr(s))
                         goto prop_error;
@@ -30153,7 +30188,7 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                     emit_u16(s, 0); /* inline cache slot */
                     emit_op(s, OP_swap);
                 }
-                if (!tok || tok == TOK_VAR) {
+                if (!tok || need_var_reference(s, tok)) {
                     /* generate reference */
                     /* source -- source source */
                     emit_op(s, OP_dup);
@@ -30271,11 +30306,20 @@ static int js_parse_destructuring_element(JSParseState *s, int tok,
                                               JS_EXPORT_TYPE_LOCAL))
                             goto var_error;
                     }
+                    if (need_var_reference(s, tok)) {
+                        /* Must make a reference for proper `with` semantics */
+                        emit_op(s, OP_scope_get_var);
+                        emit_atom(s, var_name);
+                        emit_u16(s, s->cur_func->scope_level);
+                        JS_FreeAtom(s->ctx, var_name);
+                        goto lvalue2;
+                    }
                     opcode = OP_scope_get_var;
                     scope = s->cur_func->scope_level;
                 } else {
                     if (js_parse_left_hand_side_expr(s))
                         return -1;
+                lvalue2:
                     if (get_lvalue(s, &opcode, &scope, &var_name,
                                    &label_lvalue, &enum_depth, false, '[')) {
                         return -1;
@@ -32286,7 +32330,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
             if (s->token.val == '=') {
                 if (next_token(s))
                     goto var_error;
-                if (tok == TOK_VAR) {
+                if (need_var_reference(s, tok)) {
                     /* Must make a reference for proper `with` semantics */
                     int opcode, scope, label;
                     JSAtom name1;

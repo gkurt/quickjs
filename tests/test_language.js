@@ -446,6 +446,41 @@ function test_destructuring()
     assert(x, void 0);
 }
 
+/* a var binding of a destructuring is resolved before its value is
+   read (with a 'with' scope, the HasBinding() comes first) */
+function test_destructuring_binding_order()
+{
+    var log = [];
+    var env = new Proxy({}, {
+        has(t, k) {
+            if (typeof k == "string")
+                log.push("has " + k);
+            return false;
+        }
+    });
+    var src = { get a() { log.push("get a"); return 1; }, b: 2 };
+    var it = {
+        [Symbol.iterator]() {
+            return {
+                next() { log.push("next"); return { value: 3, done: false }; },
+                return() { return {}; }
+            };
+        }
+    };
+    var x, a, r;
+    with (env) { var [x] = it; }
+    assert(log.join(), "has it,has x,next");
+    assert(x, 3);
+    log = [];
+    with (env) { var { a } = src; }
+    assert(log.join(), "has src,has a,get a");
+    assert(a, 1);
+    log = [];
+    with (env) { var { ...r } = src; }
+    assert(log.join(), "has src,has r,get a");
+    assert(r.b, 2);
+}
+
 function test_spread()
 {
     var x;
@@ -1145,6 +1180,7 @@ test_object_literal();
 test_regexp_skip();
 test_labels();
 test_destructuring();
+test_destructuring_binding_order();
 test_spread();
 test_function_length();
 test_argument_scope();
