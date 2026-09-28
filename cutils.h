@@ -89,7 +89,15 @@ extern "C" {
 #  define likely(x)       __builtin_expect(!!(x), 1)
 #  define unlikely(x)     __builtin_expect(!!(x), 0)
 #  define no_inline __attribute__((noinline))
-#  define force_inline inline __attribute__((always_inline))
+/* only when optimizing: without optimization, as under MSVC, every inlined
+   copy has its own stack slots, which made the JS_CallInternal() frame of
+   a Debug build 2.4x (clang) to 4.8x (GCC) the size of upstream's and ran
+   the tests out of stack under ASan */
+#  if defined(__OPTIMIZE__)
+#    define force_inline inline __attribute__((always_inline))
+#  else
+#    define force_inline inline
+#  endif
 #  define __maybe_unused __attribute__((unused))
 #endif
 
