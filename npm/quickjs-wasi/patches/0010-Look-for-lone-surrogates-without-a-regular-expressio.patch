@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 23:47:00 +0000
+Subject: [PATCH] Look for lone surrogates without a regular expression
+
+encodeWtf8() tested every source with a regular expression using lookahead
+and lookbehind. JavaScriptCore runs it in its regexp interpreter, which took
+about a third of the time of evalCode() of a 40 KB script in WebKit (a
+sampling profile of the web process), so the guest compiled 1.5x slower than
+the Emscripten build there, where V8 does not mind.
+
+Use String.prototype.isWellFormed where it exists and a scan of the code
+units where not. Compiling 800 functions, alternated runs in Playwright's
+WebKit: 14.9 ms before, 10.0 ms after; the Emscripten build 10.4 ms.
+---
+ src/index.ts                  | 30 ++++++++++++++++++++++++++----
+ test/lossless-strings.test.ts | 17 +++++++++++++++++
+ 2 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/src/index.ts b/src/index.ts
+index a19b139..25c1010 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -3013,14 +3013,36 @@ export class QuickJS {
+  * guest string values instead.
+  */
+ function stringKeyNeedsValuePath(key: string): boolean {
+-  return key.includes('\u0000') || LONE_SURROGATE_RE.test(key);
++  return key.includes('\u0000') || hasLoneSurrogate(key);
+ }
+ 
+ const wtf8Decoder = new TextDecoder();
+ const wtf8Encoder = new TextEncoder();
+ 
+-const LONE_SURROGATE_RE =
+-  /(?:[\uD800-\uDBFF](?![\uDC00-\uDFFF]))|(?:(?<![\uD800-\uDBFF])[\uDC00-\uDFFF])/;
++/**
++ * Whether `str` has an unpaired surrogate. Not a regular expression with
++ * lookahead and lookbehind: JavaScriptCore runs that in its regexp
++ * interpreter, and over the source of every evalCode() that took longer than
++ * the whole compilation in WebKit (the guest is 1.5x slower than the
++ * Emscripten build on a 40 KB script with it).
++ */
++function hasLoneSurrogate(str: string): boolean {
++  const isWellFormed = (str as { isWellFormed?: () => boolean }).isWellFormed;
++  if (typeof isWellFormed === 'function') return !isWellFormed.call(str);
++  for (let i = 0; i < str.length; i++) {
++    const code = str.charCodeAt(i);
++    if (code < 0xd800 || code > 0xdfff) continue;
++    if (code <= 0xdbff && i + 1 < str.length) {
++      const next = str.charCodeAt(i + 1);
++      if (next >= 0xdc00 && next <= 0xdfff) {
++        i++;
++        continue;
++      }
++    }
++    return true;
++  }
++  return false;
++}
+ 
+ /**
+  * Encode a JS string to WTF-8 bytes. Well-formed strings (including
+@@ -3032,7 +3054,7 @@ const LONE_SURROGATE_RE =
+  * newString values).
+  */
+ function encodeWtf8(str: string): Uint8Array {
+-  if (!LONE_SURROGATE_RE.test(str)) return wtf8Encoder.encode(str);
++  if (!hasLoneSurrogate(str)) return wtf8Encoder.encode(str);
+   const bytes: number[] = [];
+   for (let i = 0; i < str.length; i++) {
+     const code = str.charCodeAt(i);
+diff --git a/test/lossless-strings.test.ts b/test/lossless-strings.test.ts
+index a29e662..169eb40 100644
+--- a/test/lossless-strings.test.ts
++++ b/test/lossless-strings.test.ts
+@@ -130,3 +130,20 @@ describe('property keys with NULs / lone surrogates', () => {
+     desc?.set?.dispose();
+   });
+ });
++
++describe('host→guest: sources without String.prototype.isWellFormed', () => {
++  it.each(CASES)('evalCode: %s', async (_name, value) => {
++    // engines before ES2024 take the scan in hasLoneSurrogate
++    const proto = String.prototype as { isWellFormed?: () => boolean };
++    const isWellFormed = proto.isWellFormed;
++    delete proto.isWellFormed;
++    try {
++      using vm = await QuickJS.create(wasmBytes);
++      // the code units themselves in the source, not escapes
++      using handle = vm.evalCode(`"${value}"`);
++      expect(handle.toString()).toBe(value);
++    } finally {
++      if (isWellFormed) proto.isWellFormed = isWellFormed;
++    }
++  });
++});
