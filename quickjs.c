@@ -3861,14 +3861,26 @@ static JSAtom JS_NewAtomStr(JSContext *ctx, JSString *p)
     return __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
 }
 
+static size_t count_ascii(const uint8_t *buf, size_t len)
+{
+    const uint8_t *p, *p_end;
+    p = buf;
+    p_end = buf + len;
+    while (p < p_end && *p < 128)
+        p++;
+    return p - buf;
+}
+
 /* `str` may be pure ASCII or UTF-8 encoded */
 JSAtom JS_NewAtomLen(JSContext *ctx, const char *str, size_t len)
 {
     JSValue val;
 
-    if (len == 0 || !is_digit(*str)) {
-        // TODO(chqrlie): this does not work if `str` has UTF-8 encoded contents
-        // bug example: `({ "\u00c3\u00a9": 1 }).\u00e9` evaluates to `1`.
+    /* the atoms are looked up as 8 bit strings: only an ASCII string
+       is the same in UTF-8 */
+    if (len == 0 ||
+        (!is_digit(*str) &&
+         count_ascii((const uint8_t *)str, len) == len)) {
         JSAtom atom = __JS_FindAtom(ctx->rt, str, len, JS_ATOM_TYPE_STRING);
         if (atom)
             return atom;

@@ -541,6 +541,14 @@ function test_argument_scope()
     assert(f(), "global");
 }
 
+function test_unicode_identifiers()
+{
+    /* the UTF-8 encoding of "\u00f5" is the Latin-1 string "\u00c3\u00b5" */
+    assert(eval("var \u00c3\u00b5 = 3; typeof \u00f5"), "undefined");
+    assert(eval("({ '\u00c3\u00a9': 1 }).\u00e9"), undefined);
+    assert(eval("var \u00e9t\u00e9 = 4; \u00e9t\u00e9"), 4);
+}
+
 function test_function_expr_name()
 {
     var f;
@@ -1107,6 +1115,7 @@ test_destructuring();
 test_spread();
 test_function_length();
 test_argument_scope();
+test_unicode_identifiers();
 test_function_expr_name();
 test_reserved_names();
 test_number_literals();
