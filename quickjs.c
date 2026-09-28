@@ -589,6 +589,9 @@ struct JSContext {
     JSShape *mapped_arguments_shape;  /* shape for mapped arguments objects */
     JSShape *regexp_shape;  /* shape for regexp objects */
     JSShape *regexp_result_shape;  /* shape for regexp result objects */
+    /* names of the flag getters of RegExp.prototype, in the order of
+       js_regexp_flag_getters[] */
+    JSAtom regexp_flag_atoms[8];
     /* shapes of the function objects created by js_closure(): 'length'
        and 'name', plus 'prototype' for the constructors. Indexed by
        JSFunctionKindEnum, created on first use */
@@ -3219,6 +3222,8 @@ void JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
+    for(i = 0; i < countof(ctx->regexp_flag_atoms); i++)
+        JS_FreeAtom(ctx, ctx->regexp_flag_atoms[i]);
     for(i = 0; i < countof(ctx->closure_shape); i++)
         js_free_shape_null(ctx->rt, ctx->closure_shape[i]);
     js_free_shape_null(ctx->rt, ctx->ctor_closure_shape);
@@ -54235,60 +54240,41 @@ static JSValue js_regexp_get_flag(JSContext *ctx, JSValueConst this_val, int mas
     return js_bool(flags & mask);
 }
 
+/* the flags in the order of RegExp.prototype.flags */
+static const struct {
+    char name[12];
+    char c;
+    uint16_t flag;
+} js_regexp_flag_getters[8] = {
+    { "hasIndices", 'd', LRE_FLAG_INDICES },
+    { "global", 'g', LRE_FLAG_GLOBAL },
+    { "ignoreCase", 'i', LRE_FLAG_IGNORECASE },
+    { "multiline", 'm', LRE_FLAG_MULTILINE },
+    { "dotAll", 's', LRE_FLAG_DOTALL },
+    { "unicode", 'u', LRE_FLAG_UNICODE },
+    { "unicodeSets", 'v', LRE_FLAG_UNICODE_SETS },
+    { "sticky", 'y', LRE_FLAG_STICKY },
+};
+
 static JSValue js_regexp_get_flags(JSContext *ctx, JSValueConst this_val)
 {
     char str[8], *p = str;
-    int res;
+    int i, res;
 
     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
         return JS_ThrowTypeErrorNotAnObject(ctx);
 
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "hasIndices"));
-    if (res < 0)
-        goto exception;
-    if (res)
-        *p++ = 'd';
-    res = JS_ToBoolFree(ctx, JS_GetProperty(ctx, this_val, JS_ATOM_global));
-    if (res < 0)
-        goto exception;
-    if (res)
-        *p++ = 'g';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "ignoreCase"));
-    if (res < 0)
-        goto exception;
-    if (res)
-        *p++ = 'i';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "multiline"));
-    if (res < 0)
-        goto exception;
-    if (res)
-        *p++ = 'm';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "dotAll"));
-    if (res < 0)
-        goto exception;
-    if (res)
-        *p++ = 's';
-    res = JS_ToBoolFree(ctx, JS_GetProperty(ctx, this_val, JS_ATOM_unicode));
-    if (res < 0)
-        goto exception;
-    if (res)
-        *p++ = 'u';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "unicodeSets"));
-    if (res < 0)
-        goto exception;
-    if (res)
-        *p++ = 'v';
-    res = JS_ToBoolFree(ctx, JS_GetPropertyStr(ctx, this_val, "sticky"));
-    if (res < 0)
-        goto exception;
-    if (res)
-        *p++ = 'y';
+    for(i = 0; i < countof(js_regexp_flag_getters); i++) {
+        res = JS_ToBoolFree(ctx, JS_GetProperty(ctx, this_val,
+                                                ctx->regexp_flag_atoms[i]));
+        if (res < 0)
+            return JS_EXCEPTION;
+        if (res)
+            *p++ = js_regexp_flag_getters[i].c;
+    }
     if (p == str)
         return js_empty_string(ctx->rt);
     return js_new_string8_len(ctx, str, p - str);
-
-exception:
-    return JS_EXCEPTION;
 }
 
 static JSValue js_regexp_toString(JSContext *ctx, JSValueConst this_val,
@@ -55539,7 +55525,14 @@ void JS_AddIntrinsicRegExpCompiler(JSContext *ctx)
 int JS_AddIntrinsicRegExp(JSContext *ctx)
 {
     JSValue proto, obj;
+    int i;
 
+    for(i = 0; i < countof(js_regexp_flag_getters); i++) {
+        ctx->regexp_flag_atoms[i] = JS_NewAtom(ctx,
+                                               js_regexp_flag_getters[i].name);
+        if (ctx->regexp_flag_atoms[i] == JS_ATOM_NULL)
+            return -1;
+    }
     proto = ctx->class_proto[JS_CLASS_REGEXP] = JS_NewObject(ctx);
     if (JS_IsException(proto))
         return -1;
