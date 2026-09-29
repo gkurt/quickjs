@@ -50041,6 +50041,79 @@ exception:
     return 0;
 }
 
+/* ascending order of numbers, what the comparison function (a, b) => a - b
+   returns, including the order of the positions for equal values: the
+   sign of a - b, NaN (from a NaN or two infinities of the same sign)
+   counting as 0 */
+static int js_array_cmp_number(const void *a, const void *b, void *opaque)
+{
+    const ValueSlot *ap = a, *bp = b;
+    double d;
+    int cmp;
+
+    if (JS_VALUE_GET_TAG(ap->val) == JS_TAG_INT &&
+        JS_VALUE_GET_TAG(bp->val) == JS_TAG_INT) {
+        int32_t x = JS_VALUE_GET_INT(ap->val), y = JS_VALUE_GET_INT(bp->val);
+        cmp = (x > y) - (x < y);
+    } else {
+        double x, y;
+        x = JS_VALUE_GET_TAG(ap->val) == JS_TAG_INT ?
+            JS_VALUE_GET_INT(ap->val) : JS_VALUE_GET_FLOAT64(ap->val);
+        y = JS_VALUE_GET_TAG(bp->val) == JS_TAG_INT ?
+            JS_VALUE_GET_INT(bp->val) : JS_VALUE_GET_FLOAT64(bp->val);
+        d = x - y;
+        cmp = (d > 0) - (d < 0);
+    }
+    if (cmp != 0)
+        return cmp;
+    return (ap->pos > bp->pos) - (ap->pos < bp->pos);
+}
+
+/* the same for (a, b) => b - a */
+static int js_array_cmp_number_rev(const void *a, const void *b, void *opaque)
+{
+    const ValueSlot *ap = a, *bp = b;
+    ValueSlot a1, b1;
+    /* b - a with the positions in their usual order */
+    a1.val = bp->val;
+    a1.pos = ap->pos;
+    b1.val = ap->val;
+    b1.pos = bp->pos;
+    return js_array_cmp_number(&a1, &b1, opaque);
+}
+
+/* 1 if 'func' is exactly (a, b) => a - b, -1 for (a, b) => b - a, 0
+   otherwise. They are the usual comparison functions of numbers, and
+   when both arguments are numbers the subtraction has no side effect
+   and does not depend on anything else: the sort can compare the
+   numbers itself instead of calling the function. The bytecode is the
+   same for arrow functions, function expressions and methods, in strict
+   mode or not; default values, destructuring or any other expression
+   give a longer one, and generators and async functions are other
+   classes. */
+static int js_get_number_comparator(JSValueConst func)
+{
+    static const uint8_t asc[] = { OP_get_arg0, OP_get_arg1, OP_sub, OP_return };
+    static const uint8_t desc[] = { OP_get_arg1, OP_get_arg0, OP_sub, OP_return };
+    JSFunctionBytecode *b;
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    b = p->u.func.function_bytecode;
+    if (b->func_kind != JS_FUNC_NORMAL || b->arg_count < 2 ||
+        b->byte_code_len != sizeof(asc))
+        return 0;
+    if (!memcmp(b->byte_code_buf, asc, sizeof(asc)))
+        return 1;
+    if (!memcmp(b->byte_code_buf, desc, sizeof(desc)))
+        return -1;
+    return 0;
+}
+
 static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -50085,7 +50158,22 @@ static JSValue js_array_sort(JSContext *ctx, JSValueConst this_val,
         array[pos].pos = i;
         pos++;
     }
-    rqsort(array, pos, sizeof(*array), js_array_cmp_generic, &asc);
+    {
+        int (*cmp)(const void *, const void *, void *) = js_array_cmp_generic;
+        if (asc.has_method) {
+            int dir = js_get_number_comparator(asc.method);
+            if (dir != 0) {
+                size_t k;
+                for (k = 0; k < pos; k++) {
+                    if (!JS_IsNumber(array[k].val))
+                        break;
+                }
+                if (k == pos)
+                    cmp = dir > 0 ? js_array_cmp_number : js_array_cmp_number_rev;
+            }
+        }
+        rqsort(array, pos, sizeof(*array), cmp, &asc);
+    }
     if (asc.exception)
         goto exception;
 
