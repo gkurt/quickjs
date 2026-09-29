@@ -52655,6 +52655,76 @@ static JSValue js_string_codePointAt(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/* String.prototype.concat() when 'this_val' is a string and the
+   arguments are strings, numbers, booleans, null or undefined, whose
+   conversion to a string has no side effect, and the result is short
+   (it would not be a rope): the result is written at once instead of
+   concatenating the strings of the arguments one by one. This is the
+   case of most template literals, `a${b}c` being "a".concat(b, "c").
+   Return JS_UNDEFINED if not applicable. */
+static JSValue js_string_concat_primitives(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv)
+{
+    StringBuffer b_s, *b = &b_s;
+    JSDTOATempMem dtoa_mem;
+    char buf[128];
+    size_t len;
+    int i, total;
+
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_STRING)
+        return JS_UNDEFINED;
+    total = JS_VALUE_GET_STRING(this_val)->len;
+    for (i = 0; i < argc; i++) {
+        switch (JS_VALUE_GET_NORM_TAG(argv[i])) {
+        case JS_TAG_STRING:
+            total += JS_VALUE_GET_STRING(argv[i])->len;
+            break;
+        case JS_TAG_INT:
+        case JS_TAG_BOOL:
+        case JS_TAG_NULL:
+        case JS_TAG_UNDEFINED:
+            total += 11;
+            break;
+        case JS_TAG_FLOAT64:
+            total += 25; /* at most 24 characters in base 10 */
+            break;
+        default:
+            return JS_UNDEFINED;
+        }
+    }
+    if (total > JS_STRING_ROPE_SHORT_LEN)
+        return JS_UNDEFINED;
+    string_buffer_init(ctx, b, total);
+    string_buffer_concat_value(b, this_val);
+    for (i = 0; i < argc; i++) {
+        JSValueConst v = argv[i];
+        switch (JS_VALUE_GET_NORM_TAG(v)) {
+        case JS_TAG_STRING:
+            string_buffer_concat_value(b, v);
+            break;
+        case JS_TAG_INT:
+            len = i32toa(buf, JS_VALUE_GET_INT(v));
+            string_buffer_write8(b, (uint8_t *)buf, len);
+            break;
+        case JS_TAG_FLOAT64:
+            len = js_dtoa(buf, JS_VALUE_GET_FLOAT64(v), 10, 0,
+                          JS_DTOA_FORMAT_FREE, &dtoa_mem);
+            string_buffer_write8(b, (uint8_t *)buf, len);
+            break;
+        case JS_TAG_BOOL:
+            string_buffer_puts8(b, JS_VALUE_GET_BOOL(v) ? "true" : "false");
+            break;
+        case JS_TAG_NULL:
+            string_buffer_puts8(b, "null");
+            break;
+        default:
+            string_buffer_puts8(b, "undefined");
+            break;
+        }
+    }
+    return string_buffer_end(b);
+}
+
 static JSValue js_string_concat(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
@@ -52700,6 +52770,9 @@ static JSValue js_string_concat(JSContext *ctx, JSValueConst this_val,
         *d = '\0';
     return JS_MKPTR(JS_TAG_STRING, q);
 slow_path:
+    r = js_string_concat_primitives(ctx, this_val, argc, argv);
+    if (!JS_IsUndefined(r))
+        return r;
     r = JS_ToStringCheckObject(ctx, this_val);
     for (i = 0; i < argc; i++) {
         if (JS_IsException(r))
