@@ -592,18 +592,48 @@ static void limb_to_a(char *buf, limb_t n, unsigned int radix, int len)
     }
 }
 
+static const char digits_00_99[201] =
+    "0001020304050607080910111213141516171819"
+    "2021222324252627282930313233343536373839"
+    "4041424344454647484950515253545556575859"
+    "6061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
+
+/* number of decimal digits of n */
+static inline size_t u32_digit_count(uint32_t n)
+{
+    if (n < 10000) {
+        if (n < 100)
+            return n < 10 ? 1 : 2;
+        return n < 1000 ? 3 : 4;
+    }
+    if (n < 100000000) {
+        if (n < 1000000)
+            return n < 100000 ? 5 : 6;
+        return n < 10000000 ? 7 : 8;
+    }
+    return n < 1000000000 ? 9 : 10;
+}
+
+/* the digits are written from the end, two at a time */
 size_t u32toa(char *buf, uint32_t n)
 {
-    char buf1[10], *q;
-    size_t len;
-    
-    q = buf1 + sizeof(buf1);
-    do {
-        *--q = n % 10 + '0';
-        n /= 10;
-    } while (n != 0);
-    len = buf1 + sizeof(buf1) - q;
-    memcpy(buf, q, len);
+    size_t len = u32_digit_count(n);
+    char *q = buf + len;
+
+    while (n >= 100) {
+        uint32_t r = n % 100;
+        n /= 100;
+        q -= 2;
+        q[0] = digits_00_99[2 * r];
+        q[1] = digits_00_99[2 * r + 1];
+    }
+    if (n >= 10) {
+        q[-2] = digits_00_99[2 * n];
+        q[-1] = digits_00_99[2 * n + 1];
+    } else {
+        q[-1] = '0' + n;
+    }
     return len;
 }
 
