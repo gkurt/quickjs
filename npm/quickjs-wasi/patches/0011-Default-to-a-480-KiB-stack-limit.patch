@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 29 Sep 2026 00:42:08 +0000
+Subject: [PATCH] Default to a 480 KiB stack limit
+
+The engine is built without the debugging dumps now (NDEBUG), which
+shrinks the interpreter's frame on the WASM stack by 16 bytes (272 to
+256 bytes per level of plain recursion), so recursion at the same limit
+goes 3-6% deeper (plain recursion 1924 to 2045 levels at 512 KiB, the
+getter pattern 1635 to 1722). The default only just fit Node.js's main
+thread: with the new build the getter, apply, JSON, proxy, toString and
+generator recursions of test/stack.test.ts overflow its 984 KB host stack
+before QuickJS's limit is reached.
+
+At 480 KiB the depth is what it was (plain 1917 levels, getter 1615).
+---
+ src/index.ts       | 2 +-
+ test/stack.test.ts | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/index.ts b/src/index.ts
+index 25c1010..aacf242 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -55,7 +55,7 @@ export const MAX_STACK_SIZE = 1024 * 1024;
+  * exceeded" before a 1 MiB host native stack overflows. Raise it up to
+  * {@link MAX_STACK_SIZE} on hosts with a larger native stack.
+  */
+-export const DEFAULT_STACK_SIZE = 512 * 1024;
++export const DEFAULT_STACK_SIZE = 480 * 1024;
+ 
+ /**
+  * A host callback behind a QuickJS function (`vm.newFunction()`).
+diff --git a/test/stack.test.ts b/test/stack.test.ts
+index e2ee282..681ae24 100644
+--- a/test/stack.test.ts
++++ b/test/stack.test.ts
+@@ -43,9 +43,9 @@ const runInWorker = (script: string, stackSizeMb: number): Promise<Record<string
+   });
+ 
+ describe('stack limits', () => {
+-  it('allows up to 1 MiB, and defaults to 512 KiB', async () => {
++  it('allows up to 1 MiB, and defaults to 480 KiB', async () => {
+     expect(MAX_STACK_SIZE).toBe(1024 * 1024);
+-    expect(DEFAULT_STACK_SIZE).toBe(512 * 1024);
++    expect(DEFAULT_STACK_SIZE).toBe(480 * 1024);
+     using vm = await QuickJS.create({ wasm, maxStackSize: MAX_STACK_SIZE });
+     expect(vm.evalCode('1 + 1').consume((h) => h.toNumber())).toBe(2);
+     await expect(QuickJS.create({ wasm, maxStackSize: MAX_STACK_SIZE + 1 })).rejects.toThrow(/maxStackSize/);

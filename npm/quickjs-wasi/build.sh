@@ -110,7 +110,13 @@ engine_hash=$(node "$root/scripts/engine-source-hash.mjs" "$root")
 # CC; the interface layer takes the engine's identity in INTERFACE_CFLAGS
 # (added by the patches). Clean first because a change of OPT, TYPESCRIPT or
 # the engine's identity is invisible to make
-cc="$WASI_SDK/bin/clang"
+#
+# NDEBUG makes this a release build. Without it the engine enables its
+# debugging dumps (ENABLE_DUMPS), and the interpreter then tests
+# rt->dump_flags before it executes every opcode: a loop of global variable
+# accesses took 1.2-1.3x as long in Chromium as with the same engine built
+# with NDEBUG, which is as fast as quickjs-emscripten
+cc="$WASI_SDK/bin/clang -DNDEBUG"
 if [ "$TYPESCRIPT" = 0 ]; then
     cc="$cc -DQJS_DISABLE_TYPESCRIPT"
 fi

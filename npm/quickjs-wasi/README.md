@@ -235,7 +235,7 @@ const ns = vm.getPromiseResult(p); // the module's exports
 
 `maxStackSize` limits the stack a VM's recursion may use, up to
 `MAX_STACK_SIZE` (1 MiB of the binary's 2 MiB stack), and defaults to
-`DEFAULT_STACK_SIZE` (512 KiB). Past it, the guest gets `RangeError: Maximum
+`DEFAULT_STACK_SIZE` (480 KiB). Past it, the guest gets `RangeError: Maximum
 call stack size exceeded`, which it can catch, and the VM stays usable.
 
 The limit counts only the WASM stack (the C code's shadow stack). The host
