@@ -1829,18 +1829,19 @@ static const uint16_t arena_block_sizes[JS_ARENA_BLOCK_SIZE_COUNT] = {
     288, 320, 352, 384, 416, 448, 480, 512,
 };
 
-static int arena_get_size_index(size_t size)
+/* size class of the blocks of total size 8 * i, the header included */
+static const uint8_t arena_size_index_table[JS_ARENA_MAX_SMALL_SIZE / 8 + 1] = {
+     0,  0,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10,
+    11, 12, 13, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19,
+    19, 20, 20, 21, 21, 22, 22, 23, 23, 23, 23, 24, 24,
+    24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27, 27, 27,
+    27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30,
+};
+
+/* 'size' is a multiple of JS_ARENA_ALIGN and at most JS_ARENA_MAX_SMALL_SIZE */
+static inline int arena_get_size_index(size_t size)
 {
-    if (size <= 16)
-        return 0;
-    else if (size <= 128)
-        return (size + 7) / 8 - 2;
-    else if (size <= 256)
-        return (size + 15) / 16 + 6;
-    else if (size <= 512)
-        return (size + 31) / 32 + 14;
-    else
-        return JS_ARENA_BLOCK_SIZE_COUNT;
+    return arena_size_index_table[size / 8];
 }
 
 static inline JSMallocBlockHeader *arena_zero_block(JSRuntime *rt)
@@ -1918,12 +1919,18 @@ static no_inline void *arena_calloc_large(JSRuntime *rt, size_t size)
     return b->user_data;
 }
 
-static void *js_arena_malloc(JSRuntime *rt, size_t size)
+static size_t js_arena_usable_size(JSRuntime *rt, const void *ptr);
+
+/* also return in '*pusable' what js_arena_usable_size() would */
+static force_inline void *js_arena_malloc2(JSRuntime *rt, size_t size,
+                                           size_t *pusable)
 {
     size_t total_size;
 
-    if (unlikely(size == 0))
+    if (unlikely(size == 0)) {
+        *pusable = 0;
         return arena_zero_block(rt)->user_data;
+    }
     total_size = ((size + JS_ARENA_ALIGN - 1) & ~(size_t)(JS_ARENA_ALIGN - 1)) +
         sizeof(JSMallocBlockHeader);
     if (!JS_ARENA_LARGE_BLOCKS_ONLY && total_size <= JS_ARENA_MAX_SMALL_SIZE) {
@@ -1951,10 +1958,19 @@ static void *js_arena_malloc(JSRuntime *rt, size_t size)
         ar->n_used_blocks++;
         if (unlikely(ar->n_used_blocks == ar->n_blocks))
             list_del(&ar->free_link);
+        *pusable = block_size - sizeof(JSMallocBlockHeader);
         return b->user_data;
     } else {
-        return arena_malloc_large(rt, size);
+        void *ptr = arena_malloc_large(rt, size);
+        *pusable = ptr ? js_arena_usable_size(rt, ptr) : 0;
+        return ptr;
     }
+}
+
+static void *js_arena_malloc(JSRuntime *rt, size_t size)
+{
+    size_t usable;
+    return js_arena_malloc2(rt, size, &usable);
 }
 
 static void js_arena_free(JSRuntime *rt, void *ptr)
@@ -2144,6 +2160,7 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
 {
     void *ptr;
     JSMallocState *s;
+    size_t usable;
 
     /* Do not allocate zero bytes: behavior is platform dependent */
     if (unlikely(size == 0))
@@ -2154,12 +2171,12 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
     if (unlikely(s->malloc_size + size > s->malloc_limit - 1))
         return NULL;
 
-    ptr = js_arena_malloc(rt, size);
+    ptr = js_arena_malloc2(rt, size, &usable);
     if (!ptr)
         return NULL;
 
     s->malloc_count++;
-    s->malloc_size += js_arena_usable_size(rt, ptr) + MALLOC_OVERHEAD;
+    s->malloc_size += usable + MALLOC_OVERHEAD;
     return ptr;
 }
 
