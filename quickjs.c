@@ -46499,6 +46499,27 @@ static JSValue JS_GetOwnPropertyNames2(JSContext *ctx, JSValueConst obj1,
     if (JS_IsException(obj))
         return JS_EXCEPTION;
     p = JS_VALUE_GET_OBJ(obj);
+    if (kind == JS_ITERATOR_KIND_KEY &&
+        (!(flags & JS_GPN_ENUM_ONLY) || !p->is_exotic || p->fast_array)) {
+        JSObject *pr;
+        /* no code runs between the enumeration and the creation of the
+           keys and the flags of the shape and of the fast array elements
+           are those [[GetOwnProperty]] would return: the enumerability
+           needs no second check and the array is created at once */
+        if (JS_GetOwnPropertyNamesInternal(ctx, &atoms, &len, p, flags))
+            goto exception;
+        r = js_allocate_fast_array(ctx, len);
+        if (JS_IsException(r))
+            goto done;
+        pr = JS_VALUE_GET_OBJ(r);
+        for(i = 0; i < len; i++) {
+            val = JS_AtomToValue(ctx, atoms[i].atom);
+            if (JS_IsException(val))
+                goto exception;
+            pr->u.array.u.values[i] = val;
+        }
+        goto done;
+    }
     if (JS_GetOwnPropertyNamesInternal(ctx, &atoms, &len, p, flags & ~JS_GPN_ENUM_ONLY))
         goto exception;
     r = JS_NewArray(ctx);
