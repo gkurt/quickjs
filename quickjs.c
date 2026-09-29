@@ -56711,6 +56711,19 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 }
 
 /* 'pr' can be NULL */
+/* store the 'len' first elements of the new empty fast array 'p': the
+   values are moved into it, and left to the caller on error */
+static int json_array_set_elements(JSContext *ctx, JSObject *p,
+                                   JSValue *tab, uint32_t len)
+{
+    if (expand_fast_array(ctx, p, len))
+        return -1;
+    memcpy(p->u.array.u.values, tab, sizeof(tab[0]) * len);
+    p->u.array.count = len;
+    p->prop[0].u.value = js_int32(len);
+    return 0;
+}
+
 static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
 {
     JSContext *ctx = s->ctx;
@@ -56799,12 +56812,20 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
             uint32_t idx;
             JSONParseRecord *pr1;
             int pr_size;
+            /* The first elements are kept here and the array is allocated
+               at its length once they are all known; it is filled one
+               element at a time beyond. No code can see the array before
+               it is returned. */
+            JSValue tab[32];
+            uint32_t tab_len = 0;
+            JSObject *p;
 
             if (json_next_token(s))
                 goto fail;
             val = JS_NewArray(ctx);
             if (JS_IsException(val))
                 goto fail;
+            p = JS_VALUE_GET_OBJ(val);
             if (pr) {
                 json_parse_record_init_array(ctx, pr, val);
                 pr_size = 0;
@@ -56814,7 +56835,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                     if (pr) {
                         if (js_resize_array(ctx, (void **)&pr->u.array.elements, sizeof(pr->u.array.elements[0]),
                                             &pr_size, pr->u.array.count + 1))
-                            goto fail;
+                            goto fail_array;
                         pr1 = &pr->u.array.elements[pr->u.array.count++];
                         pr1->value = JS_UNDEFINED;
                     } else {
@@ -56822,22 +56843,41 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                     }
                     el = json_parse_value(s, pr1);
                     if (JS_IsException(el))
-                        goto fail;
-                    ret = JS_DefinePropertyValueUint32(ctx, val, idx, el, JS_PROP_C_W_E);
-                    if (ret < 0)
-                        goto fail;
+                        goto fail_array;
+                    if (idx < countof(tab)) {
+                        tab[tab_len++] = el;
+                    } else {
+                        if (tab_len != 0) {
+                            if (json_array_set_elements(ctx, p, tab, tab_len))
+                                goto fail_array;
+                            tab_len = 0;
+                        }
+                        ret = add_fast_array_element(ctx, p, el, JS_PROP_C_W_E);
+                        if (ret < 0)
+                            goto fail;
+                    }
                     if (s->token.val == ']')
                         break;
                     if (s->token.val != ',') {
                         json_parse_error(s, s->token.ptr, "Expected ',' or ']' after array element");
-                        goto fail;
+                        goto fail_array;
                     }
                     if (json_next_token(s))
-                        goto fail;
+                        goto fail_array;
+                }
+                if (tab_len != 0) {
+                    if (json_array_set_elements(ctx, p, tab, tab_len))
+                        goto fail_array;
+                    tab_len = 0;
                 }
             }
             if (json_next_token(s))
                 goto fail;
+            break;
+        fail_array:
+            while (tab_len > 0)
+                JS_FreeValue(ctx, tab[--tab_len]);
+            goto fail;
         }
         break;
     case TOK_STRING:
