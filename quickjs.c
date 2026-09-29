@@ -6164,6 +6164,32 @@ static void js_free_shape_null(JSRuntime *rt, JSShape *sh)
         js_free_shape(rt, sh);
 }
 
+/* The properties of an object are allocated with it, after the JSObject
+   (see JS_NewObjectFromShape2()): an object costs one allocation. When
+   they no longer fit, they move to an array of their own. */
+static inline JSProperty *js_object_inline_props(JSObject *p)
+{
+    return (JSProperty *)(p + 1);
+}
+
+/* reallocate the properties of 'p' for 'new_size' properties. Return
+   NULL if there is not enough memory, and p->prop is left as is. */
+static JSProperty *js_realloc_props(JSContext *ctx, JSObject *p,
+                                    uint32_t new_size)
+{
+    JSProperty *new_prop;
+
+    if (p->prop == js_object_inline_props(p)) {
+        if (new_size <= p->prop_size)
+            return p->prop;
+        new_prop = js_malloc(ctx, sizeof(new_prop[0]) * new_size);
+        if (new_prop)
+            memcpy(new_prop, p->prop, sizeof(new_prop[0]) * p->prop_size);
+        return new_prop;
+    }
+    return js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
+}
+
 /* make space to hold at least 'count' properties */
 static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
                                        JSObject *p, uint32_t count)
@@ -6180,7 +6206,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
        in case of memory allocation failure */
     if (p && new_size > p->prop_size) {
         JSProperty *new_prop;
-        new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
+        new_prop = js_realloc_props(ctx, p, new_size);
         if (unlikely(!new_prop))
             return -1;
         p->prop = new_prop;
@@ -6308,11 +6334,13 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     p->shape = sh;
     js_free(ctx, get_alloc_from_shape(old_sh));
 
-    /* reduce the size of the object properties */
-    new_prop = js_realloc(ctx, p->prop, sizeof(new_prop[0]) * new_size);
+    /* reduce the size of the object properties (the properties
+       allocated with the object stay where they are) */
+    new_prop = js_realloc_props(ctx, p, new_size);
     if (new_prop) {
+        if (new_prop != js_object_inline_props(p))
+            p->prop_size = new_size;
         p->prop = new_prop;
-        p->prop_size = new_size;
     }
     return 0;
 }
@@ -6469,9 +6497,18 @@ static JSValue JS_NewObjectFromShape2(JSContext *ctx, JSShape *sh,
     int i;
 
     js_trigger_gc(ctx->rt, sizeof(JSObject));
-    p = js_malloc(ctx, sizeof(JSObject));
-    if (unlikely(!p))
-        goto fail;
+    p = js_malloc(ctx, sizeof(JSObject) + sizeof(JSProperty) * prop_size);
+    if (unlikely(!p)) {
+        if (props) {
+            JSShapeProperty *prs = get_shape_prop(sh);
+            for(i = 0; i < sh->prop_count; i++) {
+                free_property(ctx->rt, &props[i], prs->flags);
+                prs++;
+            }
+        }
+        js_free_shape(ctx->rt, sh);
+        return JS_EXCEPTION;
+    }
     p->class_id = class_id;
     p->extensible = true;
     p->free_mark = 0;
@@ -6488,20 +6525,7 @@ static JSValue JS_NewObjectFromShape2(JSContext *ctx, JSShape *sh,
     p->u.opaque = NULL;
     p->shape = sh;
     p->prop_size = prop_size;
-    p->prop = js_malloc(ctx, sizeof(JSProperty) * prop_size);
-    if (unlikely(!p->prop)) {
-        js_free(ctx, p);
-    fail:
-        if (props) {
-            JSShapeProperty *prs = get_shape_prop(sh);
-            for(i = 0; i < sh->prop_count; i++) {
-                free_property(ctx->rt, &props[i], prs->flags);
-                prs++;
-            }
-        }
-        js_free_shape(ctx->rt, sh);
-        return JS_EXCEPTION;
-    }
+    p->prop = js_object_inline_props(p);
 
     switch(class_id) {
     case JS_CLASS_OBJECT:
@@ -7412,7 +7436,8 @@ static void free_object(JSRuntime *rt, JSObject *p)
         free_property(rt, &p->prop[i], pr->flags);
         pr++;
     }
-    js_free_rt(rt, p->prop);
+    if (p->prop != js_object_inline_props(p))
+        js_free_rt(rt, p->prop);
     /* as an optimization we destroy the shape immediately without
        putting it in gc_zero_ref_count_list */
     js_free_shape(rt, sh);
@@ -10072,8 +10097,7 @@ static force_inline int js_ic_add(JSContext *ctx, JSInlineCache *ic,
     }
     if (new_sh->prop_size > p->prop_size) {
         JSProperty *new_prop;
-        new_prop = js_realloc(ctx, p->prop,
-                              sizeof(p->prop[0]) * new_sh->prop_size);
+        new_prop = js_realloc_props(ctx, p, new_sh->prop_size);
         if (unlikely(!new_prop))
             return -1;
         p->prop = new_prop;
@@ -11286,8 +11310,7 @@ static JSProperty *add_property(JSContext *ctx,
             /*  the property array may need to be resized */
             if (new_sh->prop_size > p->prop_size) {
                 JSProperty *new_prop;
-                new_prop = js_realloc(ctx, p->prop, sizeof(p->prop[0]) *
-                                      new_sh->prop_size);
+                new_prop = js_realloc_props(ctx, p, new_sh->prop_size);
                 if (!new_prop)
                     return NULL;
                 p->prop = new_prop;
