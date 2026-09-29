@@ -754,14 +754,12 @@ struct JSStringRope {
     JSValue right;        /* might be the empty string */
 };
 
-static inline void *strv(JSString *p)
+static no_inline void *strv_slow(JSString *p)
 {
     JSStringSlice *slice;
     void **indirect;
 
     switch (p->kind) {
-    case JS_STRING_KIND_NORMAL:
-        return (void *)&p[1];
     case JS_STRING_KIND_SLICE:
         slice = (void *)&p[1];
         return (char *)&slice->parent[1] + slice->start;
@@ -771,6 +769,16 @@ static inline void *strv(JSString *p)
     }
     abort();
     return NULL;
+}
+
+/* the characters of a string. This is on every string access: the usual
+   kind is tested alone (a single masked test of the bit field) and the
+   others are out of line. */
+static inline void *strv(JSString *p)
+{
+    if (likely(p->kind == JS_STRING_KIND_NORMAL))
+        return (void *)&p[1];
+    return strv_slow(p);
 }
 
 static inline uint8_t *str8(JSString *p)
@@ -52577,7 +52585,10 @@ static int string_indexof(JSString *p1, JSString *p2, int from)
     int c, i, j, len1 = p1->len, len2 = p2->len;
     if (len2 == 0)
         return from;
-    for (i = from, c = string_get(p2, 0); i + len2 <= len1; i = j + 1) {
+    c = string_get(p2, 0);
+    if (len2 == 1)
+        return string_indexof_char(p1, c, from);
+    for (i = from; i + len2 <= len1; i = j + 1) {
         j = string_indexof_char(p1, c, i);
         if (j < 0 || j + len2 > len1)
             break;
