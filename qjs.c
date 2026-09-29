@@ -377,7 +377,9 @@ static const JSMallocFunctions mi_mf = {
     js_mi_malloc,
     js_mi_free,
     js_mi_realloc,
-    mi_malloc_usable_size
+    /* mi_malloc_usable_size() is missing from some mimalloc 3 builds,
+       such as the static library of MSYS2 */
+    mi_usable_size
 };
 #endif
 
