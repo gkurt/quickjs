@@ -381,6 +381,13 @@ struct JSRuntime {
     bool in_out_of_memory;
     /* true if inside build_backtrace, to avoid recursing */
     bool in_build_stack_trace;
+    /* the last positions found by find_line_num(), see there */
+    struct {
+        struct JSFunctionBytecode *b;
+        uint32_t pc;
+        int line_num;
+        int col_num;
+    } pc2line_cache[32];
     /* true if inside JS_FreeRuntime */
     bool in_free;
 
@@ -917,7 +924,8 @@ typedef struct JSFunctionBytecode {
     uint8_t super_allowed : 1;
     uint8_t arguments_allowed : 1;
     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
-    /* XXX: 5 bits available */
+    uint8_t pc2line_cached : 1; /* may be in rt->pc2line_cache */
+    /* XXX: 4 bits available */
     /* size of the property array of the last object built by 'new' on
        this function, allocated in advance for the next one */
     uint8_t ctor_prop_size;
@@ -8400,8 +8408,50 @@ static int get_sleb128(int32_t *pval, const uint8_t *buf,
     return ret;
 }
 
+static inline unsigned int pc2line_cache_hash(JSFunctionBytecode *b,
+                                              uint32_t pc_value)
+{
+    uint32_t h = (uint32_t)((uintptr_t)b >> 4) ^ (pc_value * 0x9e3779b1);
+    return (h ^ (h >> 16)) % countof(((JSRuntime *)0)->pc2line_cache);
+}
+
+static void pc2line_cache_remove(JSRuntime *rt, JSFunctionBytecode *b)
+{
+    int i;
+    for(i = 0; i < countof(rt->pc2line_cache); i++) {
+        if (rt->pc2line_cache[i].b == b)
+            rt->pc2line_cache[i].b = NULL;
+    }
+}
+
+static int find_line_num1(JSContext *ctx, JSFunctionBytecode *b,
+                          uint32_t pc_value, int *col);
+
+/* The table is decoded from the start of the function, which is slow in a
+   large function, and a backtrace is built again at every throw, usually
+   from the same places: the last positions found are cached. */
 static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
                          uint32_t pc_value, int *col)
+{
+    JSRuntime *rt = ctx->rt;
+    unsigned int h = pc2line_cache_hash(b, pc_value);
+    int line_num;
+
+    if (rt->pc2line_cache[h].b == b && rt->pc2line_cache[h].pc == pc_value) {
+        *col = rt->pc2line_cache[h].col_num;
+        return rt->pc2line_cache[h].line_num;
+    }
+    line_num = find_line_num1(ctx, b, pc_value, col);
+    rt->pc2line_cache[h].b = b;
+    rt->pc2line_cache[h].pc = pc_value;
+    rt->pc2line_cache[h].line_num = line_num;
+    rt->pc2line_cache[h].col_num = *col;
+    b->pc2line_cached = true;
+    return line_num;
+}
+
+static int find_line_num1(JSContext *ctx, JSFunctionBytecode *b,
+                          uint32_t pc_value, int *col)
 {
     const uint8_t *p_end, *p;
     int new_line_num, new_col_num, line_num, col_num, pc, ret;
@@ -8452,9 +8502,76 @@ fail:
     return b->line_num;
 }
 
+/* append 'p' encoded as by JS_ToCString() */
+static void dbuf_put_jsstring(JSContext *ctx, DynBuf *s, JSString *p)
+{
+    const char *str;
+    size_t len;
+    uint32_t i;
+
+    if (!p->is_wide_char) {
+        const uint8_t *s8 = str8(p);
+        uint64_t v, m = 0;
+        for(i = 0; i + 8 <= p->len; i += 8) {
+            memcpy(&v, s8 + i, 8);
+            m |= v;
+        }
+        for(; i < p->len; i++)
+            m |= s8[i];
+        if (!(m & 0x8080808080808080))
+            return (void)dbuf_put(s, s8, p->len);
+    }
+    str = JS_ToCStringLen(ctx, &len, JS_MKPTR(JS_TAG_STRING, p));
+    if (str) {
+        dbuf_put(s, (const uint8_t *)str, len);
+        JS_FreeCString(ctx, str);
+    }
+}
+
+static void dbuf_put_atom(JSContext *ctx, DynBuf *s, JSAtom atom)
+{
+    if (__JS_AtomIsTaggedInt(atom)) {
+        char buf[16];
+        dbuf_put(s, (const uint8_t *)buf, u32toa(buf, __JS_AtomToUInt32(atom)));
+    } else {
+        dbuf_put_jsstring(ctx, s, ctx->rt->atom_array[atom]);
+    }
+}
+
+/* append ":line:col" */
+static void dbuf_put_line_col(DynBuf *s, int line_num, int col_num)
+{
+    char buf[32];
+    size_t len;
+    buf[0] = ':';
+    len = 1 + i32toa(buf + 1, line_num);
+    buf[len++] = ':';
+    len += i32toa(buf + len, col_num);
+    dbuf_put(s, (const uint8_t *)buf, len);
+}
+
 /* in order to avoid executing arbitrary code during the stack trace
    generation, we only look at simple 'name' properties containing a
    string. */
+static JSString *get_func_name_string(JSValueConst func)
+{
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    JSValue val;
+
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
+        return NULL;
+    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(func), JS_ATOM_name);
+    if (!prs)
+        return NULL;
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return NULL;
+    val = pr->u.value;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
+        return NULL;
+    return JS_VALUE_GET_STRING(val);
+}
+
 static const char *get_func_name(JSContext *ctx, JSValueConst func)
 {
     JSProperty *pr;
@@ -8518,8 +8635,6 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     JSStackFrame *sf, *sf_start;
     JSValue stack, prepare, saved_exception, error_obj;
     DynBuf dbuf;
-    const char *func_name_str;
-    const char *str1;
     JSObject *p;
     JSFunctionBytecode *b;
     bool backtrace_barrier, has_prepare, has_filter_func;
@@ -8574,6 +8689,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         js_dbuf_init(ctx, &dbuf);
         if (stack_trace_limit == 0)
             goto done;
+        /* room for a few levels at once */
+        dbuf_claim(&dbuf, 1024);
         if (filename) {
             i++;
             dbuf_printf(&dbuf, "    at %s", filename);
@@ -8617,35 +8734,34 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         if (has_prepare) {
             js_new_callsite_data(ctx, &csd[i], sf);
         } else {
-            /* func_name_str is UTF-8 encoded if needed */
-            func_name_str = get_func_name(ctx, sf->cur_func);
-            if (!func_name_str || func_name_str[0] == '\0')
-                str1 = "<anonymous>";
+            JSString *func_name = get_func_name_string(sf->cur_func);
+            dbuf_putstr(&dbuf, "    at ");
+            if (!func_name || func_name->len == 0)
+                dbuf_putstr(&dbuf, "<anonymous>");
             else
-                str1 = func_name_str;
-            dbuf_printf(&dbuf, "    at %s", str1);
-            JS_FreeCString(ctx, func_name_str);
+                dbuf_put_jsstring(ctx, &dbuf, func_name);
 
             if (b && sf->cur_pc) {
-                const char *atom_str;
                 int line_num1, col_num1;
                 uint32_t pc;
 
                 pc = sf->cur_pc - b->byte_code_buf - 1;
                 line_num1 = find_line_num(ctx, b, pc, &col_num1);
-                atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
-                dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
-                JS_FreeCString(ctx, atom_str);
+                dbuf_putstr(&dbuf, " (");
+                if (b->filename)
+                    dbuf_put_atom(ctx, &dbuf, b->filename);
+                else
+                    dbuf_putstr(&dbuf, "<null>");
                 if (line_num1 != -1)
-                    dbuf_printf(&dbuf, ":%d:%d", line_num1, col_num1);
+                    dbuf_put_line_col(&dbuf, line_num1, col_num1);
                 dbuf_putc(&dbuf, ')');
             } else if (b) {
                 // FIXME(bnoordhuis) Missing `sf->cur_pc = pc` in bytecode
                 // handler in JS_CallInternal. Almost never user observable
                 // except with intercepting JS proxies that throw exceptions.
-                dbuf_printf(&dbuf, " (missing)");
+                dbuf_putstr(&dbuf, " (missing)");
             } else {
-                dbuf_printf(&dbuf, " (native)");
+                dbuf_putstr(&dbuf, " (native)");
             }
             dbuf_putc(&dbuf, '\n');
         }
@@ -41998,6 +42114,8 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 
     JS_FreeAtomRT(rt, b->func_name);
     JS_FreeAtomRT(rt, b->filename);
+    if (b->pc2line_cached)
+        pc2line_cache_remove(rt, b);
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
 
