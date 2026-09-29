@@ -430,6 +430,9 @@ if tests.allowed()
       run262_exe,
       args: ['-c', files('tests.conf')],
       workdir: meson.current_source_dir(),
+      # 65 to over 150 s with the MSan debug builds of CI, where the
+      # default of 30 s (x5 there) is too short
+      timeout: 120,
     )
 
     foreach bench : [
