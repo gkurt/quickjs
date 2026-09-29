@@ -2641,21 +2641,43 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
             memmove(bc, bc + prefix_len,
                     s->byte_code.size - RE_HEADER_LEN - prefix_len);
             s->byte_code.size -= prefix_len;
-        } else if (bc[prefix_len] == REOP_save_start &&
-                   bc[prefix_len + 2] == REOP_char) {
-            /* a pattern starting with a character (case sensitive,
-               not a quantified or alternative atom, which start with
-               another opcode) can only match where the character
-               occurs: the loop over the start positions skips to its
-               next occurrence first */
-            uint32_t c = get_u16(bc + prefix_len + 3);
-            if ((c < 0xd800 || c > 0xdfff) &&
-                !dbuf_insert(&s->byte_code, RE_HEADER_LEN, 3)) {
-                bc = s->byte_code.buf + RE_HEADER_LEN;
-                bc[0] = REOP_skip_to_char;
-                put_u16(bc + 1, c);
-                /* the goto of the loop now jumps to REOP_skip_to_char */
-                put_u32(bc + 3 + 5 + 1 + 1, -(3 + 5 + 1 + 5));
+        } else if (bc[prefix_len] == REOP_save_start) {
+            /* the first atom, after the start of the capture groups
+               which begin with it */
+            int pos = prefix_len + 2;
+            while (bc[pos] == REOP_save_start)
+                pos += 2;
+            if (bc[pos] == REOP_char) {
+                /* a pattern starting with a character (case sensitive,
+                   not a quantified or alternative atom, which start with
+                   another opcode) can only match where the character
+                   occurs: the loop over the start positions skips to
+                   its next occurrence first */
+                uint32_t c = get_u16(bc + pos + 1);
+                if ((c < 0xd800 || c > 0xdfff) &&
+                    !dbuf_insert(&s->byte_code, RE_HEADER_LEN, 3)) {
+                    bc = s->byte_code.buf + RE_HEADER_LEN;
+                    bc[0] = REOP_skip_to_char;
+                    put_u16(bc + 1, c);
+                    /* the goto of the loop now jumps to REOP_skip_to_char */
+                    put_u32(bc + 3 + 5 + 1 + 1, -(3 + 5 + 1 + 5));
+                }
+            } else if (bc[pos] == REOP_range) {
+                /* the same for a character class (case sensitive, of a
+                   few ranges below the surrogates, so that a match is
+                   never in a surrogate pair and an astral character
+                   never matches), which also starts an atom quantified
+                   with '+': the loop skips to the next character of the
+                   class, read from the range of the atom itself */
+                int n = get_u16(bc + pos + 1);
+                if (n <= 8 && get_u16(bc + pos + 3 + (n - 1) * 4 + 2) < 0xd800 &&
+                    !dbuf_insert(&s->byte_code, RE_HEADER_LEN, 5)) {
+                    bc = s->byte_code.buf + RE_HEADER_LEN;
+                    bc[0] = REOP_skip_to_range;
+                    /* the range moved by 5 as well */
+                    put_u32(bc + 1, pos);
+                    put_u32(bc + 5 + 5 + 1 + 1, -(5 + 5 + 1 + 5));
+                }
             }
         }
     }
@@ -2985,6 +3007,7 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
         [REOP_check_advance] = &&case_REOP_check_advance,
         [REOP_prev] = &&case_REOP_prev,
         [REOP_skip_to_char] = &&case_REOP_skip_to_char,
+        [REOP_skip_to_range] = &&case_REOP_skip_to_range,
         [REOP_COUNT ... 255] = &&case_default,
     };
 #define RE_NEXT         { opcode = *pc++; goto *dispatch_table[opcode]; }
@@ -3154,6 +3177,44 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                 if (p1 == p_end)
                     goto no_match;
                 cptr = (const uint8_t *)p1;
+            }
+            RE_NEXT;
+        RE_CASE(REOP_skip_to_range):
+            {
+                /* the operand is the offset of a REOP_range of 'n' ranges
+                   below 0xd800 */
+                const uint8_t *r = pc + 4 + (int)get_u32(pc);
+                int n = get_u16(r + 1), i;
+                const uint8_t *tab = r + 3;
+                pc += 4;
+                if (cbuf_type == 0) {
+                    const uint8_t *p1;
+                    for(p1 = cptr; p1 < cbuf_end; p1++) {
+                        c = *p1;
+                        for(i = 0; i < n; i++) {
+                            if (c >= get_u16(tab + i * 4) &&
+                                c <= get_u16(tab + i * 4 + 2))
+                                goto range8_found;
+                        }
+                    }
+                    goto no_match;
+                range8_found:
+                    cptr = p1;
+                } else {
+                    const uint16_t *p1 = (const uint16_t *)cptr;
+                    const uint16_t *p_end = (const uint16_t *)cbuf_end;
+                    for(; p1 < p_end; p1++) {
+                        c = *p1;
+                        for(i = 0; i < n; i++) {
+                            if (c >= get_u16(tab + i * 4) &&
+                                c <= get_u16(tab + i * 4 + 2))
+                                goto range16_found;
+                        }
+                    }
+                    goto no_match;
+                range16_found:
+                    cptr = (const uint8_t *)p1;
+                }
             }
             RE_NEXT;
         RE_CASE(REOP_goto):

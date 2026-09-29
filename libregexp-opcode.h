@@ -70,5 +70,6 @@ DEF(set_char_pos, 2) /* store the character position to a register */
 DEF(check_advance, 2) /* check that the register is different from the character position */
 DEF(prev, 1) /* go to the previous char */
 DEF(skip_to_char, 3) /* advance to the next occurrence of a 16 bit char */
+DEF(skip_to_range, 5) /* advance to the next char matched by the range at the relative offset */
 
 #endif /* DEF */
