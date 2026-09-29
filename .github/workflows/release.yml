@@ -16,9 +16,15 @@ jobs:
         run: |
           pip install --upgrade meson ninja
       - name: check meson version
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           MESON_VERSION=$(meson introspect meson.build --projectinfo | jq -r '.version')
-          test "${{ github.ref_name }}" = "v${MESON_VERSION}"
+          # v<version>, or v<version>-gkurt.<n> for the releases of this fork
+          if ! echo "$TAG" | grep -Eqx "v${MESON_VERSION//./\\.}(-gkurt\.[0-9]+)?"; then
+            echo "tag $TAG does not match v$MESON_VERSION or v$MESON_VERSION-gkurt.<n>"
+            exit 1
+          fi
 
   linux:
     runs-on: ubuntu-22.04
@@ -168,6 +174,8 @@ jobs:
   upload-to-release:
     needs: [linux, macos, windows, wasi, check_meson_version]
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
       - name: get assets
         uses: actions/download-artifact@v8
