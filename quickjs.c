@@ -53636,6 +53636,74 @@ static JSValue js_string_case_ascii(JSContext *ctx, JSValue val, bool to_lower)
     return JS_MKPTR(JS_TAG_STRING, r);
 }
 
+/* The same for 8-bit strings with other Latin-1 characters: to lower case,
+   U+00C0-U+00DE (but U+00D7) map to U+00E0-U+00FE, and to upper case
+   the reverse, except U+00DF (to "SS"), U+00FF and U+00B5 (to characters
+   outside Latin-1) for which JS_UNDEFINED is returned. No other Latin-1
+   character has a case mapping and the final sigma rule does not apply.
+   'val' is consumed unless JS_UNDEFINED or JS_EXCEPTION is returned. */
+static JSValue js_string_case_latin1(JSContext *ctx, JSValue val, bool to_lower)
+{
+    JSString *p = JS_VALUE_GET_STRING(val);
+    const uint8_t *src = str8(p);
+    int i, n = p->len;
+    JSString *r;
+    uint8_t *dst;
+
+    if (!to_lower) {
+        for (i = 0; i < n; i++) {
+            if (src[i] == 0xdf || src[i] == 0xff || src[i] == 0xb5)
+                return JS_UNDEFINED;
+        }
+    }
+    r = js_alloc_string(ctx, n, 0);
+    if (!r)
+        return JS_EXCEPTION;
+    dst = str8(r);
+    for (i = 0; i < n; i++) {
+        uint8_t ch = src[i];
+        if (to_lower) {
+            if ((uint8_t)(ch - 'A') < 26 ||
+                ((uint8_t)(ch - 0xc0) < 0x1f && ch != 0xd7))
+                ch += 0x20;
+        } else {
+            if ((uint8_t)(ch - 'a') < 26 ||
+                ((uint8_t)(ch - 0xe0) < 0x1f && ch != 0xf7))
+                ch -= 0x20;
+        }
+        dst[i] = ch;
+    }
+    dst[n] = '\0';
+    JS_FreeValue(ctx, val);
+    return JS_MKPTR(JS_TAG_STRING, r);
+}
+
+/* case conversion of the basic Greek and Cyrillic letters, which map
+   by a constant offset: return -1 for the other characters and for
+   U+03A3 to lower case (final sigma) */
+static int case_conv_greek_cyrillic(uint32_t c, bool to_lower)
+{
+    if (to_lower) {
+        if ((c >= 0x391 && c <= 0x3a9 && c != 0x3a3) ||
+            (c >= 0x410 && c <= 0x42f))
+            return c == 0x3a2 ? c : c + 0x20; /* U+03A2 is unassigned */
+        if (c >= 0x400 && c <= 0x40f)
+            return c + 0x50;
+        if ((c >= 0x3b1 && c <= 0x3c9) || (c >= 0x430 && c <= 0x45f))
+            return c;
+    } else {
+        if (c == 0x3c2) /* final sigma */
+            return 0x3a3;
+        if ((c >= 0x3b1 && c <= 0x3c9) || (c >= 0x430 && c <= 0x44f))
+            return c - 0x20;
+        if (c >= 0x450 && c <= 0x45f)
+            return c - 0x50;
+        if ((c >= 0x391 && c <= 0x3a9) || (c >= 0x400 && c <= 0x42f))
+            return c;
+    }
+    return -1;
+}
+
 static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv, int to_lower)
 {
@@ -53653,6 +53721,8 @@ static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val,
         return val;
     if (!p->is_wide_char) {
         JSValue ret = js_string_case_ascii(ctx, val, to_lower);
+        if (JS_IsUndefined(ret))
+            ret = js_string_case_latin1(ctx, val, to_lower);
         if (!JS_IsUndefined(ret)) {
             if (JS_IsException(ret))
                 JS_FreeValue(ctx, val);
@@ -53662,6 +53732,26 @@ static JSValue js_string_toLowerCase(JSContext *ctx, JSValueConst this_val,
     if (string_buffer_init(ctx, b, p->len))
         goto fail;
     for(i = 0; i < p->len;) {
+        if (p->is_wide_char) {
+            c = str16(p)[i];
+            if (c < 0x80) {
+                /* ASCII inline */
+                if (to_lower ? (unsigned)(c - 'A') < 26 : (unsigned)(c - 'a') < 26)
+                    c ^= 0x20;
+                i++;
+                if (string_buffer_putc16(b, c))
+                    goto fail;
+                continue;
+            } else if (c >= 0x391 && c <= 0x45f) {
+                int c1 = case_conv_greek_cyrillic(c, to_lower);
+                if (c1 >= 0) {
+                    i++;
+                    if (string_buffer_putc16(b, c1))
+                        goto fail;
+                    continue;
+                }
+            }
+        }
         c = string_getc(p, &i);
         if (c == 0x3a3 && to_lower && test_final_sigma(p, i - 1)) {
             res[0] = 0x3c2; /* final sigma */
