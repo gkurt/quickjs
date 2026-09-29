@@ -53747,7 +53747,7 @@ static JSValue js_string_case_ascii(JSContext *ctx, JSValue val, bool to_lower)
    outside Latin-1) for which JS_UNDEFINED is returned. No other Latin-1
    character has a case mapping and the final sigma rule does not apply.
    'val' is consumed unless JS_UNDEFINED or JS_EXCEPTION is returned. */
-static JSValue js_string_case_latin1(JSContext *ctx, JSValue val, bool to_lower)
+static no_inline JSValue js_string_case_latin1(JSContext *ctx, JSValue val, bool to_lower)
 {
     JSString *p = JS_VALUE_GET_STRING(val);
     const uint8_t *src = str8(p);
