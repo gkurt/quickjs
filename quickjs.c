@@ -15190,9 +15190,23 @@ static JSValue js_atof(JSContext *ctx, const char *str, const char **pp,
     if (p == p_start)
         goto fail;
 
+    len = p - p_start;
+    /* short decimal integer: exact in a double, no need for js_atod() */
+    if (atod_type == ATOD_TYPE_FLOAT64 && radix == 10 && !is_float &&
+        len <= 15 && !(flags & ATOD_ACCEPT_SUFFIX && *p == 'n')) {
+        uint64_t v = 0;
+        for (i = 0; i < len; i++) {
+            unsigned int c = (uint8_t)p_start[i] - '0';
+            if (c >= 10)
+                goto no_fast_int; /* separator */
+            v = v * 10 + c;
+        }
+        val = js_number(is_neg ? -(double)v : (double)v);
+        goto done;
+    }
+ no_fast_int:
     buf = buf1;
     buf_allocated = false;
-    len = p - p_start;
     if (unlikely((len + 2) > sizeof(buf1))) {
         buf = js_malloc_rt(ctx->rt, len + 2); /* no exception raised */
         if (!buf)
