@@ -289,9 +289,11 @@ VM.
   the same version of this package. Nothing checks it: restoring a snapshot of
   another build (of this package or of `quickjs-wasi`) corrupts the VM. Store
   the package version with each snapshot and compare it on restore. Snapshots
-  of 0.1.0 do not restore into 0.2.0.
+  of 0.1.0 do not restore into 0.2.0, nor those of 0.2.0 into 0.3.0.
 - **Bytecode** from `quickjs-wasi` or upstream QuickJS-NG is rejected (the
-  bytecode version differs); compile it again with this package.
+  bytecode version differs); compile it again with this package. So is the
+  bytecode of 0.2.0 by 0.3.0 and the other way round: the bytecode version
+  changed (0.3.0 can compile regular expressions that 0.2.0 cannot run).
 - **Host functions** that returned a handle and kept using it (a cached
   handle) must return `handle.dup()` since 0.2.0.
 
