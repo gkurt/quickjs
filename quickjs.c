@@ -12719,6 +12719,21 @@ int JS_DefinePropertyValue(JSContext *ctx, JSValueConst this_obj,
                            JSAtom prop, JSValue val, int flags)
 {
     int ret;
+    if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT)) {
+        JSObject *p = JS_VALUE_GET_OBJ(this_obj);
+        /* a new property of an ordinary extensible object: what
+           JS_DefineProperty() and JS_CreateProperty() do, without the
+           checks that cannot apply */
+        if (!p->is_exotic && p->extensible && !find_own_property1(p, prop)) {
+            JSProperty *pr = add_property(ctx, p, prop, flags & JS_PROP_C_W_E);
+            if (unlikely(!pr)) {
+                JS_FreeValue(ctx, val);
+                return -1;
+            }
+            pr->u.value = val;
+            return true;
+        }
+    }
     ret = JS_DefinePropertyValueConst(ctx, this_obj, prop, val, flags);
     JS_FreeValue(ctx, val);
     return ret;
