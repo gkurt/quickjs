@@ -50233,7 +50233,18 @@ static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
     if (JS_IsUndefined(it->obj))
         goto done;
     p = JS_VALUE_GET_OBJ(it->obj);
-    if (is_typed_array(p->class_id)) {
+    if (p->class_id == JS_CLASS_ARRAY && p->fast_array &&
+        JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT) {
+        /* the length of a fast array is in its first property, which is
+           a plain value; it can exceed the number of elements */
+        len = JS_VALUE_GET_INT(p->prop[0].u.value);
+        idx = it->idx;
+        if (idx < p->u.array.count && it->kind == JS_ITERATOR_KIND_VALUE) {
+            it->idx = idx + 1;
+            *pdone = false;
+            return js_dup(p->u.array.u.values[idx]);
+        }
+    } else if (is_typed_array(p->class_id)) {
         if (typed_array_is_oob(p)) {
             JS_ThrowTypeErrorArrayBufferOOB(ctx);
             goto fail1;
