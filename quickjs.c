@@ -24482,7 +24482,7 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
     opcode_info[(op) >= OP_TEMP_START ? \
                 (op) + (OP_TEMP_END - OP_TEMP_START) : (op)]
 
-static void json_free_token(JSParseState *s, JSToken *token) {
+static inline void json_free_token(JSParseState *s, JSToken *token) {
     // Only free actual allocated values
     switch(token->val) {
     case TOK_NUMBER:
@@ -25594,9 +25594,33 @@ static int json_parse_error(JSParseState *s, const uint8_t *curp, const char *ms
                           msg, position, line, (int)(p - line_start) + 1);
 }
 
-static int json_parse_string(JSParseState *s, const uint8_t **pp)
+/* skip the characters of a JSON string that need no processing: ASCII
+   characters other than the controls, '"' and '\\', 8 at a time */
+static const uint8_t *json_skip_plain(const uint8_t *p, const uint8_t *end)
 {
-    const uint8_t *p, *p_next;
+    const uint64_t ones = 0x0101010101010101ULL, highs = 0x8080808080808080ULL;
+    while (end - p >= 8) {
+        uint64_t v, q, bs, t;
+        memcpy(&v, p, 8);
+        q = v ^ (ones * '"');
+        bs = v ^ (ones * '\\');
+        t = v | ((v - ones * 0x20) & ~v) | ((q - ones) & ~q) | ((bs - ones) & ~bs);
+        if (t & highs)
+            break;
+        p += 8;
+    }
+    while (p < end && *p != '"' && *p != '\\' && *p >= 0x20 && *p < 0x80)
+        p++;
+    return p;
+}
+
+/* the string token after the opening quote at 'p', with escapes or other
+   characters than ASCII: return the position after the closing quote, or
+   NULL in case of error */
+static no_inline const uint8_t *json_parse_string_slow(JSParseState *s,
+                                                       const uint8_t *p)
+{
+    const uint8_t *p_next;
     int i;
     uint32_t c;
     StringBuffer b_s, *b = &b_s;
@@ -25604,7 +25628,6 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
     if (string_buffer_init(s->ctx, b, 48))
         goto fail;
 
-    p = *pp;
     for(;;) {
         if (p >= s->buf_end) {
             goto end_of_input;
@@ -25612,9 +25635,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
 
         // Fast path: batch consecutive ASCII characters
         const uint8_t *p_start = p;
-        while (p < s->buf_end && *p != '"' && *p != '\\' && *p >= 0x20 && *p < 0x80) {
-            p++;
-        }
+        p = json_skip_plain(p, s->buf_end);
 
         // Write batched ASCII in one call
         if (p > p_start) {
@@ -25675,29 +25696,53 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
     s->token.val = TOK_STRING;
     s->token.u.str.sep = '"';
     s->token.u.str.str = string_buffer_end(b);
-    *pp = p;
-    return 0;
+    return p;
 
  end_of_input:
     js_parse_error(s, "Unexpected end of JSON input");
  fail:
     string_buffer_free(b);
-    return -1;
+    return NULL;
 }
 
-static int json_parse_number(JSParseState *s, const uint8_t **pp)
+/* the string token after the opening quote at 'p': return the position
+   after the closing quote, or NULL in case of error */
+static inline const uint8_t *json_parse_string(JSParseState *s,
+                                               const uint8_t *p)
 {
-    const uint8_t *p = *pp;
+    /* usual case: no escape and only ASCII characters, the string is
+       created at once */
+    const uint8_t *p_end = json_skip_plain(p, s->buf_end);
+    if (likely(p_end < s->buf_end && *p_end == '"')) {
+        JSValue str = js_new_string8_len(s->ctx, (const char *)p, p_end - p);
+        if (JS_IsException(str))
+            return NULL;
+        s->token.val = TOK_STRING;
+        s->token.u.str.sep = '"';
+        s->token.u.str.str = str;
+        return p_end + 1;
+    }
+    return json_parse_string_slow(s, p);
+}
+
+/* the number token at 'p': return the position after it, or NULL in case
+   of error */
+static const uint8_t *json_parse_number(JSParseState *s, const uint8_t *p)
+{
     const uint8_t *p_start = p;
 
     if (*p == '+' || *p == '-')
         p++;
 
-    if (!is_digit(*p))
-        return js_parse_error(s, "Unexpected token '%c'", *p_start);
+    if (!is_digit(*p)) {
+        js_parse_error(s, "Unexpected token '%c'", *p_start);
+        return NULL;
+    }
 
-    if (p[0] == '0' && is_digit(p[1]))
-        return json_parse_error(s, p, "Unexpected number");
+    if (p[0] == '0' && is_digit(p[1])) {
+        json_parse_error(s, p, "Unexpected number");
+        return NULL;
+    }
 
     while (is_digit(*p))
         p++;
@@ -25720,16 +25765,17 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             if (v != 0 || !neg) {
                 s->token.val = TOK_NUMBER;
                 s->token.u.num.val = js_int32(neg ? -(int32_t)v : (int32_t)v);
-                *pp = p;
-                return 0;
+                return p;
             }
         }
     }
 
     if (*p == '.') {
         p++;
-        if (!is_digit(*p))
-            return json_parse_error(s, p, "Unterminated fractional number");
+        if (!is_digit(*p)) {
+            json_parse_error(s, p, "Unterminated fractional number");
+            return NULL;
+        }
         while (is_digit(*p))
             p++;
     }
@@ -25737,19 +25783,22 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
         p++;
         if (*p == '+' || *p == '-')
             p++;
-        if (!is_digit(*p))
-            return json_parse_error(s, p, "Exponent part is missing a number");
+        if (!is_digit(*p)) {
+            json_parse_error(s, p, "Exponent part is missing a number");
+            return NULL;
+        }
         while (is_digit(*p))
             p++;
     }
     s->token.val = TOK_NUMBER;
     s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
-    *pp = p;
-    return 0;
+    return p;
 }
 
-/* 'c' is the first character. Return JS_ATOM_NULL in case of error */
-static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
+/* 'c' is the first character. Return JS_ATOM_NULL in case of error. Out
+   of line with json_parse_ident_token(): its buffer would make the frame
+   of json_next_token() large. */
+static no_inline JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
 {
     const uint8_t *p;
     char ident_buf[128], *buf;
@@ -25783,16 +25832,43 @@ static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
     return atom;
 }
 
+/* the identifier token after its first character 'c' at p[-1]: return
+   the position after it, or NULL in case of error */
+static no_inline const uint8_t *json_parse_ident_token(JSParseState *s,
+                                                       const uint8_t *p, int c)
+{
+    JSAtom atom = json_parse_ident(s, &p, c);
+    if (atom == JS_ATOM_NULL)
+        return NULL;
+    s->token.u.ident.atom = atom;
+    s->token.u.ident.has_escape = false;
+    s->token.u.ident.is_reserved = false;
+    s->token.val = TOK_IDENT;
+    return p;
+}
+
+static no_inline void json_parse_error_unexpected(JSParseState *s,
+                                                  const uint8_t *p)
+{
+    const uint8_t *p_next;
+    int c;
+
+    c = utf8_decode(p, &p_next);
+    if (p_next == p + 1) {
+        js_parse_error(s, "Unexpected token '\\x%02x' in JSON", *p);
+    } else {
+        if (c > 0xFFFF) {
+            c = get_hi_surrogate(c);
+        }
+        js_parse_error(s, "Unexpected token '\\u%04x' in JSON", c);
+    }
+}
+
+/* Note: not recursive, json_parse_value() checks the stack */
 static __exception int json_next_token(JSParseState *s)
 {
-    const uint8_t *p, *p_next;
+    const uint8_t *p;
     int c;
-    JSAtom atom;
-
-    if (js_check_stack_overflow(s->ctx->rt, 1000)) {
-        JS_ThrowStackOverflow(s->ctx);
-        return -1;
-    }
 
     json_free_token(s, &s->token);
 
@@ -25817,8 +25893,8 @@ static __exception int json_next_token(JSParseState *s)
         /* JSON does not accept single quoted strings */
         goto def_token;
     case '\"':
-        p++;
-        if (json_parse_string(s, &p))
+        p = json_parse_string(s, p + 1);
+        if (!p)
             goto fail;
         break;
     case '\r':  /* accept DOS and MAC newline sequences */
@@ -25861,14 +25937,9 @@ static __exception int json_next_token(JSParseState *s)
     case '_':
     case '$':
         /* identifier : only pure ascii characters are accepted */
-        p++;
-        atom = json_parse_ident(s, &p, c);
-        if (atom == JS_ATOM_NULL)
+        p = json_parse_ident_token(s, p + 1, c);
+        if (!p)
             goto fail;
-        s->token.u.ident.atom = atom;
-        s->token.u.ident.has_escape = false;
-        s->token.u.ident.is_reserved = false;
-        s->token.val = TOK_IDENT;
         break;
     case '-':
         if (!is_digit(p[1])) {
@@ -25887,20 +25958,13 @@ static __exception int json_next_token(JSParseState *s)
     case '9':
         /* number */
     parse_number:
-        if (json_parse_number(s, &p))
+        p = json_parse_number(s, p);
+        if (!p)
             goto fail;
         break;
     default:
         if (c >= 0x80) {
-            c = utf8_decode(p, &p_next);
-            if (p_next == p + 1) {
-                js_parse_error(s, "Unexpected token '\\x%02x' in JSON", *p);
-            } else {
-                if (c > 0xFFFF) {
-                    c = get_hi_surrogate(c);
-                }
-                js_parse_error(s, "Unexpected token '\\u%04x' in JSON", c);
-            }
+            json_parse_error_unexpected(s, p);
             goto fail;
         }
     def_token:
@@ -56711,6 +56775,43 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 }
 
 /* 'pr' can be NULL */
+/* Read the token in the position of a property name. When it is a
+   string of ASCII characters without escape right at the current
+   position, the usual case, return its atom in '*patom' without creating
+   the string: the token is then TOK_STRING without a value. Otherwise
+   the token is read by json_next_token() and '*patom' is JS_ATOM_NULL. */
+static int json_next_token_key(JSParseState *s, JSAtom *patom)
+{
+    const uint8_t *p = s->buf_ptr, *q;
+    JSAtom atom;
+
+    *patom = JS_ATOM_NULL;
+    if (*p != '"')
+        return json_next_token(s);
+    q = json_skip_plain(p + 1, s->buf_end);
+    if (q >= s->buf_end || *q != '"')
+        return json_next_token(s);
+    /* the same atom as JS_ValueToAtom() of the string */
+    atom = JS_NewAtomLen(s->ctx, (const char *)p + 1, q - p - 1);
+    if (atom == JS_ATOM_NULL)
+        return -1;
+    /* what json_next_token() does for a string token */
+    json_free_token(s, &s->token);
+    s->last_ptr = p;
+    s->last_line_num = s->token.line_num;
+    s->last_col_num = s->token.col_num;
+    s->token.line_num = s->line_num;
+    s->token.ptr = p;
+    s->token.line_start = s->line_start;
+    s->token.val = TOK_STRING;
+    s->token.u.str.sep = '"';
+    s->token.u.str.str = JS_UNDEFINED;
+    s->token.col_num = s->mark - s->eol;
+    s->buf_ptr = q + 1;
+    *patom = atom;
+    return 0;
+}
+
 /* store the 'len' first elements of the new empty fast array 'p': the
    values are moved into it, and left to the caller on error */
 static int json_array_set_elements(JSContext *ctx, JSObject *p,
@@ -56742,22 +56843,27 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
     case '{':
         {
             JSValue prop_val;
-            JSAtom prop_name;
+            JSAtom prop_name, key_atom;
             JSONParseRecord *pr1;
             int pr_size;
 
-            if (json_next_token(s))
+            if (json_next_token_key(s, &key_atom))
                 goto fail;
             val = JS_NewObject(ctx);
-            if (JS_IsException(val))
+            if (JS_IsException(val)) {
+                JS_FreeAtom(ctx, key_atom);
                 goto fail;
+            }
             if (pr) {
                 json_parse_record_init_obj(ctx, pr, val);
                 pr_size = 0;
             }
             if (s->token.val != '}') {
                 for(;;) {
-                    if (s->token.val == TOK_STRING) {
+                    if (key_atom != JS_ATOM_NULL) {
+                        prop_name = key_atom;
+                        key_atom = JS_ATOM_NULL;
+                    } else if (s->token.val == TOK_STRING) {
                         prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
                         if (prop_name == JS_ATOM_NULL)
                             goto fail;
@@ -56798,7 +56904,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                         json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
                         goto fail;
                     }
-                    if (json_next_token(s))
+                    if (json_next_token_key(s, &key_atom))
                         goto fail;
                 }
             }
