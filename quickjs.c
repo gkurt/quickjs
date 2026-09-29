@@ -57564,10 +57564,12 @@ static int js_get_own_enumerable_keys(JSContext *ctx, JSPropertyEnum **ptab,
     for(i = j = 0; i < len; i++) {
         res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags, p, tab[i].atom);
         if (res < 0) {
-            /* free the kept keys and the ones not checked yet */
-            for(; i < len; i++)
-                tab[j++] = tab[i];
-            js_free_prop_enum(ctx, tab, j);
+            js_free_prop_enum(ctx, tab + i, len - i);
+            len = j;
+            js_free_prop_enum(ctx, NULL, 0);
+            for(i = 0; i < j; i++)
+                JS_FreeAtom(ctx, tab[i].atom);
+            /* the array itself was freed by the first js_free_prop_enum() */
             return -1;
         }
         if (res && (desc_flags & JS_PROP_ENUMERABLE))
