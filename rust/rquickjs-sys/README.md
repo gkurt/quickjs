@@ -20,8 +20,10 @@ test suite passes with it (CI runs it on Linux, macOS and Windows).
 
 Cargo takes the default branch of the repository, `next`, and records the
 commit in `Cargo.lock`: `cargo update -p rquickjs-sys` moves to the latest
-one. Add `rev = "..."` to pin a commit. Cargo does not fetch the test262
-submodule of the repository.
+one. To stay on a release of the engine instead, add its tag, for example
+`tag = "v0.17.0-gkurt.1"` (the releases are the `v<version>-gkurt.<n>` tags
+of the repository), or `rev = "..."` to pin a commit. Cargo does not fetch
+the test262 submodule of the repository.
 
 ## TypeScript
 
