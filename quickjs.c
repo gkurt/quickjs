@@ -4722,7 +4722,10 @@ static no_inline int string_buffer_realloc(StringBuffer *s, int new_len, int c)
         JS_ThrowRangeError(s->ctx, "invalid string length");
         return string_buffer_set_error(s);
     }
-    new_size = min_int(max_int(new_len, s->size * 3 / 2), JS_STRING_LEN_MAX);
+    /* a buffer started empty grows to 16 characters at once, instead of
+       1, 2, 3, 4, 6... */
+    new_size = min_int(max_int(max_int(new_len, s->size * 3 / 2), 16),
+                       JS_STRING_LEN_MAX);
     if (!s->is_wide_char && c >= 0x100) {
         return string_buffer_widen(s, new_size);
     }
