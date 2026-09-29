@@ -11608,6 +11608,8 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
 }
 
 /* return -1 if exception */
+/* grow the storage of a fast array to hold at least 'new_len' elements
+   (1.5 times the current size if that is more) */
 static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
 {
     uint32_t old_size, new_size;
@@ -11633,6 +11635,15 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     return 0;
 }
 
+/* the same when elements are appended one or a few at a time: an array
+   filled from empty starts with room for a few elements instead of
+   growing through sizes 1, 2, 3 and 4 */
+static inline int expand_fast_array_append(JSContext *ctx, JSObject *p,
+                                           uint32_t new_len)
+{
+    return expand_fast_array(ctx, p, max_uint32(new_len, 4));
+}
+
 /* Preconditions: 'p' must be of class JS_CLASS_ARRAY, p->fast_array =
    true and p->extensible = true */
 static int add_fast_array_element(JSContext *ctx, JSObject *p,
@@ -11655,7 +11666,7 @@ static int add_fast_array_element(JSContext *ctx, JSObject *p,
         }
     }
     if (unlikely(new_len > p->u.array.u1.size)) {
-        if (expand_fast_array(ctx, p, new_len)) {
+        if (expand_fast_array_append(ctx, p, new_len)) {
             JS_FreeValue(ctx, val);
             return -1;
         }
@@ -49420,7 +49431,7 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
                 if (likely(array_len == p->u.array.count &&
                            new_len >= array_len && new_len <= (uint32_t)INT32_MAX)) { /* no overflow and within fast-array bounds */
                     if (unlikely(new_len > p->u.array.u1.size)) {
-                        if (expand_fast_array(ctx, p, new_len))
+                        if (expand_fast_array_append(ctx, p, new_len))
                             return JS_EXCEPTION;
                     }
                     for(i = 0; i < argc; i++) {
