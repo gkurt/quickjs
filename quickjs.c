@@ -22579,13 +22579,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                have the same tag and payload, and two strings are equal
                if they are the same string or, when they are two
                distinct atoms, different. Values of different types
-               among those are never equal. */
+               among those are never equal, and neither is a number and
+               one of them (two numbers do not get there). */
 #define JS_SEQ_TAG_MASK ((1 << (JS_TAG_OBJECT - JS_TAG_FIRST)) |        \
                          (1 << (JS_TAG_SYMBOL - JS_TAG_FIRST)) |        \
                          (1 << (JS_TAG_STRING - JS_TAG_FIRST)) |        \
                          (1 << (JS_TAG_NULL - JS_TAG_FIRST)) |          \
                          (1 << (JS_TAG_UNDEFINED - JS_TAG_FIRST)) |     \
-                         (1 << (JS_TAG_BOOL - JS_TAG_FIRST)))
+                         (1 << (JS_TAG_BOOL - JS_TAG_FIRST)) |          \
+                         (1 << (JS_TAG_INT - JS_TAG_FIRST)) |           \
+                         (1 << (JS_TAG_FLOAT64 - JS_TAG_FIRST)))
 #define JS_SEQ_TAG_OK(tag) ((unsigned)((tag) - JS_TAG_FIRST) < 32 &&    \
                             ((JS_SEQ_TAG_MASK >> ((tag) - JS_TAG_FIRST)) & 1))
 #define OP_SEQ(opcode, is_neq)                                          \
