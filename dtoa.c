@@ -48,6 +48,11 @@
 #define USE_POW5_TABLE
 /* use fast path to print small integers in free format */
 #define USE_FAST_INT
+/* use fast path to print short decimal numbers in free format in base 10.
+   It relies on correctly rounded double operations. */
+#if defined(FLT_EVAL_METHOD) && FLT_EVAL_METHOD == 0
+#define USE_FAST_DECIMAL
+#endif
 
 #define LIMB_LOG2_BITS 5
 
@@ -1105,6 +1110,88 @@ static void dtoa_free(void *ptr)
 #endif
 
 /* return the length */
+#ifdef USE_FAST_DECIMAL
+/* Print the non-integer x > 0 in base 10 as Number.prototype.toString()
+   does, if it has few digits.
+
+   Take the largest j such that s = RN(x * 10^j) < 2^50. s is within 2^-4
+   of x * 10^j, and the reals which round to x are within
+   ulp(x) / 2 <= x * 2^-53 of it, so within 1/8 once scaled by 10^j: at
+   most one integer c is such that c * 10^-j converts back to x, and if it
+   exists, |c - s| < 1/4 so c = round(s). RN(c / 10^j) is a single
+   correctly rounded division since c < 2^53 and 10^j <= 10^22 are exact.
+   A representation of x with fewer decimals would give such an integer
+   too (with trailing zeros), so if there is none, x needs about 15
+   significant digits or more and the slow path is used; otherwise the
+   shortest representation is c without its trailing zeros.
+
+   Return the length, or 0 if the slow path must be used. */
+static int dtoa_short_decimal(char *buf, double x)
+{
+    static const double pow10_tab[] = {
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    };
+    char digits[24];
+    uint64_t a, c;
+    double s;
+    int e, j, k, n, i;
+    char *q;
+
+    /* below RN(10^-6), the exponential notation is used */
+    if (!(x >= 1e-6))
+        return 0;
+    /* 2^(e - 1) <= x < 2^e */
+    memcpy(&a, &x, sizeof(a));
+    e = (int)((a >> 52) & 0x7ff) - 1022;
+    /* largest j such that x * 10^j < 2^50, starting from an estimate */
+    j = (int)((50 - e) * 0.30102999566398120);
+    if (j < 1)
+        return 0;
+    if (j > 22)
+        j = 22;
+    while (j < 22 && x * pow10_tab[j + 1] < 0x1p50)
+        j++;
+    while (j >= 1 && !(x * pow10_tab[j] < 0x1p50))
+        j--;
+    if (j < 1)
+        return 0;
+    s = x * pow10_tab[j];
+    c = (uint64_t)(s + 0.5);
+    if (!(fabs(s - (double)c) < 0.25) || c == 0 ||
+        (double)c / pow10_tab[j] != x)
+        return 0;
+    while (c % 10 == 0) {
+        c /= 10;
+        j--;
+    }
+    if (j < 1)
+        return 0; /* not reached: x is not an integer */
+    k = u64toa(digits, c);
+    /* position of the decimal point: x = 0.d1d2...dk * 10^n */
+    n = k - j;
+    if (n <= -6)
+        return 0; /* not reached */
+    q = buf;
+    if (n <= 0) {
+        *q++ = '0';
+        *q++ = '.';
+        for(i = 0; i < -n; i++)
+            *q++ = '0';
+        memcpy(q, digits, k);
+        q += k;
+    } else {
+        /* n < k since j >= 1 */
+        memcpy(q, digits, n);
+        q += n;
+        *q++ = '.';
+        memcpy(q, digits + n, k - n);
+        q += k - n;
+    }
+    return q - buf;
+}
+#endif
+
 int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
             JSDTOATempMem *tmp_mem)
 {
@@ -1174,6 +1261,16 @@ int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
         /* 'm' is never zero */
         q += u64toa_radix(q, m, radix);
         goto done;
+    }
+#endif
+#ifdef USE_FAST_DECIMAL
+    if (fmt == JS_DTOA_FORMAT_FREE && radix == 10 &&
+        (flags & JS_DTOA_EXP_MASK) == JS_DTOA_EXP_AUTO) {
+        int len = dtoa_short_decimal(q, fabs(d));
+        if (len > 0) {
+            q += len;
+            goto done;
+        }
     }
 #endif
     
